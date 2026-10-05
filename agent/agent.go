@@ -148,7 +148,7 @@ func (a *Agent) runGRPCServer(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	go func() {
 		a.logger.Info().Msgf("Agent GRPC server listening on VSOCK port %d", a.cfg.Port)
-		errCh <- grpcServer.Serve(listener)
+		errCh <- grpcServer.Serve(hostOnlyListener{Listener: listener})
 	}()
 
 	select {

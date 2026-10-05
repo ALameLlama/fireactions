@@ -4,7 +4,7 @@ Fireactions provides a CLI for interacting with the server.
 
 ```bash
 $ fireactions --help
-BYOM (Bring Your Own Metal) and run self-hosted GitHub runners in ephemeral, fast and secure Firecracker based virtual machines.
+Run Forgejo workflows in disposable Firecracker virtual machines.
 
 Usage:
   fireactions [command]
@@ -19,7 +19,6 @@ Pool management commands:
 
 Machine management commands:
   ps          List all running machines across all pools
-  login       SSH into a running VM as root user
   logs        Stream logs from the fireactions-agent service inside a machine
 
 Image management commands:
@@ -39,15 +38,15 @@ Use "fireactions [command] --help" for more information about a command.
 
 ## Server Endpoint
 
-Most commands that interact with the Fireactions server accept an `--endpoint` (or `-e`) flag to specify the server address.
+Most commands that interact with the Fireactions server accept an `--endpoint` (or `-e`) flag.
 
 ```bash
-fireactions --endpoint https://fireactions.example.com:8080 pools list
+fireactions --endpoint unix:///run/fireactions/plugin.sock pools list
 # or using shorthand
-fireactions -e https://fireactions.example.com:8080 pools list
+fireactions -e unix:///run/fireactions/plugin.sock pools list
 ```
 
-The default endpoint is `127.0.0.1:8080`.
+The default endpoint is `unix:///run/fireactions/plugin.sock`.
 
 ## Commands
 
@@ -93,7 +92,7 @@ fireactions validate /path/to/config.yaml
 
 ### Pool Management Commands
 
-All pool management commands accept an `--endpoint` (or `-e`) flag to specify the server address (default: `127.0.0.1:8080`).
+All pool management commands accept an `--endpoint` (or `-e`) flag (default: `unix:///run/fireactions/plugin.sock`).
 
 #### `pools list` (alias: `pools ls`)
 
@@ -135,7 +134,7 @@ fireactions pools scale default --replicas 0
 
 ### Machine Management Commands
 
-All machine management commands accept an `--endpoint` (or `-e`) flag to specify the server address (default: `127.0.0.1:8080`).
+All machine management commands accept an `--endpoint` (or `-e`) flag (default: `unix:///run/fireactions/plugin.sock`).
 
 #### `ps` (alias: `ls`)
 
@@ -145,20 +144,6 @@ List all running machines across all pools.
 fireactions ps
 ```
 
-#### `login <VMID>`
-
-SSH into a running VM as the root user. This is useful for debugging or inspecting VM state.
-
-```bash
-fireactions login default-abc123
-```
-
-The command will automatically:
-- Look up the VM's IP address
-- Establish an SSH connection with appropriate options
-- Drop you into a root shell
-
-**Requirements**: SSH must be installed and accessible in your PATH.
 
 #### `logs <MACHINE_ID>`
 
@@ -181,7 +166,7 @@ fireactions logs default-abc123 --follow --tail 50
 
 ### Image Management Commands
 
-All image management commands accept an `--endpoint` (or `-e`) flag to specify the server address (default: `127.0.0.1:8080`).
+All image management commands accept an `--endpoint` (or `-e`) flag (default: `unix:///run/fireactions/plugin.sock`).
 
 #### `image list` (alias: `image ls`)
 
@@ -232,8 +217,6 @@ fireactions ps
 # View logs from a specific machine
 fireactions logs production-abc123 --follow
 
-# SSH into a machine for debugging
-fireactions login production-abc123
 
 # Scale down when done
 fireactions pools scale production --replicas 0
@@ -245,13 +228,10 @@ fireactions image list
 fireactions image remove ghcr.io/example/old-image:v1
 ```
 
-### Using Remote Server
+### Using an alternate local socket
+
+Use `--endpoint` with a `unix://` URI to select another local Unix socket. The server does not expose TCP gRPC endpoints.
 
 ```bash
-# Connect to a remote Fireactions server
-fireactions -e https://fireactions.example.com:8080 pools list
-
-# All commands support the --endpoint flag
-fireactions -e https://fireactions.example.com:8080 ps
-fireactions -e https://fireactions.example.com:8080 logs machine-123 -f
+fireactions -e unix:///run/fireactions/plugin.sock ps
 ```

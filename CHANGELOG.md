@@ -11,6 +11,13 @@
 * Give writable snapshots, leases, CNI namespaces, VMM processes and control connections one retryable cleanup owner; verify process identity before force-stop.
 * Stream bounded tar transfers through the private guest channel, confining filesystem access to the rooted workspace and preserving safe links, ownership, executable modes and timestamps.
 * Execute direct guest argv with explicit identity/environment, bounded stdout/stderr streams and delegated cgroup-v2 process scopes. Require `cgroup.kill` readiness and clean descendants on cancellation or shutdown.
+* Add the Forgejo Runner v13.2 `plugin.v1alpha` backend with health checks, configured image profiles, and streamed file and process operations.
+* Replace the TCP listener with a permission-protected Unix socket and restrict guest control connections to the host CID.
+* Add the Ubuntu 24.04 guest image, Runner configuration, action fixtures, and real Firecracker integration coverage. Remove the root SSH login command.
+* Return permanent guest readiness errors immediately instead of waiting for the startup deadline.
+* Prepare Runner's declared `FORGEJO_WORKSPACE` through rooted guest setup. Other missing execution directories still produce launch failures.
+* Use same-revision remote JavaScript fixtures for pre/main/post hooks because Runner v13.2 skips pre hooks for local actions.
+* Accept Runner v13.2 active-stream keepalive pings so silent commands remain connected until their actual deadline or cancellation.
 
 ## [2.0.8](https://github.com/hostinger/fireactions/compare/v2.0.7...v2.0.8) (2026-09-15)
 

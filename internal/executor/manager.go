@@ -46,6 +46,7 @@ type environment struct {
 	guest     Guest
 	info      VMInfo
 	ready     ReadySpec
+	workspace string
 	cleanup   *cleanupAttempt
 	destroyed bool
 }
@@ -86,6 +87,23 @@ func NewManager(backend Backend, options Options) (*Manager, error) {
 		environments: make(map[string]*environment),
 		vms:          make(map[string]*environment),
 	}, nil
+}
+
+// EnvironmentForVM provides cached administrative ownership without guest IO.
+// Registry membership and mutable environment state use separate locks.
+func (m *Manager) EnvironmentForVM(vmID string) (id string, removing bool) {
+	m.mu.Lock()
+	e := m.vms[vmID]
+	m.mu.Unlock()
+	if e == nil {
+		return "", false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.destroyed {
+		return "", false
+	}
+	return e.id, e.state == stateRemoving
 }
 
 func (m *Manager) Create(ctx context.Context, spec CreateSpec) (EnvironmentInfo, error) {
@@ -284,6 +302,34 @@ func (m *Manager) Exec(ctx context.Context, id string, spec ExecSpec, stdout, st
 		return ExecResult{}, err
 	}
 	defer finish()
+	if spec.Workspace != "" {
+		workspace, err := canonicalWorkspace(spec.Workspace, e.info.Layout.Root)
+		if err != nil {
+			return ExecResult{}, err
+		}
+		if e.workspace != "" {
+			if e.workspace != workspace {
+				return ExecResult{}, NewError(InvalidArgument, "environment workspace cannot be changed", nil)
+			}
+		} else {
+			ready := e.ready
+			ready.Directories = append(slices.Clone(ready.Directories), workspace)
+			if _, err := e.guest.Ready(opCtx, ready); err != nil {
+				m.beginRemoval(e)
+				return ExecResult{}, err
+			}
+			e.mu.Lock()
+			if e.state == stateRemoving {
+				e.mu.Unlock()
+				if err := context.Cause(e.ctx); err != nil {
+					return ExecResult{}, err
+				}
+				return ExecResult{}, NewError(FailedPrecondition, "environment is being removed", nil)
+			}
+			e.workspace = workspace
+			e.mu.Unlock()
+		}
+	}
 	merged := maps.Clone(e.info.ImageEnv)
 	if _, exists := merged["PATH"]; !exists {
 		merged["PATH"] = e.info.Layout.DefaultPath
@@ -661,4 +707,19 @@ func validateExecSpec(spec ExecSpec) error {
 		return NewError(InvalidArgument, "invalid execution user or working directory", nil)
 	}
 	return nil
+}
+func canonicalWorkspace(workspace, root string) (string, error) {
+	if strings.ContainsRune(workspace, 0) {
+		return "", NewError(InvalidArgument, "workspace path contains NUL", nil)
+	}
+	for component := range strings.SplitSeq(workspace, "/") {
+		if component == ".." {
+			return "", NewError(InvalidArgument, "workspace path cannot traverse its root", nil)
+		}
+	}
+	clean := path.Clean(workspace)
+	if !path.IsAbs(workspace) || (clean != root && !strings.HasPrefix(clean, root+"/")) {
+		return "", NewError(InvalidArgument, "workspace must be inside the guest workspace root", nil)
+	}
+	return clean, nil
 }

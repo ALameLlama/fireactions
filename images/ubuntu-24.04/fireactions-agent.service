@@ -1,0 +1,15 @@
+[Unit]
+Description=Fireactions guest agent
+After=basic.target
+
+[Service]
+Type=simple
+User=root
+ExecStartPre=/usr/bin/ln -snf /proc/net/pnp /etc/resolv.conf
+ExecStart=/usr/local/bin/fireactions agent --port 9001 --workspace-root /workspace --default-user ci
+Delegate=yes
+Restart=on-failure
+RestartSec=1s
+
+[Install]
+WantedBy=multi-user.target

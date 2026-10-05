@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -23,6 +24,37 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func TestEffectiveCNIConfigOverridesOnlyHostLocalResolver(t *testing.T) {
+	resolver := filepath.Join(t.TempDir(), "resolv.conf")
+	if err := os.WriteFile(resolver, []byte("nameserver 127.0.0.1\nnameserver 10.10.0.1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	input := []byte(`{"cniVersion":"1.0.0","name":"fireactions","plugins":[{"type":"bridge","bridge":"fa0","ipam":{"type":"host-local","subnet":"10.88.0.0/16","rangeStart":"10.88.0.10","resolvConf":"old"}},{"type":"firewall","backend":"iptables"}]}`)
+	effective, err := effectiveCNIConfig(input, resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got, want map[string]any
+	if err := json.Unmarshal(effective, &got); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(input, &want); err != nil {
+		t.Fatal(err)
+	}
+	want["plugins"].([]any)[0].(map[string]any)["ipam"].(map[string]any)["resolvConf"] = resolver
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("effective CNI policy changed beyond resolver path: %#v", got)
+	}
+	if _, err := libcni.ConfListFromBytes(effective); err != nil {
+		t.Fatalf("effective CNI list is invalid: %v", err)
+	}
+	if err := os.WriteFile(resolver, []byte("nameserver 127.0.0.1\nnameserver ::1\nnameserver 9.9.9.9\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := effectiveCNIConfig(input, resolver); err == nil {
+		t.Fatal("loopback-only resolver was accepted")
+	}
+}
 func TestOwnedResourcesRetriesOnlyUnfinishedSteps(t *testing.T) {
 	for failure := range 5 {
 		t.Run(strconv.Itoa(failure), func(t *testing.T) {

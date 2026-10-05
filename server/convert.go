@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/containerd/containerd"
+	"github.com/hostinger/fireactions/internal/executor"
 	serverv1 "github.com/hostinger/fireactions/proto/server/v1"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -25,8 +26,16 @@ func convertPoolToProto(ctx context.Context, pool *Pool) *serverv1.Pool {
 	}
 }
 
-func convertMachineToProto(ctx context.Context, machine *Machine) *serverv1.Machine {
+func convertMachineToProto(ctx context.Context, machine *Machine, managers ...*executor.Manager) *serverv1.Machine {
 	metadata := machine.Metadata()
+	if len(managers) != 0 && managers[0] != nil {
+		if id, removing := managers[0].EnvironmentForVM(machine.Name); id != "" {
+			metadata.EnvironmentID = id
+			if removing {
+				metadata.State = "removing"
+			}
+		}
+	}
 	return &serverv1.Machine{
 		ID:            machine.Name,
 		Pool:          machine.Pool,

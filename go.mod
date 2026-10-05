@@ -5,9 +5,11 @@ go 1.26.0
 require (
 	github.com/containerd/errdefs v1.0.0
 	github.com/containerd/log v0.2.0
+	github.com/containernetworking/cni v1.3.0
 	github.com/distribution/reference v0.6.0
 	github.com/docker/go-units v0.5.0
 	github.com/fsnotify/fsnotify v1.10.1
+	github.com/mdlayher/vsock v1.3.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/rs/zerolog v1.35.1
 	github.com/sirupsen/logrus v1.10.2
@@ -33,7 +35,6 @@ require (
 	github.com/containerd/platforms v1.0.0-rc.4 // indirect
 	github.com/containerd/ttrpc v1.2.8 // indirect
 	github.com/containerd/typeurl/v2 v2.3.0 // indirect
-	github.com/containernetworking/cni v1.3.0 // indirect
 	github.com/containernetworking/plugins v1.9.1 // indirect
 	github.com/cyphar/filepath-securejoin v0.6.1 // indirect
 	github.com/docker/cli v29.5.2+incompatible // indirect
@@ -78,7 +79,6 @@ require (
 	github.com/mattn/go-isatty v0.0.22 // indirect
 	github.com/mattn/go-runewidth v0.0.23 // indirect
 	github.com/mdlayher/socket v0.6.1 // indirect
-	github.com/mdlayher/vsock v1.3.0 // indirect
 	github.com/moby/locker v1.0.1 // indirect
 	github.com/moby/sys/mountinfo v0.7.2 // indirect
 	github.com/moby/sys/sequential v0.6.0 // indirect
@@ -128,7 +128,7 @@ require (
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sync v0.23.0
-	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/sys v0.48.0
 	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1

@@ -39,3 +39,10 @@ func TestImageRemoveCommand_Structure(t *testing.T) {
 	assert.NotNil(t, cmd.RunE)
 	assert.Contains(t, cmd.Aliases, "rm")
 }
+
+func TestImageEndpointDefaultsToUnixSocket(t *testing.T) {
+	cmd := newImageCmd()
+	endpoint, err := cmd.PersistentFlags().GetString("endpoint")
+	assert.NoError(t, err)
+	assert.Equal(t, "unix:///run/fireactions/plugin.sock", endpoint)
+}

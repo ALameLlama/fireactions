@@ -1,0 +1,48 @@
+containerd:
+  address: /run/containerd/containerd.sock
+  namespace: fireactions
+log_level: info
+
+socket_path: /run/fireactions/plugin.sock
+socket_group: fireactions
+state_dir: /var/lib/fireactions
+
+# The supplied host has this resolver path; verify it exists and has usable nameservers.
+network:
+  resolver_path: /run/systemd/resolve/resolv.conf
+
+guest:
+  startup_timeout: 2m
+  max_transfer_bytes: 10737418240
+  max_archive_entries: 100000
+
+leases:
+  max_lifetime: 3h2m
+  cleanup_grace: 2m
+  reap_interval: 10s
+
+pools:
+  - name: ubuntu-24.04
+    replicas: 0
+    image: localhost/fireactions-guest:ubuntu-24.04
+    image_pull_policy: Never
+    default_user: ci
+    firecracker:
+      binary_path: /usr/local/bin/firecracker
+      kernel_image_path: /var/lib/fireactions/kernels/6.1/vmlinux
+      kernel_args: "console=ttyS0 reboot=k panic=1 pci=off nomodules rw init=/sbin/init systemd.unified_cgroup_hierarchy=1"
+      machine_config:
+        vcpu_count: 2
+        mem_size_mib: 4096
+  - name: ubuntu-24.04-large
+    replicas: 0
+    image: localhost/fireactions-guest:ubuntu-24.04
+    image_pull_policy: Never
+    default_user: ci
+    firecracker:
+      binary_path: /usr/local/bin/firecracker
+      kernel_image_path: /var/lib/fireactions/kernels/6.1/vmlinux
+      kernel_args: "console=ttyS0 reboot=k panic=1 pci=off nomodules rw init=/sbin/init systemd.unified_cgroup_hierarchy=1"
+      machine_config:
+        vcpu_count: 4
+        mem_size_mib: 8192

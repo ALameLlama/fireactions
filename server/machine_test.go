@@ -3,13 +3,23 @@ package server
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/hostinger/fireactions/internal/executor"
+	"github.com/hostinger/fireactions/internal/guest"
+	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/test/bufconn"
 )
 
 func TestCIDAllocationReservedValuesAndOverflow(t *testing.T) {
@@ -82,8 +92,11 @@ func TestImageInfoUsesResolvedOCIConfiguration(t *testing.T) {
 	if len(info.ImageEnv) != 3 {
 		t.Fatalf("daemon environment leaked into image environment: %#v", info.ImageEnv)
 	}
-	machine := &Machine{info: info}
+	machine := &Machine{info: info, defaultUser: "profile-user"}
 	copy := machine.Info()
+	if copy.DefaultUser != "profile-user" {
+		t.Fatalf("profile default user did not override image user: %#v", copy)
+	}
 	copy.ImageEnv["PATH"] = "caller-mutated"
 	if machine.Info().ImageEnv["PATH"] != "/image/bin" {
 		t.Fatal("caller modified machine-owned image environment")
@@ -103,21 +116,21 @@ func TestImageInfoUsesResolvedOCIConfiguration(t *testing.T) {
 }
 
 func TestMachineConnectionIsCachedAndDestructionOwnsClose(t *testing.T) {
-	machine := &Machine{State: "idle", resources: &ownedResources{}}
-	first, _, err := machine.ConnectToGuestAgent(context.Background())
+	conn, err := grpc.NewClient("passthrough:test", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, _, err := machine.ConnectToGuestAgent(context.Background())
-	if err != nil || first != second {
-		t.Fatalf("guest connection was not machine-owned and cached: %v", err)
+	client := guest.New(conn)
+	machine := &Machine{State: "idle", resources: &ownedResources{}, guestConn: conn, guestClient: client}
+	if machine.Guest() != client {
+		t.Fatal("guest client was not cached by the machine")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := machine.Destroy(ctx); err != nil {
 		t.Fatalf("cancelled caller prevented independent cleanup: %v", err)
 	}
-	if _, _, err := machine.ConnectToGuestAgent(context.Background()); err == nil {
+	if _, err := machine.ConnectToGuestAgent(context.Background()); err == nil {
 		t.Fatal("destroyed VM reopened its control channel")
 	}
 	if machine.Metadata().State != "removing" {
@@ -176,5 +189,52 @@ func TestMachineMetadataUpdatesAreAtomic(t *testing.T) {
 func TestUnprovisionedMachineHasNoAddress(t *testing.T) {
 	if addr := (&Machine{}).GetAddr(); addr != "" {
 		t.Fatalf("unprovisioned VM has address %q", addr)
+	}
+}
+
+type invalidArgumentReadyServer struct {
+	agentv1.UnimplementedAgentServiceServer
+}
+
+func (invalidArgumentReadyServer) Ready(context.Context, *agentv1.ReadyRequest) (*agentv1.ReadyResponse, error) {
+	return nil, status.Error(codes.InvalidArgument, "invalid readiness request")
+}
+
+func TestConnectToGuestAgentReturnsPermanentReadyError(t *testing.T) {
+	listener := bufconn.Listen(1024 * 1024)
+	server := grpc.NewServer()
+	agentv1.RegisterAgentServiceServer(server, invalidArgumentReadyServer{})
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		server.Stop()
+		_ = listener.Close()
+	})
+
+	conn, err := grpc.NewClient("passthrough:bufconn",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return listener.Dial()
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	machine := &Machine{
+		guestConn:      conn,
+		guestClient:    guest.New(conn),
+		startupTimeout: 5 * time.Second,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	_, err = machine.ConnectToGuestAgent(ctx)
+	if got := executor.KindOf(err); got != executor.InvalidArgument {
+		t.Fatalf("ConnectToGuestAgent error kind = %v, want %v (err: %v)", got, executor.InvalidArgument, err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ConnectToGuestAgent consumed the caller deadline: %v", err)
 	}
 }

@@ -2,10 +2,8 @@ package server
 
 import (
 	"context"
-	"io"
 	"sort"
 
-	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
 	serverv1 "github.com/hostinger/fireactions/proto/server/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -137,7 +135,7 @@ func (s *Server) ListMachines(ctx context.Context, req *serverv1.ListMachinesReq
 
 	protoMachines := make([]*serverv1.Machine, len(machines))
 	for i, machine := range machines {
-		protoMachines[i] = convertMachineToProto(ctx, machine)
+		protoMachines[i] = convertMachineToProto(ctx, machine, s.executor)
 	}
 
 	return &serverv1.ListMachinesResponse{Machines: protoMachines}, nil
@@ -150,7 +148,7 @@ func (s *Server) GetMachine(ctx context.Context, req *serverv1.GetMachineRequest
 		return nil, status.Errorf(codes.NotFound, "machine not found: %v", err)
 	}
 
-	return &serverv1.GetMachineResponse{Machine: convertMachineToProto(ctx, machine)}, nil
+	return &serverv1.GetMachineResponse{Machine: convertMachineToProto(ctx, machine, s.executor)}, nil
 }
 
 // GetHealth implements ServerService.GetHealth.
@@ -172,34 +170,12 @@ func (s *Server) GetMachineLogs(req *serverv1.GetMachineLogsRequest, stream serv
 		return status.Errorf(codes.NotFound, "machine not found: %v", err)
 	}
 
-	_, client, err := machine.ConnectToGuestAgent(ctx)
-	if err != nil {
-		return status.Errorf(codes.Internal, "connect to agent: %v", err)
+	if err := machine.GuestLogs(ctx, req.Follow, req.TailLines, func(line string) error {
+		return stream.Send(&serverv1.GetMachineLogsResponse{Line: line})
+	}); err != nil {
+		return status.Errorf(codes.Internal, "guest logs: %v", err)
 	}
-
-	agentStream, err := client.GetLogs(ctx, &agentv1.GetLogsRequest{
-		Follow:    req.Follow,
-		TailLines: req.TailLines,
-	})
-	if err != nil {
-		return status.Errorf(codes.Internal, "agent GetLogs: %v", err)
-	}
-
-	// Proxy logs from agent to CLI
-	for {
-		agentResp, err := agentStream.Recv()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return status.Errorf(codes.Internal, "receive from agent: %v", err)
-		}
-
-		// Forward to client
-		if err := stream.Send(&serverv1.GetMachineLogsResponse{Line: agentResp.Line}); err != nil {
-			return err
-		}
-	}
+	return nil
 }
 
 // ListImages implements ServerService.ListImages.

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -254,6 +255,92 @@ func TestStartPreconditionsAndEnvironmentIsolation(t *testing.T) {
 	require.Equal(t, "/custom", executed.Env["PATH"])
 	require.Equal(t, "root", executed.User)
 	require.Equal(t, "/workspace/project", executed.Workdir)
+}
+
+func TestExecCreatesDeclaredWorkspaceButNotWorkdir(t *testing.T) {
+	vm := newTestVM("vm")
+	hostRoot, err := os.OpenRoot(t.TempDir())
+	require.NoError(t, err)
+	defer hostRoot.Close()
+	mapPath := func(guestPath string) string {
+		rel := strings.TrimPrefix(guestPath, WorkspaceRoot)
+		if rel == "" {
+			return "."
+		}
+		if rel != "" && !strings.HasPrefix(rel, "/") {
+			t.Fatalf("guest path %q is outside %s", guestPath, WorkspaceRoot)
+		}
+		return strings.TrimPrefix(rel, "/")
+	}
+	mkdirAll := func(guestPath string) error {
+		return hostRoot.MkdirAll(mapPath(guestPath), 0o755)
+	}
+	vm.guest.ready = func(_ context.Context, spec ReadySpec) (string, error) {
+		for _, directory := range spec.Directories {
+			if err := mkdirAll(directory); err != nil {
+				return "", err
+			}
+		}
+		return "test-agent", nil
+	}
+	vm.guest.exec = func(_ context.Context, spec ExecSpec, stdout, _ io.Writer) (ExecResult, error) {
+		file, err := hostRoot.Open(mapPath(spec.Workdir + "/marker"))
+		if err != nil {
+			return ExecResult{}, &LaunchError{Message: "working directory is missing"}
+		}
+		defer file.Close()
+		_, err = io.Copy(stdout, file)
+		return ExecResult{}, err
+	}
+	manager := testManager(t, fixedBackend(vm), Options{})
+	defer manager.Close(context.Background())
+	info := createEnvironment(t, manager, CreateSpec{})
+	startEnvironment(t, manager, info.ID)
+
+	workspace := WorkspaceRoot + "/owner/repo"
+	workdir := workspace + "/not-created"
+	_, err = hostRoot.Stat(mapPath(workspace))
+	require.ErrorIs(t, err, os.ErrNotExist)
+	spec := ExecSpec{Command: []string{"run"}, Workspace: workspace, Workdir: workdir}
+	var launch *LaunchError
+	if _, err := manager.Exec(context.Background(), info.ID, spec, nil, nil); !errors.As(err, &launch) {
+		t.Fatalf("Exec with missing Workdir error = %v, want launch failure", err)
+	}
+	workspaceInfo, err := hostRoot.Stat(mapPath(workspace))
+	require.NoError(t, err)
+	require.True(t, workspaceInfo.IsDir())
+	_, err = hostRoot.Stat(mapPath(workdir))
+	require.ErrorIs(t, err, os.ErrNotExist)
+
+	require.NoError(t, mkdirAll(workdir))
+	file, err := hostRoot.Create(mapPath(workdir + "/marker"))
+	require.NoError(t, err)
+	_, err = file.Write([]byte("persistent"))
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+	var output bytes.Buffer
+	_, err = manager.Exec(context.Background(), info.ID, spec, &output, nil)
+	require.NoError(t, err)
+	require.Equal(t, "persistent", output.String())
+	_, err = manager.Exec(context.Background(), info.ID, spec, nil, nil)
+	require.NoError(t, err)
+
+	missing := WorkspaceRoot + "/generic-missing"
+	_, err = manager.Exec(context.Background(), info.ID, ExecSpec{Command: []string{"run"}, Workdir: missing}, nil, nil)
+	if !errors.As(err, &launch) {
+		t.Fatalf("generic Exec with missing Workdir error = %v, want launch failure", err)
+	}
+	_, err = hostRoot.Stat(mapPath(missing))
+	require.ErrorIs(t, err, os.ErrNotExist)
+	other := WorkspaceRoot + "/other-repo"
+	_, err = manager.Exec(context.Background(), info.ID, ExecSpec{Command: []string{"run"}, Workspace: other}, nil, nil)
+	require.Equal(t, InvalidArgument, KindOf(err))
+	_, err = hostRoot.Stat(mapPath(other))
+	require.ErrorIs(t, err, os.ErrNotExist)
+	for _, escaped := range []string{WorkspaceRoot + "/../outside", WorkspaceRoot + "/owner/../outside", WorkspaceRoot + "/owner/\x00repo"} {
+		_, err := manager.Exec(context.Background(), info.ID, ExecSpec{Command: []string{"run"}, Workspace: escaped}, nil, nil)
+		require.Equal(t, InvalidArgument, KindOf(err))
+	}
 }
 
 func TestImagePathAndProfileReadySettings(t *testing.T) {

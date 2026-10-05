@@ -1,5 +1,7 @@
 ---
-bind_address: 0.0.0.0:8080
+socket_path: /run/fireactions/plugin.sock
+socket_group: fireactions
+state_dir: /var/lib/fireactions
 
 
 pools:
@@ -19,4 +21,7 @@ pools:
         bandwidth:
           refill_time: 1000
 
+containerd:
+  address: /run/containerd/containerd.sock
+  namespace: fireactions
 log_level: debug

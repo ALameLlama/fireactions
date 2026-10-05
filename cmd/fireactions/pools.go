@@ -17,7 +17,7 @@ func newPoolsCmd() *cobra.Command {
 		GroupID: "pool",
 	}
 
-	cmd.PersistentFlags().StringP("endpoint", "e", "127.0.0.1:8080", "Sets the Fireactions server endpoint")
+	cmd.PersistentFlags().StringP("endpoint", "e", "unix:///run/fireactions/plugin.sock", "Sets the Fireactions server endpoint")
 
 	cmd.AddCommand(newPoolsListCmd())
 	cmd.AddCommand(newPoolsPauseCmd())

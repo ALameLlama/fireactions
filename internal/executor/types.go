@@ -51,6 +51,9 @@ type ExecSpec struct {
 	Command       []string
 	Env           map[string]string
 	User, Workdir string
+	// Workspace is a trusted declaration of the runner checkout to prepare.
+	// It is distinct from Workdir, which is passed unchanged to the guest.
+	Workspace string
 }
 
 type ExecResult struct {

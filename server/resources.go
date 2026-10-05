@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -18,6 +20,92 @@ import (
 	"github.com/firecracker-microvm/firecracker-go-sdk/cni/vmconf"
 	"golang.org/x/sys/unix"
 )
+
+func effectiveCNIConfig(raw []byte, resolverPath string) ([]byte, error) {
+	if resolverPath == "" {
+		return nil, fmt.Errorf("DNS resolver path is not configured")
+	}
+	resolver, err := os.ReadFile(resolverPath)
+	if err != nil {
+		return nil, fmt.Errorf("reading DNS resolver: %w", err)
+	}
+	hasUsableNameserver := false
+	nameserverCount := 0
+	unsupported := false
+	for _, line := range strings.Split(string(resolver), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "nameserver" {
+			continue
+		}
+		if nameserverCount < 2 {
+			ip := net.ParseIP(fields[1])
+			if ip == nil || ip.To4() == nil {
+				unsupported = true
+			} else if !ip.IsLoopback() && !ip.IsUnspecified() {
+				hasUsableNameserver = true
+			}
+		}
+		nameserverCount++
+	}
+	if unsupported {
+		return nil, fmt.Errorf("DNS resolver has an IPv6 or invalid nameserver in the first two entries; Firecracker guest networking supports IPv4 only")
+	}
+	if !hasUsableNameserver {
+		return nil, fmt.Errorf("DNS resolver has no usable non-loopback IPv4 nameserver in the first two entries")
+	}
+	var config map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &config); err != nil {
+		return nil, fmt.Errorf("decoding CNI network configuration: %w", err)
+	}
+	var plugins []json.RawMessage
+	if err := json.Unmarshal(config["plugins"], &plugins); err != nil {
+		return nil, fmt.Errorf("decoding CNI plugin list: %w", err)
+	}
+	if plugins == nil {
+		return nil, fmt.Errorf("CNI configuration has no plugin list")
+	}
+	hostLocal := false
+	for i, value := range plugins {
+		var plugin map[string]json.RawMessage
+		if err := json.Unmarshal(value, &plugin); err != nil {
+			continue
+		}
+		var ipam map[string]json.RawMessage
+		if err := json.Unmarshal(plugin["ipam"], &ipam); err != nil {
+			continue
+		}
+		var ipamType string
+		if err := json.Unmarshal(ipam["type"], &ipamType); err != nil || ipamType != "host-local" {
+			continue
+		}
+		path, err := json.Marshal(resolverPath)
+		if err != nil {
+			return nil, fmt.Errorf("encoding resolver path: %w", err)
+		}
+		ipam["resolvConf"] = path
+		plugin["ipam"], err = json.Marshal(ipam)
+		if err != nil {
+			return nil, fmt.Errorf("encoding host-local IPAM: %w", err)
+		}
+		plugins[i], err = json.Marshal(plugin)
+		if err != nil {
+			return nil, fmt.Errorf("encoding CNI plugin: %w", err)
+		}
+		hostLocal = true
+	}
+	if !hostLocal {
+		return nil, fmt.Errorf("fireactions CNI list has no host-local IPAM plugin")
+	}
+	config["plugins"], err = json.Marshal(plugins)
+	if err != nil {
+		return nil, fmt.Errorf("encoding CNI plugin list: %w", err)
+	}
+	effective, err := json.Marshal(config)
+	if err != nil {
+		return nil, fmt.Errorf("encoding effective CNI configuration: %w", err)
+	}
+	return effective, nil
+}
 
 const resourceCleanupTimeout = 30 * time.Second
 

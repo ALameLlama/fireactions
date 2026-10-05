@@ -2,8 +2,12 @@ package server
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"path/filepath"
 	"regexp"
+	"strings"
+	"time"
 
 	"github.com/firecracker-microvm/firecracker-go-sdk"
 	"github.com/firecracker-microvm/firecracker-go-sdk/client/models"
@@ -13,13 +17,34 @@ import (
 
 // Config is the configuration for the Client.
 type Config struct {
-	BindAddress string            `yaml:"bind_address" validate:"required,hostname_port"`
+	SocketPath  string            `yaml:"socket_path" validate:"required"`
+	SocketGroup string            `yaml:"socket_group" validate:"required"`
+	StateDir    string            `yaml:"state_dir" validate:"required"`
 	Containerd  *ContainerdConfig `yaml:"containerd" validate:"required"`
 	Metrics     *MetricsConfig    `yaml:"metrics"`
+	Guest       GuestConfig       `yaml:"guest"`
+	Leases      LeaseConfig       `yaml:"leases"`
+	Network     NetworkConfig     `yaml:"network"`
 	Pools       []*PoolConfig     `yaml:"pools" validate:"required,min=1,dive,required"`
 	LogLevel    string            `yaml:"log_level" validate:"required,oneof=debug info warn error fatal panic trace"`
 
 	path string
+}
+
+type GuestConfig struct {
+	StartupTimeout    time.Duration `yaml:"startup_timeout"`
+	MaxTransferBytes  int64         `yaml:"max_transfer_bytes"`
+	MaxArchiveEntries int           `yaml:"max_archive_entries"`
+}
+
+type LeaseConfig struct {
+	MaxLifetime  time.Duration `yaml:"max_lifetime"`
+	CleanupGrace time.Duration `yaml:"cleanup_grace"`
+	ReapInterval time.Duration `yaml:"reap_interval"`
+}
+
+type NetworkConfig struct {
+	ResolverPath string `yaml:"resolver_path"`
 }
 
 type ContainerdConfig struct {
@@ -102,15 +127,22 @@ func (c *FirecrackerTokenBucketConfig) toSDK() *models.TokenBucket {
 
 // DefaultConfig creates a new Config with default values.
 func DefaultConfig() *Config {
-	c := &Config{
-		BindAddress: ":8080",
+	return &Config{
+		SocketPath:  "/run/fireactions/plugin.sock",
+		SocketGroup: "fireactions",
+		StateDir:    "/var/lib/fireactions",
 		Containerd:  &ContainerdConfig{Address: "/run/containerd/containerd.sock", Namespace: "fireactions"},
-		Metrics:     &MetricsConfig{Enabled: true, Address: ":8081"},
-		Pools:       []*PoolConfig{},
-		LogLevel:    "debug",
+		Metrics:     &MetricsConfig{Enabled: true, Address: "127.0.0.1:8081"},
+		Guest: GuestConfig{
+			StartupTimeout:    2 * time.Minute,
+			MaxTransferBytes:  10 * 1024 * 1024 * 1024,
+			MaxArchiveEntries: 100000,
+		},
+		Leases:   LeaseConfig{MaxLifetime: 3*time.Hour + 2*time.Minute, CleanupGrace: 2 * time.Minute, ReapInterval: 10 * time.Second},
+		Network:  NetworkConfig{ResolverPath: "/etc/resolv.conf"},
+		Pools:    []*PoolConfig{},
+		LogLevel: "debug",
 	}
-
-	return c
 }
 
 // NewConfigFromFile creates a new Config from a file.
@@ -144,15 +176,60 @@ func (c *Config) Load() error {
 
 	decoder := yaml.NewDecoder(file)
 	decoder.KnownFields(true)
-	return decoder.Decode(c)
+	if err := decoder.Decode(c); err != nil {
+		return err
+	}
+	for _, pool := range c.Pools {
+		if pool != nil && pool.DefaultUser == "" {
+			pool.DefaultUser = "ci"
+		}
+	}
+	return nil
 }
 
-var profileNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+var profileNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$`)
+var socketGroupPattern = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+var userNamePattern = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 
 // Validate validates the configuration.
 func (c *Config) Validate() error {
 	if err := validator.New().Struct(c); err != nil {
 		return err
+	}
+	for name, path := range map[string]string{
+		"socket_path": c.SocketPath, "state_dir": c.StateDir, "network.resolver_path": c.Network.ResolverPath,
+	} {
+		if !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.Contains(path, "\x00") {
+			return fmt.Errorf("%s must be an absolute, clean path", name)
+		}
+	}
+	if c.SocketPath == "/" || c.StateDir == "/" || c.Network.ResolverPath == "/" {
+		return fmt.Errorf("socket_path, state_dir, and network.resolver_path must name specific paths")
+	}
+	if len(c.SocketPath) > 107 || filepath.Dir(c.SocketPath) == "/" {
+		return fmt.Errorf("socket_path is not a usable Unix socket path")
+	}
+	if !socketGroupPattern.MatchString(c.SocketGroup) {
+		return fmt.Errorf("socket_group must be a valid Unix group name")
+	}
+	if c.Metrics != nil && c.Metrics.Enabled {
+		host, _, err := net.SplitHostPort(c.Metrics.Address)
+		if err != nil {
+			return fmt.Errorf("metrics.address must be a loopback host and port")
+		}
+		ip := net.ParseIP(host)
+		if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			return fmt.Errorf("metrics.address must be loopback-only")
+		}
+	}
+	if c.Guest.StartupTimeout <= 0 || c.Guest.MaxTransferBytes <= 0 || c.Guest.MaxArchiveEntries <= 0 {
+		return fmt.Errorf("guest limits and startup_timeout must be positive")
+	}
+	if c.Leases.MaxLifetime <= 0 || c.Leases.CleanupGrace <= 0 || c.Leases.ReapInterval <= 0 {
+		return fmt.Errorf("lease durations must be positive")
+	}
+	if c.Leases.ReapInterval > c.Leases.CleanupGrace || c.Guest.StartupTimeout > c.Leases.MaxLifetime {
+		return fmt.Errorf("reap_interval must not exceed cleanup_grace and startup_timeout must not exceed max_lifetime")
 	}
 
 	names := make(map[string]struct{}, len(c.Pools))
@@ -162,6 +239,9 @@ func (c *Config) Validate() error {
 		}
 		if _, exists := names[pool.Name]; exists {
 			return fmt.Errorf("duplicate profile name %q", pool.Name)
+		}
+		if !userNamePattern.MatchString(pool.DefaultUser) {
+			return fmt.Errorf("profile %q default_user must be a valid guest user name", pool.Name)
 		}
 		names[pool.Name] = struct{}{}
 	}

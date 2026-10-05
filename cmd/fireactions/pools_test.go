@@ -54,3 +54,10 @@ func TestPoolsListCommand_Structure(t *testing.T) {
 	assert.Equal(t, "list", cmd.Use)
 	assert.NotNil(t, cmd.RunE)
 }
+
+func TestAdminEndpointsDefaultToUnixSocket(t *testing.T) {
+	cmd := newPoolsCmd()
+	endpoint, err := cmd.PersistentFlags().GetString("endpoint")
+	assert.NoError(t, err)
+	assert.Equal(t, "unix:///run/fireactions/plugin.sock", endpoint)
+}

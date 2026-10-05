@@ -1,5 +1,9 @@
 ---
-bind_address: 0.0.0.0:8080
+socket_path: /run/fireactions/plugin.sock
+socket_group: fireactions
+state_dir: /var/lib/fireactions
+network:
+  resolver_path: /etc/resolv.conf
 
 
 metrics:
@@ -41,6 +45,7 @@ pools:
           size: 2000
           refill_time: 1000
 - name: fireactions-2vcpu-4gb
+  default_user: ci
   replicas: 1
   image: localhost/fireactions-guest:ubuntu-24.04
   image_pull_policy: Never
@@ -52,4 +57,7 @@ pools:
       mem_size_mib: 4096
       vcpu_count: 2
 
+containerd:
+  address: /run/containerd/containerd.sock
+  namespace: fireactions
 log_level: debug

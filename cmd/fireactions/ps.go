@@ -20,7 +20,7 @@ func newPsCmd() *cobra.Command {
 		GroupID: "machine",
 	}
 
-	cmd.Flags().StringP("endpoint", "e", "127.0.0.1:8080", "Sets the Fireactions server endpoint")
+	cmd.Flags().StringP("endpoint", "e", "unix:///run/fireactions/plugin.sock", "Sets the Fireactions server endpoint")
 
 	return cmd
 }

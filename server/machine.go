@@ -26,11 +26,12 @@ import (
 	"github.com/firecracker-microvm/firecracker-go-sdk/vsock"
 	"github.com/hostinger/fireactions/helper/stringid"
 	"github.com/hostinger/fireactions/internal/executor"
-	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
+	"github.com/hostinger/fireactions/internal/guest"
 	"github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
@@ -47,17 +48,23 @@ type Machine struct {
 	AgentVersion  string
 	EnvironmentID string
 
-	metadataMu    sync.RWMutex
-	info          executor.VMInfo
-	vsockCID      uint32
-	vsockPath     string
-	guestMu       sync.Mutex
-	guestConn     *grpc.ClientConn
-	guestClosed   bool
-	resources     *ownedResources
-	cleanupQueued atomic.Bool
-	vmmCancel     context.CancelFunc
+	metadataMu     sync.RWMutex
+	info           executor.VMInfo
+	vsockCID       uint32
+	vsockPath      string
+	guestMu        sync.Mutex
+	guestConn      *grpc.ClientConn
+	guestClient    *guest.Client
+	guestClosed    bool
+	resources      *ownedResources
+	cleanupQueued  atomic.Bool
+	vmmCancel      context.CancelFunc
+	readySpec      executor.ReadySpec
+	startupTimeout time.Duration
+	defaultUser    string
 }
+
+var _ executor.VM = (*Machine)(nil)
 
 type MachineMetadata struct {
 	State         string
@@ -88,19 +95,22 @@ func (m *Machine) ID() string { return m.Name }
 func (m *Machine) Info() executor.VMInfo {
 	info := m.info
 	info.ImageEnv = maps.Clone(info.ImageEnv)
+	if m.defaultUser != "" {
+		info.DefaultUser = m.defaultUser
+	}
 	return info
 }
 
-// ConnectToGuestAgent lends the machine-owned connection. Callers must not close
-// it. NewClient is lazy; successful construction does not imply guest readiness.
-func (m *Machine) ConnectToGuestAgent(ctx context.Context) (*grpc.ClientConn, agentv1.AgentServiceClient, error) {
+// ConnectToGuestAgent waits for and verifies the private agent, then returns its
+// machine-owned client. The connection is never exposed to callers.
+func (m *Machine) ConnectToGuestAgent(ctx context.Context) (executor.Guest, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	m.guestMu.Lock()
-	defer m.guestMu.Unlock()
 	if m.guestClosed {
-		return nil, nil, fmt.Errorf("guest connection is closed")
+		m.guestMu.Unlock()
+		return nil, fmt.Errorf("guest connection is closed")
 	}
 	if m.guestConn == nil {
 		dialer := func(ctx context.Context, _ string) (net.Conn, error) {
@@ -110,11 +120,79 @@ func (m *Machine) ConnectToGuestAgent(ctx context.Context) (*grpc.ClientConn, ag
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 			grpc.WithContextDialer(dialer))
 		if err != nil {
-			return nil, nil, fmt.Errorf("grpc dial: %w", err)
+			m.guestMu.Unlock()
+			return nil, fmt.Errorf("grpc dial: %w", err)
 		}
 		m.guestConn = conn
+		m.guestClient = guest.New(conn)
 	}
-	return m.guestConn, agentv1.NewAgentServiceClient(m.guestConn), nil
+	conn, client := m.guestConn, m.guestClient
+	m.guestMu.Unlock()
+	startupTimeout := m.startupTimeout
+	if startupTimeout <= 0 {
+		startupTimeout = 2 * time.Minute
+	}
+	startupCtx, cancel := context.WithTimeout(ctx, startupTimeout)
+	defer cancel()
+	ready := m.readySpec
+	if len(ready.Directories) == 0 {
+		ready.Directories = []string{m.info.Layout.Root, m.info.Layout.Act, m.info.Layout.ToolCache, m.info.Layout.Temp}
+	}
+	if ready.DefaultUser == "" {
+		ready.DefaultUser = m.Info().DefaultUser
+	}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := startupCtx.Err(); err != nil {
+			return nil, err
+		}
+		state := conn.GetState()
+		if state == connectivity.Shutdown {
+			return nil, executor.NewError(executor.Unavailable, "guest agent connection closed", nil)
+		}
+		if state == connectivity.Idle {
+			conn.Connect()
+		}
+		if state == connectivity.Ready {
+			version, err := client.Ready(startupCtx, ready)
+			if err == nil {
+				m.SetAgentVersion(version)
+				return client, nil
+			}
+			if startupCtx.Err() != nil {
+				return nil, startupCtx.Err()
+			}
+			if executor.KindOf(err) != executor.Unavailable {
+				return nil, err
+			}
+		}
+		select {
+		case <-startupCtx.Done():
+			return nil, startupCtx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (m *Machine) Guest() executor.Guest {
+	m.guestMu.Lock()
+	defer m.guestMu.Unlock()
+	return m.guestClient
+}
+
+func (m *Machine) GuestLogs(ctx context.Context, follow bool, tailLines int32, send func(string) error) error {
+	client, err := m.ConnectToGuestAgent(ctx)
+	if err != nil {
+		return err
+	}
+	logs, ok := client.(interface {
+		Logs(context.Context, bool, int32, func(string) error) error
+	})
+	if !ok {
+		return fmt.Errorf("guest client does not provide logs")
+	}
+	return logs.Logs(ctx, follow, tailLines, send)
 }
 
 func (m *Machine) closeGuest() error {
@@ -191,7 +269,7 @@ func imageVMInfo(image ocispec.Image) (executor.VMInfo, error) {
 	}
 	user := image.Config.User
 	if user == "" {
-		user = "ci"
+		user = executor.DefaultUser
 	}
 	return executor.VMInfo{
 		Layout:      layout,
@@ -233,6 +311,15 @@ func (p *Pool) provisionMachine(ctx context.Context) (_ *Machine, resultErr erro
 		return nil, err
 	}
 	vmID := p.config.Name + "-" + stringid.New()
+	if p.stateDir == "" {
+		return nil, fmt.Errorf("runtime state directory is not configured")
+	}
+	if err := os.MkdirAll(p.GetDir(), 0700); err != nil {
+		return nil, fmt.Errorf("creating pool resource directory: %w", err)
+	}
+	if err := os.Chmod(p.GetDir(), 0700); err != nil {
+		return nil, fmt.Errorf("protecting pool resource directory: %w", err)
+	}
 	resourceDir := filepath.Join(p.GetDir(), vmID)
 	apiSocket := filepath.Join(resourceDir, "api.sock")
 	if len(apiSocket) >= 108 {
@@ -248,6 +335,7 @@ func (p *Pool) provisionMachine(ctx context.Context) (_ *Machine, resultErr erro
 	m := &Machine{
 		Name: vmID, Pool: p.config.Name, State: "provisioning", CreatedAt: time.Now().UTC(),
 		info: info, vsockCID: cid, vsockPath: filepath.Join(resourceDir, "vsock"), resources: r,
+		readySpec: p.ready, startupTimeout: p.startupTimeout, defaultUser: p.config.DefaultUser,
 	}
 	var leaseCancel func(context.Context) error
 	var snapshotOwned, directoryOwned, netnsOwned, networkAttempted bool
@@ -364,7 +452,15 @@ func (p *Pool) provisionMachine(ctx context.Context) (_ *Machine, resultErr erro
 	if err != nil {
 		return nil, fmt.Errorf("loading fireactions CNI network: %w", err)
 	}
-	r.cniConfig = append([]byte(nil), conf.Bytes...)
+	effective, err := effectiveCNIConfig(conf.Bytes, p.resolverPath)
+	if err != nil {
+		return nil, err
+	}
+	conf, err = libcni.ConfListFromBytes(effective)
+	if err != nil {
+		return nil, fmt.Errorf("parsing effective CNI network: %w", err)
+	}
+	r.cniConfig = effective
 	if err := os.MkdirAll(r.cniCacheDir, 0700); err != nil {
 		return nil, fmt.Errorf("creating CNI cache directory: %w", err)
 	}

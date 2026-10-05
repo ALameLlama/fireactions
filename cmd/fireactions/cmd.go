@@ -50,9 +50,8 @@ func NewRootCommand() *cobra.Command {
 	cmd.AddGroup(&cobra.Group{ID: "pool", Title: "Pool management commands:"})
 	cmd.AddCommand(newPoolsCmd())
 
-	cmd.AddGroup(&cobra.Group{ID: "machine", Title: "Machine management commands:"})
+	cmd.AddGroup(&cobra.Group{ID: "machine", Title: "VM diagnostics commands:"})
 	cmd.AddCommand(newPsCmd())
-	cmd.AddCommand(newLoginCmd())
 	cmd.AddCommand(newLogsCmd())
 
 	cmd.AddGroup(&cobra.Group{ID: "image", Title: "Image management commands:"})

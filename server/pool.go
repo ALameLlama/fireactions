@@ -2,14 +2,16 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/log"
+	"github.com/hostinger/fireactions/internal/executor"
 	"github.com/rs/zerolog"
 )
 
@@ -22,32 +24,46 @@ type Pool struct {
 	config         *PoolConfig
 	containerd     *containerd.Client
 	imageManager   *imageManager
+	replicas       atomic.Int32
 	pendingCreates atomic.Int32
 	pendingDeletes atomic.Int32
 	machinesMu     *sync.Mutex
 	machines       map[string]*Machine
 	logger         *zerolog.Logger
-	replicas       atomic.Int32
-	isActive       bool
 	scaleTrigger   chan struct{}
 	stopCh         chan struct{}
 	doneCh         chan struct{}
-	cleanupWg      sync.WaitGroup
-	workWg         sync.WaitGroup
 	stopOnce       sync.Once
+	isActive       bool
+	acquireWg      sync.WaitGroup
+	workWg         sync.WaitGroup
+	cleanupWg      sync.WaitGroup
 	ctx            context.Context
 	cancel         context.CancelFunc
 	nextCID        *atomic.Uint32
 	l              sync.Mutex
+	stateDir       string
+	resolverPath   string
+	startupTimeout time.Duration
+	ready          executor.ReadySpec
 }
 
-// PoolConfig represents the configuration of a Pool.
 type PoolConfig struct {
 	Name            string             `yaml:"name" validate:"required"`
 	Replicas        int                `yaml:"replicas" validate:"min=0"`
 	Image           string             `yaml:"image" validate:"required"`
 	ImagePullPolicy string             `yaml:"image_pull_policy" validate:"required,oneof=Always Never IfNotPresent"`
+	DefaultUser     string             `yaml:"default_user"`
 	Firecracker     *FirecrackerConfig `yaml:"firecracker" validate:"required"`
+}
+
+// configureRuntime injects daemon-owned paths and trusted guest readiness values
+// before Run begins.
+func (p *Pool) configureRuntime(stateDir, resolverPath string, startupTimeout time.Duration, ready executor.ReadySpec) {
+	p.stateDir = stateDir
+	p.resolverPath = resolverPath
+	p.startupTimeout = startupTimeout
+	p.ready = ready
 }
 
 // NewPool creates a new Pool.
@@ -73,15 +89,6 @@ func NewPool(logger *zerolog.Logger, config *PoolConfig, imageManager *imageMana
 	}
 
 	p.replicas.Store(int32(config.Replicas))
-
-	if err := os.MkdirAll(p.GetDir(), 0700); err != nil {
-		cancel()
-		return nil, fmt.Errorf("creating pool directory: %w", err)
-	}
-	if err := os.Chmod(p.GetDir(), 0700); err != nil {
-		cancel()
-		return nil, fmt.Errorf("protecting pool directory: %w", err)
-	}
 
 	metricPoolMachinesCurrent.
 		WithLabelValues(p.config.Name).Set(float64(p.GetCurrentSize()))
@@ -168,6 +175,7 @@ func (p *Pool) Stop() {
 		p.l.Lock()
 		p.l.Unlock()
 		p.workWg.Wait()
+		p.acquireWg.Wait()
 		machines, _ := p.ListMachines(context.Background())
 		var destruction sync.WaitGroup
 		for _, machine := range machines {
@@ -186,7 +194,7 @@ func (p *Pool) Stop() {
 
 // GetDir returns the directory where the pool sockets and logs are stored.
 func (p *Pool) GetDir() string {
-	return fmt.Sprintf("/var/lib/fireactions/pools/%s", p.config.Name)
+	return filepath.Join(p.stateDir, "pools", p.config.Name)
 }
 
 // Scale scales the pool to the desired size.
@@ -373,6 +381,71 @@ func (p *Pool) GetMachine(name string) (*Machine, error) {
 		return nil, fmt.Errorf("machine not found: %s", name)
 	}
 
+	return machine, nil
+}
+
+func (p *Pool) acquire(ctx context.Context, expiry time.Time) (executor.VM, error) {
+	p.l.Lock()
+	if !p.isActive {
+		p.l.Unlock()
+		return nil, fmt.Errorf("pool %q is paused", p.config.Name)
+	}
+	if p.ctx.Err() != nil {
+		p.l.Unlock()
+		return nil, p.ctx.Err()
+	}
+	p.acquireWg.Add(1)
+	p.l.Unlock()
+	defer p.acquireWg.Done()
+
+	acquireCtx, cancelAcquire := context.WithCancel(ctx)
+	stopOnPoolShutdown := context.AfterFunc(p.ctx, cancelAcquire)
+	defer stopOnPoolShutdown()
+	defer cancelAcquire()
+	if !expiry.IsZero() {
+		var expiryCancel context.CancelFunc
+		acquireCtx, expiryCancel = context.WithDeadline(acquireCtx, expiry)
+		defer expiryCancel()
+	}
+	if p.startupTimeout > 0 {
+		var timeoutCancel context.CancelFunc
+		acquireCtx, timeoutCancel = context.WithTimeout(acquireCtx, p.startupTimeout)
+		defer timeoutCancel()
+	}
+	machine, err := p.provisionMachine(acquireCtx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := machine.ConnectToGuestAgent(acquireCtx); err != nil {
+		cleanupErr := machine.Destroy(context.Background())
+		if cleanupErr != nil {
+			p.machinesMu.Lock()
+			p.machines[machine.Name] = machine
+			p.machinesMu.Unlock()
+		}
+		return nil, errors.Join(fmt.Errorf("guest readiness: %w", err), cleanupErr)
+	}
+	if err := acquireCtx.Err(); err != nil {
+		cleanupErr := machine.Destroy(context.Background())
+		if cleanupErr != nil {
+			p.machinesMu.Lock()
+			p.machines[machine.Name] = machine
+			p.machinesMu.Unlock()
+		}
+		return nil, errors.Join(err, cleanupErr)
+	}
+	machine.SetState("claimed", "")
+	p.machinesMu.Lock()
+	p.machines[machine.Name] = machine
+	p.machinesMu.Unlock()
+	p.cleanupWg.Add(1)
+	go func() {
+		defer p.cleanupWg.Done()
+		_ = machine.Wait(p.ctx)
+		if err := p.destroyMachine(context.Background(), machine); err != nil {
+			p.logger.Error().Err(err).Str("vm_id", machine.Name).Msg("Failed to clean up exited VM")
+		}
+	}()
 	return machine, nil
 }
 
