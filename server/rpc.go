@@ -51,7 +51,7 @@ func (s *Server) ScalePool(ctx context.Context, req *serverv1.ScalePoolRequest) 
 		return nil, status.Errorf(codes.NotFound, "pool not found: %v", err)
 	}
 
-	metricPoolScaleRequests.WithLabelValues(req.Name, pool.config.Runner.Organization).Inc()
+	metricPoolScaleRequests.WithLabelValues(pool.config.Name).Inc()
 
 	// Update the pool config with the new replicas value
 	// The Run() loop will handle the actual scaling

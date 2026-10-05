@@ -22,46 +22,46 @@ var (
 		Help:      "Total number of pools",
 	})
 
-	metricPoolRunnersCurrent = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name:      "pool_runners_current",
+	metricPoolMachinesCurrent = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name:      "pool_vms_current",
 		Namespace: namespace,
-		Help:      "Current number of running runners in a pool",
-	}, []string{"pool", "organization"})
+		Help:      "Current number of virtual machines in a profile",
+	}, []string{"profile"})
 
-	metricPoolRunnersDesired = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name:      "pool_runners_desired",
+	metricPoolMachinesDesired = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name:      "pool_vms_desired",
 		Namespace: namespace,
-		Help:      "Desired number of runners in a pool (replicas)",
-	}, []string{"pool", "organization"})
+		Help:      "Desired number of virtual machines in a profile (replicas)",
+	}, []string{"profile"})
 
-	metricPoolRunnersPending = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name:      "pool_runners_pending",
+	metricPoolMachinesPending = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name:      "pool_vms_pending",
 		Namespace: namespace,
-		Help:      "Number of pending VM create/delete operations in a pool",
-	}, []string{"pool", "organization"})
+		Help:      "Number of pending VM create/delete operations in a profile",
+	}, []string{"profile"})
 
 	metricPoolScaleRequests = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name:      "pool_scale_requests_total",
 		Namespace: namespace,
 		Help:      "Number of scale requests for a pool",
-	}, []string{"pool", "organization"})
+	}, []string{"profile"})
 
 	metricScaleOperations = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name:      "scale_operations_total",
 		Namespace: namespace,
 		Help:      "Total number of scale operations",
-	}, []string{"pool", "organization", "direction", "status"})
+	}, []string{"profile", "direction", "status"})
 
 	metricScaleDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:      "scale_duration_seconds",
 		Namespace: namespace,
 		Help:      "Time taken to complete a scale operation",
 		Buckets:   prometheus.DefBuckets,
-	}, []string{"pool", "organization", "direction"})
+	}, []string{"profile", "direction"})
 
 	metricPoolStatus = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name:      "pool_status",
 		Namespace: namespace,
 		Help:      "Status of a pool. 0 is paused, 1 is active.",
-	}, []string{"pool"})
+	}, []string{"profile"})
 )

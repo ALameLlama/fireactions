@@ -11,7 +11,6 @@ import (
 
 	"github.com/containerd/containerd"
 	"github.com/hostinger/fireactions"
-	"github.com/hostinger/fireactions/helper/github"
 	serverv1 "github.com/hostinger/fireactions/proto/server/v1"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
@@ -27,7 +26,6 @@ type Server struct {
 	pools         map[string]*Pool
 	grpcServer    *grpc.Server
 	metricsServer *http.Server
-	github        *github.Client
 	containerd    *containerd.Client
 	imageManager  *imageManager
 	l             *sync.Mutex
@@ -57,11 +55,6 @@ func New(config *Config, opts ...Opt) (*Server, error) {
 		return nil, fmt.Errorf("config: %w", err)
 	}
 
-	github, err := github.NewClient(config.GitHub.AppID, config.GitHub.AppPrivateKey)
-	if err != nil {
-		return nil, fmt.Errorf("creating github client: %w", err)
-	}
-
 	logger := zerolog.Nop()
 
 	containerdClient, err := containerd.New(config.Containerd.Address,
@@ -70,17 +63,12 @@ func New(config *Config, opts ...Opt) (*Server, error) {
 		return nil, fmt.Errorf("containerd: creating client: %w", err)
 	}
 
-	// Create gRPC server with interceptors
-	grpcServer := grpc.NewServer(
-	// TODO: Add auth interceptor for BasicAuth if config.BasicAuthEnabled
-	// TODO: Add logging interceptor
-	)
+	grpcServer := grpc.NewServer()
 
 	s := &Server{
 		config:     config,
 		grpcServer: grpcServer,
 		pools:      make(map[string]*Pool),
-		github:     github,
 		containerd: containerdClient,
 		l:          &sync.Mutex{},
 		logger:     &logger,
@@ -134,7 +122,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}()
 
 	for _, poolConfig := range s.config.Pools {
-		pool, err := NewPool(s.logger, poolConfig, s.github, s.imageManager, s.containerd, &s.nextCID)
+		pool, err := NewPool(s.logger, poolConfig, s.imageManager, s.containerd, &s.nextCID)
 		if err != nil {
 			return fmt.Errorf("creating pool: %w", err)
 		}

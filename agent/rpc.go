@@ -6,33 +6,13 @@ import (
 	"io"
 	"os"
 
+	"github.com/hostinger/fireactions"
 	"github.com/hostinger/fireactions/agent/tail"
 	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
 )
 
-func (a *Agent) GetRunnerState(ctx context.Context, req *agentv1.GetRunnerStateRequest) (*agentv1.GetRunnerStateResponse, error) {
-	if a.runner == nil {
-		return nil, fmt.Errorf("runner not initialized")
-	}
-
-	resp := &agentv1.GetRunnerStateResponse{
-		State: string(a.runner.GetState()),
-	}
-
-	return resp, nil
-}
-
-func (a *Agent) GetRunnerVersion(ctx context.Context, req *agentv1.GetRunnerVersionRequest) (*agentv1.GetRunnerVersionResponse, error) {
-	version, err := a.runner.GetVersion()
-	if err != nil {
-		return nil, fmt.Errorf("get runner version: %w", err)
-	}
-
-	resp := &agentv1.GetRunnerVersionResponse{
-		Version: version,
-	}
-
-	return resp, nil
+func (a *Agent) Ready(ctx context.Context, req *agentv1.ReadyRequest) (*agentv1.ReadyResponse, error) {
+	return &agentv1.ReadyResponse{Version: fireactions.Version}, nil
 }
 
 func (a *Agent) GetLogs(req *agentv1.GetLogsRequest, stream agentv1.AgentService_GetLogsServer) error {

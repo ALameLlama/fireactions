@@ -5,16 +5,13 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"time"
 
 	"github.com/firecracker-microvm/firecracker-go-sdk/vsock"
-	"github.com/hostinger/fireactions/agent/runner"
 	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
 	"github.com/rs/zerolog"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 )
 
@@ -28,7 +25,6 @@ type Agent struct {
 	logFile       string
 	logFileWriter *os.File
 	logger        *zerolog.Logger
-	runner        *runner.Runner
 }
 
 type Opt func(a *Agent)
@@ -69,6 +65,8 @@ func (a *Agent) setupLogger() error {
 
 	logLevel, err := zerolog.ParseLevel(a.cfg.LogLevel)
 	if err != nil {
+		logFileWriter.Close()
+		a.logFileWriter = nil
 		return fmt.Errorf("parse log level: %w", err)
 	}
 
@@ -84,21 +82,16 @@ func (a *Agent) setupLogger() error {
 // Close closes the agent resources, including the log file.
 func (a *Agent) Close() error {
 	if a.logFileWriter != nil {
-		return a.logFileWriter.Close()
+		err := a.logFileWriter.Close()
+		a.logFileWriter = nil
+		return err
 	}
 
 	return nil
 }
 
 func (a *Agent) Run(ctx context.Context) error {
-	if err := a.setHostname(); err != nil {
-		return fmt.Errorf("setting hostname: %w", err)
-	}
-
-	// Run GitHub runner in background - it will trigger shutdown on success
-	go a.runGitHubRunner(ctx)
-
-	// Run gRPC server in main flow
+	defer a.Close()
 	return a.runGRPCServer(ctx)
 }
 
@@ -119,54 +112,30 @@ func (a *Agent) runGRPCServer(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	go func() {
 		a.logger.Info().Msgf("Agent GRPC server listening on VSOCK port %d", a.cfg.Port)
-		if err := grpcServer.Serve(listener); err != nil {
-			errCh <- fmt.Errorf("grpc serve: %w", err)
-		}
+		errCh <- grpcServer.Serve(listener)
 	}()
 
 	select {
 	case <-ctx.Done():
-		grpcServer.GracefulStop()
+		stopped := make(chan struct{})
+		go func() {
+			grpcServer.GracefulStop()
+			close(stopped)
+		}()
+		timer := time.NewTimer(2 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-stopped:
+		case <-timer.C:
+			grpcServer.Stop()
+			<-stopped
+		}
 		return nil
 	case err := <-errCh:
-		return err
+		grpcServer.Stop()
+		if err != nil {
+			return fmt.Errorf("grpc serve: %w", err)
+		}
+		return nil
 	}
-}
-
-func (a *Agent) runGitHubRunner(ctx context.Context) {
-	a.runner = runner.New(
-		a.cfg.RunnerJITConfig,
-		runner.WithLogger(a.logger),
-	)
-
-	if err := a.runner.Run(ctx); err != nil {
-		a.logger.Error().Err(err).Msg("Runner encountered an error")
-	}
-
-	if !a.cfg.ShutdownOnExit {
-		a.logger.Info().Msg("Runner completed, but shutdown on exit is disabled - keeping VM running")
-		return
-	}
-
-	a.logger.Info().Msg("Runner completed, initiating VM shutdown")
-	a.shutdown()
-}
-
-func (a *Agent) shutdown() {
-	// We don't need to wait for it to complete since the VM will shut down anyway
-	cmd := exec.Command("systemctl", "reboot")
-	if err := cmd.Start(); err != nil {
-		a.logger.Error().Err(err).Msg("Failed to initiate VM shutdown")
-		return
-	}
-
-	a.logger.Info().Msg("Shutdown command executed")
-}
-
-func (a *Agent) setHostname() error {
-	if err := unix.Sethostname([]byte(a.cfg.Hostname)); err != nil {
-		return fmt.Errorf("sethostname: %w", err)
-	}
-
-	return nil
 }

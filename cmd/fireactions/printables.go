@@ -1,7 +1,6 @@
 package main
 
 import (
-	"strings"
 	"time"
 
 	"github.com/docker/go-units"
@@ -14,19 +13,16 @@ type printablePool struct {
 }
 
 func (p *printablePool) Cols() []string {
-	return []string{"Name", "Current", "Desired", "Organization", "Group ID", "Labels", "Image", "State"}
+	return []string{"Name", "Current", "Desired", "Image", "State"}
 }
 
 func (p *printablePool) ColsMap() map[string]string {
 	return map[string]string{
-		"Name":         "Name",
-		"Current":      "Current",
-		"Desired":      "Desired",
-		"Organization": "Organization",
-		"Group ID":     "Group ID",
-		"Labels":       "Labels",
-		"Image":        "Image",
-		"State":        "State",
+		"Name":    "Name",
+		"Current": "Current",
+		"Desired": "Desired",
+		"Image":   "Image",
+		"State":   "State",
 	}
 }
 
@@ -38,14 +34,11 @@ func (p *printablePool) KV() []map[string]interface{} {
 			state = "Paused"
 		}
 		kv = append(kv, map[string]interface{}{
-			"Name":         pool.Name,
-			"Current":      pool.CurrentReplicas,
-			"Desired":      pool.DesiredReplicas,
-			"Organization": pool.Organization,
-			"Group ID":     pool.GroupId,
-			"Labels":       strings.Join(pool.Labels, ", "),
-			"Image":        pool.Image,
-			"State":        state,
+			"Name":    pool.Name,
+			"Current": pool.CurrentReplicas,
+			"Desired": pool.DesiredReplicas,
+			"Image":   pool.Image,
+			"State":   state,
 		})
 	}
 	return kv
@@ -57,7 +50,7 @@ type printableMachine struct {
 }
 
 func (m *printableMachine) Cols() []string {
-	return []string{"Pool", "ID", "ADDR", "Runner State", "Runner Version", "Created"}
+	return []string{"Pool", "ID", "ADDR", "State", "Agent Version", "Environment ID", "Created"}
 }
 
 func (m *printableMachine) ColsMap() map[string]string {
@@ -65,8 +58,9 @@ func (m *printableMachine) ColsMap() map[string]string {
 		"Pool":           "Pool",
 		"ID":             "ID",
 		"ADDR":           "ADDR",
-		"Runner State":   "Runner State",
-		"Runner Version": "Runner Version",
+		"State":          "State",
+		"Agent Version":  "Agent Version",
+		"Environment ID": "Environment ID",
 		"Created":        "Created",
 	}
 }
@@ -74,14 +68,9 @@ func (m *printableMachine) ColsMap() map[string]string {
 func (m *printableMachine) KV() []map[string]interface{} {
 	kv := make([]map[string]interface{}, 0, len(m.Machines))
 	for _, vm := range m.Machines {
-		runnerState := vm.RunnerState
-		if runnerState == "" {
-			runnerState = "Unknown"
-		}
-
-		runnerVersion := vm.RunnerVersion
-		if runnerVersion == "" {
-			runnerVersion = "Unknown"
+		agentVersion := vm.AgentVersion
+		if agentVersion == "" {
+			agentVersion = "Unknown"
 		}
 
 		createdAt := vm.CreatedAt.AsTime()
@@ -90,8 +79,9 @@ func (m *printableMachine) KV() []map[string]interface{} {
 			"Pool":           vm.Pool,
 			"ID":             vm.ID,
 			"ADDR":           vm.Addr,
-			"Runner State":   runnerState,
-			"Runner Version": runnerVersion,
+			"State":          vm.State,
+			"Agent Version":  agentVersion,
+			"Environment ID": vm.EnvironmentId,
 			"Created":        units.HumanDuration(time.Since(createdAt)),
 		})
 	}

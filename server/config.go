@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"os"
+	"regexp"
 
 	"github.com/firecracker-microvm/firecracker-go-sdk"
 	"github.com/firecracker-microvm/firecracker-go-sdk/client/models"
@@ -12,14 +13,11 @@ import (
 
 // Config is the configuration for the Client.
 type Config struct {
-	BindAddress      string            `yaml:"bind_address" validate:"required,hostname_port"`
-	Containerd       *ContainerdConfig `yaml:"containerd" validate:"required"`
-	Metrics          *MetricsConfig    `yaml:"metrics"`
-	BasicAuthEnabled bool              `yaml:"basic_auth_enabled" validate:""`
-	BasicAuthUsers   map[string]string `yaml:"basic_auth_users" validate:"required_if=basic_auth_enabled true"`
-	GitHub           *GitHubConfig     `yaml:"github" validate:"required"`
-	Pools            []*PoolConfig     `yaml:"pools" validate:"required,min=1,dive,required"`
-	LogLevel         string            `yaml:"log_level" validate:"required,oneof=debug info warn error fatal panic trace"`
+	BindAddress string            `yaml:"bind_address" validate:"required,hostname_port"`
+	Containerd  *ContainerdConfig `yaml:"containerd" validate:"required"`
+	Metrics     *MetricsConfig    `yaml:"metrics"`
+	Pools       []*PoolConfig     `yaml:"pools" validate:"required,min=1,dive,required"`
+	LogLevel    string            `yaml:"log_level" validate:"required,oneof=debug info warn error fatal panic trace"`
 
 	path string
 }
@@ -34,33 +32,18 @@ type MetricsConfig struct {
 	Address string `yaml:"address" validate:"required_if=enabled true,hostname_port"`
 }
 
-type GitHubConfig struct {
-	AppPrivateKey string `yaml:"app_private_key" validate:"required"`
-	AppID         int64  `yaml:"app_id" validate:"required"`
-}
-
-type RunnerConfig struct {
-	Name            string   `yaml:"name" validate:"required"`
-	ImagePullPolicy string   `yaml:"image_pull_policy" validate:"required,oneof=Always Never IfNotPresent"`
-	Image           string   `yaml:"image" validate:"required"`
-	Organization    string   `yaml:"organization" validate:"required"`
-	GroupID         int64    `yaml:"group_id" validate:"required"`
-	Labels          []string `yaml:"labels" validate:"required"`
-}
-
 type FirecrackerConfig struct {
-	BinaryPath       string                             `yaml:"binary_path" `
-	KernelImagePath  string                             `yaml:"kernel_image_path"`
+	BinaryPath       string                             `yaml:"binary_path" validate:"required"`
+	KernelImagePath  string                             `yaml:"kernel_image_path" validate:"required"`
 	KernelArgs       string                             `yaml:"kernel_args"`
 	MachineConfig    FirecrackerMachineConfig           `yaml:"machine_config"`
 	NetworkInterface *FirecrackerNetworkInterfaceConfig `yaml:"network_interface"`
 	Rootfs           *FirecrackerRootfsConfig           `yaml:"rootfs"`
-	Metadata         map[string]interface{}             `yaml:"metadata"`
 }
 
 type FirecrackerMachineConfig struct {
-	VcpuCount  int64 `yaml:"vcpu_count"`
-	MemSizeMib int64 `yaml:"mem_size_mib"`
+	VcpuCount  int64 `yaml:"vcpu_count" validate:"gt=0"`
+	MemSizeMib int64 `yaml:"mem_size_mib" validate:"gt=0"`
 }
 
 // FirecrackerNetworkInterfaceConfig configures the MicroVM's network interface.
@@ -120,14 +103,11 @@ func (c *FirecrackerTokenBucketConfig) toSDK() *models.TokenBucket {
 // DefaultConfig creates a new Config with default values.
 func DefaultConfig() *Config {
 	c := &Config{
-		BindAddress:      ":8080",
-		Containerd:       &ContainerdConfig{Address: "/run/containerd/containerd.sock", Namespace: "fireactions"},
-		Metrics:          &MetricsConfig{Enabled: true, Address: ":8081"},
-		BasicAuthEnabled: false,
-		BasicAuthUsers:   map[string]string{},
-		GitHub:           &GitHubConfig{AppPrivateKey: "", AppID: 0},
-		Pools:            []*PoolConfig{},
-		LogLevel:         "debug",
+		BindAddress: ":8080",
+		Containerd:  &ContainerdConfig{Address: "/run/containerd/containerd.sock", Namespace: "fireactions"},
+		Metrics:     &MetricsConfig{Enabled: true, Address: ":8081"},
+		Pools:       []*PoolConfig{},
+		LogLevel:    "debug",
 	}
 
 	return c
@@ -162,10 +142,28 @@ func (c *Config) Load() error {
 		_ = file.Close()
 	}()
 
-	return yaml.NewDecoder(file).Decode(c)
+	decoder := yaml.NewDecoder(file)
+	decoder.KnownFields(true)
+	return decoder.Decode(c)
 }
+
+var profileNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 // Validate validates the configuration.
 func (c *Config) Validate() error {
-	return validator.New().Struct(c)
+	if err := validator.New().Struct(c); err != nil {
+		return err
+	}
+
+	names := make(map[string]struct{}, len(c.Pools))
+	for _, pool := range c.Pools {
+		if !profileNamePattern.MatchString(pool.Name) {
+			return fmt.Errorf("invalid profile name %q: use only letters, digits, underscores and hyphens", pool.Name)
+		}
+		if _, exists := names[pool.Name]; exists {
+			return fmt.Errorf("duplicate profile name %q", pool.Name)
+		}
+		names[pool.Name] = struct{}{}
+	}
+	return nil
 }

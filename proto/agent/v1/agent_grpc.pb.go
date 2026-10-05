@@ -19,21 +19,18 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	AgentService_GetRunnerState_FullMethodName   = "/fireactions.agent.v1.AgentService/GetRunnerState"
-	AgentService_GetRunnerVersion_FullMethodName = "/fireactions.agent.v1.AgentService/GetRunnerVersion"
-	AgentService_GetLogs_FullMethodName          = "/fireactions.agent.v1.AgentService/GetLogs"
+	AgentService_Ready_FullMethodName   = "/fireactions.agent.v1.AgentService/Ready"
+	AgentService_GetLogs_FullMethodName = "/fireactions.agent.v1.AgentService/GetLogs"
 )
 
 // AgentServiceClient is the client API for AgentService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// AgentService provides status reporting for the GitHub Actions agent running in a VM.
+// AgentService provides readiness and diagnostics for the generic guest agent.
 type AgentServiceClient interface {
-	// GetRunnerState retrieves the current state of the GitHub Actions runner.
-	GetRunnerState(ctx context.Context, in *GetRunnerStateRequest, opts ...grpc.CallOption) (*GetRunnerStateResponse, error)
-	// GetRunnerVersion retrieves the agent version.
-	GetRunnerVersion(ctx context.Context, in *GetRunnerVersionRequest, opts ...grpc.CallOption) (*GetRunnerVersionResponse, error)
+	// Ready reports the agent version once it can accept guest requests.
+	Ready(ctx context.Context, in *ReadyRequest, opts ...grpc.CallOption) (*ReadyResponse, error)
 	// GetLogs streams logs from the agent service (server-side streaming).
 	GetLogs(ctx context.Context, in *GetLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GetLogsResponse], error)
 }
@@ -46,20 +43,10 @@ func NewAgentServiceClient(cc grpc.ClientConnInterface) AgentServiceClient {
 	return &agentServiceClient{cc}
 }
 
-func (c *agentServiceClient) GetRunnerState(ctx context.Context, in *GetRunnerStateRequest, opts ...grpc.CallOption) (*GetRunnerStateResponse, error) {
+func (c *agentServiceClient) Ready(ctx context.Context, in *ReadyRequest, opts ...grpc.CallOption) (*ReadyResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(GetRunnerStateResponse)
-	err := c.cc.Invoke(ctx, AgentService_GetRunnerState_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *agentServiceClient) GetRunnerVersion(ctx context.Context, in *GetRunnerVersionRequest, opts ...grpc.CallOption) (*GetRunnerVersionResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(GetRunnerVersionResponse)
-	err := c.cc.Invoke(ctx, AgentService_GetRunnerVersion_FullMethodName, in, out, cOpts...)
+	out := new(ReadyResponse)
+	err := c.cc.Invoke(ctx, AgentService_Ready_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -89,12 +76,10 @@ type AgentService_GetLogsClient = grpc.ServerStreamingClient[GetLogsResponse]
 // All implementations must embed UnimplementedAgentServiceServer
 // for forward compatibility.
 //
-// AgentService provides status reporting for the GitHub Actions agent running in a VM.
+// AgentService provides readiness and diagnostics for the generic guest agent.
 type AgentServiceServer interface {
-	// GetRunnerState retrieves the current state of the GitHub Actions runner.
-	GetRunnerState(context.Context, *GetRunnerStateRequest) (*GetRunnerStateResponse, error)
-	// GetRunnerVersion retrieves the agent version.
-	GetRunnerVersion(context.Context, *GetRunnerVersionRequest) (*GetRunnerVersionResponse, error)
+	// Ready reports the agent version once it can accept guest requests.
+	Ready(context.Context, *ReadyRequest) (*ReadyResponse, error)
 	// GetLogs streams logs from the agent service (server-side streaming).
 	GetLogs(*GetLogsRequest, grpc.ServerStreamingServer[GetLogsResponse]) error
 	mustEmbedUnimplementedAgentServiceServer()
@@ -107,11 +92,8 @@ type AgentServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedAgentServiceServer struct{}
 
-func (UnimplementedAgentServiceServer) GetRunnerState(context.Context, *GetRunnerStateRequest) (*GetRunnerStateResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method GetRunnerState not implemented")
-}
-func (UnimplementedAgentServiceServer) GetRunnerVersion(context.Context, *GetRunnerVersionRequest) (*GetRunnerVersionResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method GetRunnerVersion not implemented")
+func (UnimplementedAgentServiceServer) Ready(context.Context, *ReadyRequest) (*ReadyResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Ready not implemented")
 }
 func (UnimplementedAgentServiceServer) GetLogs(*GetLogsRequest, grpc.ServerStreamingServer[GetLogsResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method GetLogs not implemented")
@@ -137,38 +119,20 @@ func RegisterAgentServiceServer(s grpc.ServiceRegistrar, srv AgentServiceServer)
 	s.RegisterService(&AgentService_ServiceDesc, srv)
 }
 
-func _AgentService_GetRunnerState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(GetRunnerStateRequest)
+func _AgentService_Ready_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReadyRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(AgentServiceServer).GetRunnerState(ctx, in)
+		return srv.(AgentServiceServer).Ready(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: AgentService_GetRunnerState_FullMethodName,
+		FullMethod: AgentService_Ready_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(AgentServiceServer).GetRunnerState(ctx, req.(*GetRunnerStateRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _AgentService_GetRunnerVersion_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(GetRunnerVersionRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(AgentServiceServer).GetRunnerVersion(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: AgentService_GetRunnerVersion_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(AgentServiceServer).GetRunnerVersion(ctx, req.(*GetRunnerVersionRequest))
+		return srv.(AgentServiceServer).Ready(ctx, req.(*ReadyRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -192,12 +156,8 @@ var AgentService_ServiceDesc = grpc.ServiceDesc{
 	HandlerType: (*AgentServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
-			MethodName: "GetRunnerState",
-			Handler:    _AgentService_GetRunnerState_Handler,
-		},
-		{
-			MethodName: "GetRunnerVersion",
-			Handler:    _AgentService_GetRunnerVersion_Handler,
+			MethodName: "Ready",
+			Handler:    _AgentService_Ready_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

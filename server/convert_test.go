@@ -1,1 +1,69 @@
 package server
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/firecracker-microvm/firecracker-go-sdk"
+	serverv1 "github.com/hostinger/fireactions/proto/server/v1"
+)
+
+func TestConvertPoolUsesProfileImageAndCurrentTarget(t *testing.T) {
+	pool := &Pool{
+		config:       &PoolConfig{Name: "ubuntu-large", Image: "registry.example/guest@sha256:abc", Replicas: 9},
+		machinesMu:   &sync.Mutex{},
+		machines:     map[string]*Machine{"vm-1": {}, "vm-2": {}},
+		scaleTrigger: make(chan struct{}, 1),
+		isActive:     true,
+	}
+	pool.SetReplicas(3)
+
+	got := convertPoolToProto(context.Background(), pool)
+	if got.Name != "ubuntu-large" || got.Image != pool.config.Image {
+		t.Fatalf("profile identity/image lost: %v", got)
+	}
+	if got.CurrentReplicas != 2 || got.DesiredReplicas != 3 || got.Replicas != 3 {
+		t.Fatalf("expected current VM count 2 and runtime replica target 3: %v", got)
+	}
+	if got.State != serverv1.PoolState_POOL_STATE_ACTIVE {
+		t.Fatalf("expected active profile: %v", got.State)
+	}
+	pool.isActive = false
+	if got := convertPoolToProto(context.Background(), pool); got.State != serverv1.PoolState_POOL_STATE_PAUSED {
+		t.Fatalf("expected paused profile: %v", got.State)
+	}
+}
+
+func TestConvertMachineKeepsHostStateWhenAgentUnavailable(t *testing.T) {
+	createdAt := time.Unix(1720000000, 0)
+	for _, state := range []string{"provisioning", "idle", "claimed", "removing"} {
+		t.Run(state, func(t *testing.T) {
+			machine := &Machine{
+				Machine:      &firecracker.Machine{},
+				Name:         "ubuntu-vm-1",
+				Pool:         "ubuntu",
+				CreatedAt:    createdAt,
+				State:        state,
+				AgentVersion: "1.2.3",
+			}
+			if state == "claimed" || state == "removing" {
+				machine.EnvironmentID = "owned-environment"
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			got := convertMachineToProto(ctx, machine)
+			if got.State != state || got.EnvironmentId != machine.EnvironmentID {
+				t.Fatalf("agent failure changed host-owned lifecycle: %v", got)
+			}
+			if got.AgentVersion != machine.AgentVersion {
+				t.Fatalf("agent failure discarded known version: %v", got)
+			}
+			if got.ID != machine.Name || got.Pool != machine.Pool || !got.CreatedAt.AsTime().Equal(createdAt) {
+				t.Fatalf("machine diagnostics lost: %v", got)
+			}
+		})
+	}
+}

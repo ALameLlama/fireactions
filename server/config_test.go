@@ -1,95 +1,142 @@
 package server
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
-	"github.com/firecracker-microvm/firecracker-go-sdk"
-	"github.com/firecracker-microvm/firecracker-go-sdk/client/models"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestNewConfig(t *testing.T) {
+func TestNewConfigProfiles(t *testing.T) {
 	config, err := NewConfig("testdata/config1.yaml")
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-
-	assert.Equal(t, "testdata/config1.yaml", config.path)
-}
-
-func TestNewConfigNetworkInterface(t *testing.T) {
-	config, err := NewConfig("testdata/config1.yaml")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	networkInterface := config.Pools[0].Firecracker.NetworkInterface
-	if networkInterface == nil {
-		t.Fatal("expected network interface configuration to be set")
-	}
-
-	assert.Equal(t, &FirecrackerTokenBucketConfig{
-		Size: 131072000, RefillTime: 1000, OneTimeBurst: firecracker.Int64(262144000),
-	}, networkInterface.InRateLimiter.Bandwidth)
-	assert.Equal(t, &FirecrackerTokenBucketConfig{
-		Size: 10000, RefillTime: 1000,
-	}, networkInterface.InRateLimiter.Ops)
-	assert.Equal(t, &FirecrackerTokenBucketConfig{
-		Size: 26214400, RefillTime: 1000,
-	}, networkInterface.OutRateLimiter.Bandwidth)
-	assert.Nil(t, networkInterface.OutRateLimiter.Ops)
-
-	// A pool without a network_interface block leaves the interface unlimited.
+	require.NoError(t, err)
+	require.Len(t, config.Pools, 2)
+	assert.Equal(t, "localhost/fireactions-guest:ubuntu-24.04", config.Pools[0].Image)
+	assert.Equal(t, "IfNotPresent", config.Pools[0].ImagePullPolicy)
+	assert.Equal(t, "Never", config.Pools[1].ImagePullPolicy)
+	// Omitting rate limiters keeps both network directions and rootfs unlimited.
 	assert.Nil(t, config.Pools[1].Firecracker.NetworkInterface)
-}
-
-func TestNewConfigNetworkInterfaceInvalid(t *testing.T) {
-	// A token bucket without a size is rejected.
-	_, err := NewConfig("testdata/config2.yaml")
-	assert.ErrorContains(t, err, "Config.Pools[0].Firecracker.NetworkInterface.InRateLimiter.Bandwidth.Size")
-}
-
-func TestNewConfigRootfs(t *testing.T) {
-	config, err := NewConfig("testdata/config1.yaml")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	rootfs := config.Pools[0].Firecracker.Rootfs
-	if rootfs == nil {
-		t.Fatal("expected rootfs configuration to be set")
-	}
-
-	assert.Equal(t, &FirecrackerTokenBucketConfig{
-		Size: 52428800, RefillTime: 1000,
-	}, rootfs.RateLimiter.Bandwidth)
-	assert.Equal(t, &FirecrackerTokenBucketConfig{
-		Size: 2000, RefillTime: 1000,
-	}, rootfs.RateLimiter.Ops)
-
-	// A pool without a rootfs block leaves the block device unlimited.
 	assert.Nil(t, config.Pools[1].Firecracker.Rootfs)
 }
 
-func TestNewConfigRootfsInvalid(t *testing.T) {
-	// A token bucket without a refill time is rejected.
-	_, err := NewConfig("testdata/config3.yaml")
-	assert.ErrorContains(t, err, "Config.Pools[0].Firecracker.Rootfs.RateLimiter.Ops.RefillTime")
+func TestNewConfigInvalidRateLimitFixtures(t *testing.T) {
+	cases := map[string]string{
+		"testdata/config2.yaml": "Size",
+		"testdata/config3.yaml": "RefillTime",
+	}
+	for path, field := range cases {
+		t.Run(path, func(t *testing.T) {
+			_, err := NewConfig(path)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "validate:")
+			assert.Contains(t, err.Error(), field)
+		})
+	}
 }
 
-func TestFirecrackerRateLimiterConfigToSDK(t *testing.T) {
-	var nilRateLimiter *FirecrackerRateLimiterConfig
-	assert.Nil(t, nilRateLimiter.toSDK())
-
-	rateLimiter := &FirecrackerRateLimiterConfig{
-		Bandwidth: &FirecrackerTokenBucketConfig{Size: 131072000, RefillTime: 1000, OneTimeBurst: firecracker.Int64(262144000)},
+func TestConfigRequiredProfileSettings(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"missing profiles", func(c *Config) { c.Pools = nil }},
+		{"nil profile", func(c *Config) { c.Pools[0] = nil }},
+		{"missing name", func(c *Config) { c.Pools[0].Name = "" }},
+		{"unsafe name", func(c *Config) { c.Pools[0].Name = "../escape" }},
+		{"name with spaces", func(c *Config) { c.Pools[0].Name = "bad profile" }},
+		{"duplicate name", func(c *Config) { c.Pools[1].Name = c.Pools[0].Name }},
+		{"missing image", func(c *Config) { c.Pools[0].Image = "" }},
+		{"missing pull policy", func(c *Config) { c.Pools[0].ImagePullPolicy = "" }},
+		{"unknown pull policy", func(c *Config) { c.Pools[0].ImagePullPolicy = "sometimes" }},
+		{"missing binary", func(c *Config) { c.Pools[0].Firecracker.BinaryPath = "" }},
+		{"missing kernel", func(c *Config) { c.Pools[0].Firecracker.KernelImagePath = "" }},
+		{"zero CPUs", func(c *Config) { c.Pools[0].Firecracker.MachineConfig.VcpuCount = 0 }},
+		{"negative CPUs", func(c *Config) { c.Pools[0].Firecracker.MachineConfig.VcpuCount = -1 }},
+		{"zero memory", func(c *Config) { c.Pools[0].Firecracker.MachineConfig.MemSizeMib = 0 }},
+		{"negative memory", func(c *Config) { c.Pools[0].Firecracker.MachineConfig.MemSizeMib = -1 }},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			config, err := NewConfig("testdata/config1.yaml")
+			require.NoError(t, err)
+			tc.mutate(config)
+			assert.Error(t, config.Validate())
+		})
+	}
+}
 
-	assert.Equal(t, &models.RateLimiter{
-		Bandwidth: &models.TokenBucket{
-			Size:         firecracker.Int64(131072000),
-			RefillTime:   firecracker.Int64(1000),
-			OneTimeBurst: firecracker.Int64(262144000),
-		},
-	}, rateLimiter.toSDK())
+func TestConfigAcceptsSafeProfileNamesAndPullPolicies(t *testing.T) {
+	for _, policy := range []string{"Always", "Never", "IfNotPresent"} {
+		t.Run(policy, func(t *testing.T) {
+			config, err := NewConfig("testdata/config1.yaml")
+			require.NoError(t, err)
+			config.Pools[0].Name = "Profile_24-04"
+			config.Pools[0].ImagePullPolicy = policy
+			assert.NoError(t, config.Validate())
+		})
+	}
+}
+
+func TestConfigRateLimitValidation(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*FirecrackerTokenBucketConfig)
+	}{
+		{"zero size", func(b *FirecrackerTokenBucketConfig) { b.Size = 0 }},
+		{"negative size", func(b *FirecrackerTokenBucketConfig) { b.Size = -1 }},
+		{"zero refill", func(b *FirecrackerTokenBucketConfig) { b.RefillTime = 0 }},
+		{"negative refill", func(b *FirecrackerTokenBucketConfig) { b.RefillTime = -1 }},
+		{"negative burst", func(b *FirecrackerTokenBucketConfig) { v := int64(-1); b.OneTimeBurst = &v }},
+	}
+	for _, target := range []string{"network in", "network out", "rootfs"} {
+		for _, tc := range cases {
+			t.Run(target+"/"+tc.name, func(t *testing.T) {
+				config, err := NewConfig("testdata/config1.yaml")
+				require.NoError(t, err)
+				fc := config.Pools[0].Firecracker
+				bucket := fc.Rootfs.RateLimiter.Bandwidth
+				switch target {
+				case "network in":
+					bucket = fc.NetworkInterface.InRateLimiter.Bandwidth
+				case "network out":
+					bucket = fc.NetworkInterface.OutRateLimiter.Bandwidth
+				}
+				tc.mutate(bucket)
+				assert.Error(t, config.Validate())
+			})
+		}
+	}
+	config, err := NewConfig("testdata/config1.yaml")
+	require.NoError(t, err)
+	zero := int64(0)
+	config.Pools[0].Firecracker.Rootfs.RateLimiter.Bandwidth.OneTimeBurst = &zero
+	assert.NoError(t, config.Validate(), "an explicitly zero initial burst is valid")
+}
+
+func TestNewConfigRejectsUnknownFields(t *testing.T) {
+	data, err := os.ReadFile("testdata/config1.yaml")
+	require.NoError(t, err)
+	valid := string(data)
+	cases := map[string]string{
+		"github":               valid + "\ngithub:\n  app_id: 1\n",
+		"basic auth enabled":   valid + "\nbasic_auth_enabled: true\n",
+		"basic auth users":     valid + "\nbasic_auth_users:\n  user: password\n",
+		"unknown top level":    valid + "\ndebug: false\n",
+		"runner":               strings.Replace(valid, "  replicas: 1", "  replicas: 1\n  runner:\n    name: obsolete", 1),
+		"shutdown on exit":     strings.Replace(valid, "  replicas: 1", "  replicas: 1\n  shutdown_on_exit: true", 1),
+		"metadata":             strings.Replace(valid, "  firecracker:", "  firecracker:\n    metadata:\n      key: value", 1),
+		"unknown nested field": strings.Replace(valid, "      vcpu_count: 2", "      vcpu_count: 2\n      unknown: true", 1),
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			require.NoError(t, os.WriteFile(path, []byte(content), 0600))
+			_, err := NewConfig(path)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "not found")
+		})
+	}
 }

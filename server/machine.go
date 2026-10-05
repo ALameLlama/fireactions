@@ -17,10 +17,12 @@ import (
 type Machine struct {
 	*firecracker.Machine
 
-	Name      string
-	RunnerID  int64
-	Pool      string
-	CreatedAt time.Time
+	Name          string
+	Pool          string
+	CreatedAt     time.Time
+	State         string
+	AgentVersion  string
+	EnvironmentID string
 
 	vsockCID    uint32
 	vsockPath   string
@@ -51,7 +53,7 @@ func (m *Machine) ConnectToGuestAgent(ctx context.Context) (*grpc.ClientConn, ag
 
 func (m *Machine) GetAddr() string {
 	addr := ""
-	if len(m.Cfg.NetworkInterfaces) > 0 {
+	if len(m.Cfg.NetworkInterfaces) > 0 && m.Cfg.NetworkInterfaces[0].StaticConfiguration != nil && m.Cfg.NetworkInterfaces[0].StaticConfiguration.IPConfiguration != nil {
 		addr = m.Cfg.NetworkInterfaces[0].StaticConfiguration.IPConfiguration.IPAddr.IP.String()
 	}
 

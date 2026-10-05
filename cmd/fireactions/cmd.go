@@ -27,7 +27,7 @@ func newClient(endpoint string) (serverv1.ServerServiceClient, func(), error) {
 func NewRootCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:           "fireactions",
-		Short:         "BYOM (Bring Your Own Metal) and run self-hosted GitHub runners in ephemeral, fast and secure Firecracker based virtual machines.",
+		Short:         "Run disposable Firecracker execution environments for Forgejo.",
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		Version:       fireactions.Version,
