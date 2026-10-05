@@ -70,6 +70,10 @@ func newPoolsScaleCmd() *cobra.Command {
 }
 
 func runPoolsScaleCmd(cmd *cobra.Command, args []string) error {
+	replicas, _ := cmd.Flags().GetInt("replicas")
+	if replicas < 0 || uint64(replicas) > uint64(1<<31-1) {
+		return fmt.Errorf("replicas must be between 0 and %d", int32(1<<31-1))
+	}
 	endpoint, _ := cmd.Flags().GetString("endpoint")
 	client, cleanup, err := newClient(endpoint)
 	if err != nil {
@@ -77,17 +81,13 @@ func runPoolsScaleCmd(cmd *cobra.Command, args []string) error {
 	}
 	defer cleanup()
 
-	replicas, _ := cmd.Flags().GetInt("replicas")
-
 	_, err = client.ScalePool(cmd.Context(), &serverv1.ScalePoolRequest{
-		Name:     args[0],
-		Replicas: int32(replicas),
+		Name: args[0], Replicas: int32(replicas),
 	})
 	if err != nil {
-		return fmt.Errorf("scale pool \"%s\": %w", args[0], err)
+		return fmt.Errorf("scale pool %q: %w", args[0], err)
 	}
-
-	fmt.Printf("Pool \"%s\" replicas set to %d\n", args[0], replicas)
+	fmt.Printf("Pool %q replicas set to %d\n", args[0], replicas)
 	return nil
 }
 

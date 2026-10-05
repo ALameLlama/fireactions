@@ -21,31 +21,40 @@ const (
 
 // Pool owns Firecracker VMs for one configured image profile.
 type Pool struct {
-	config         *PoolConfig
-	containerd     *containerd.Client
-	imageManager   *imageManager
-	replicas       atomic.Int32
-	pendingCreates atomic.Int32
-	pendingDeletes atomic.Int32
-	machinesMu     *sync.Mutex
-	machines       map[string]*Machine
-	logger         *zerolog.Logger
-	scaleTrigger   chan struct{}
-	stopCh         chan struct{}
-	doneCh         chan struct{}
-	stopOnce       sync.Once
-	isActive       bool
-	acquireWg      sync.WaitGroup
-	workWg         sync.WaitGroup
-	cleanupWg      sync.WaitGroup
-	ctx            context.Context
-	cancel         context.CancelFunc
-	nextCID        *atomic.Uint32
-	l              sync.Mutex
-	stateDir       string
-	resolverPath   string
-	startupTimeout time.Duration
-	ready          executor.ReadySpec
+	config           *PoolConfig
+	containerd       *containerd.Client
+	imageManager     *imageManager
+	replicas         atomic.Int32
+	machinesMu       *sync.Mutex
+	machines         map[string]*Machine
+	poolCleanup      map[*Machine]struct{} // guarded by machinesMu
+	logger           *zerolog.Logger
+	scaleTrigger     chan struct{}
+	stopCh           chan struct{}
+	doneCh           chan struct{}
+	stopOnce         sync.Once
+	runStarted       bool // guarded by l
+	isActive         bool
+	acquireWg        sync.WaitGroup
+	workWg           sync.WaitGroup
+	cleanupWg        sync.WaitGroup
+	ctx              context.Context
+	cancel           context.CancelFunc
+	nextCID          *atomic.Uint32
+	l                sync.Mutex
+	scaleGeneration  uint64                    // guarded by l
+	nextIdleCreate   uint64                    // guarded by l
+	idleProvisioning map[uint64]*idleProvision // guarded by l
+	stateDir         string
+	resolverPath     string
+	startupTimeout   time.Duration
+	ready            executor.ReadySpec
+}
+
+type idleProvision struct {
+	cancel     context.CancelFunc
+	generation uint64
+	cancelled  bool
 }
 
 type PoolConfig struct {
@@ -73,37 +82,38 @@ func NewPool(logger *zerolog.Logger, config *PoolConfig, imageManager *imageMana
 	ctx, cancel := context.WithCancel(context.Background())
 
 	p := &Pool{
-		config:       config,
-		machinesMu:   &sync.Mutex{},
-		machines:     make(map[string]*Machine),
-		isActive:     true,
-		containerd:   containerdClient,
-		imageManager: imageManager,
-		logger:       &l,
-		scaleTrigger: make(chan struct{}, 1),
-		stopCh:       make(chan struct{}, 1),
-		doneCh:       make(chan struct{}),
-		ctx:          ctx,
-		cancel:       cancel,
-		nextCID:      nextCID,
+		config:           config,
+		machinesMu:       &sync.Mutex{},
+		machines:         make(map[string]*Machine),
+		poolCleanup:      make(map[*Machine]struct{}),
+		idleProvisioning: make(map[uint64]*idleProvision),
+		isActive:         true,
+		containerd:       containerdClient,
+		imageManager:     imageManager,
+		logger:           &l,
+		scaleTrigger:     make(chan struct{}, 1),
+		stopCh:           make(chan struct{}, 1),
+		doneCh:           make(chan struct{}),
+		ctx:              ctx,
+		cancel:           cancel,
+		nextCID:          nextCID,
 	}
 
 	p.replicas.Store(int32(config.Replicas))
-
-	metricPoolMachinesCurrent.
-		WithLabelValues(p.config.Name).Set(float64(p.GetCurrentSize()))
-	metricPoolMachinesDesired.
-		WithLabelValues(p.config.Name).Set(float64(p.config.Replicas))
-	metricPoolStatus.
-		WithLabelValues(p.config.Name).Set(1)
-
-	metricPoolsTotal.Inc()
+	p.refreshMetrics()
 
 	return p, nil
 }
 
 // Run starts the pool. Starting the pool will start the scaling process.
 func (p *Pool) Run() {
+	p.l.Lock()
+	if p.ctx.Err() != nil || p.runStarted {
+		p.l.Unlock()
+		return
+	}
+	p.runStarted = true
+	p.l.Unlock()
 	defer close(p.doneCh) // Signal that Run() has exited
 
 	// Trigger initial scale
@@ -128,18 +138,8 @@ func (p *Pool) Run() {
 		default:
 		}
 
-		curSize := p.GetCurrentSize()
 		p.retryRemovals()
 		desiredReplicas := p.GetReplicas()
-		pendingCreates := int(p.pendingCreates.Load())
-		pendingDeletes := int(p.pendingDeletes.Load())
-		netPending := pendingCreates - pendingDeletes
-		metricPoolMachinesCurrent.
-			WithLabelValues(p.config.Name).Set(float64(curSize))
-		metricPoolMachinesDesired.
-			WithLabelValues(p.config.Name).Set(float64(desiredReplicas))
-		metricPoolMachinesPending.
-			WithLabelValues(p.config.Name).Set(float64(netPending))
 
 		if !p.IsActive() {
 			p.logger.Debug().Msgf("Pool %s is paused, skipping scaling", p.config.Name)
@@ -165,15 +165,18 @@ func (p *Pool) Stop() {
 		case p.stopCh <- struct{}{}:
 		default:
 		}
-		select {
-		case <-p.doneCh:
-		case <-time.After(5 * time.Second):
-			p.logger.Warn().Msg("Timeout waiting for pool loop to exit")
-		}
-		// Synchronize with Scale's scheduling before waiting for work. No new
-		// WaitGroup Add can occur after cancellation and this lock barrier.
+
+		// This barrier prevents any later WaitGroup Add from scale, cleanup
+		// retry, or acquisition admission. It also prevents Run from starting
+		// after Stop has decided whether to join it.
 		p.l.Lock()
+		p.cancelIdleProvisioningLocked()
+		runStarted := p.runStarted
 		p.l.Unlock()
+		if runStarted {
+			<-p.doneCh
+		}
+
 		p.workWg.Wait()
 		p.acquireWg.Wait()
 		machines, _ := p.ListMachines(context.Background())
@@ -197,120 +200,168 @@ func (p *Pool) GetDir() string {
 	return filepath.Join(p.stateDir, "pools", p.config.Name)
 }
 
-// Scale scales the pool to the desired size.
+// Scale reconciles the number of ready clean-idle VMs to desiredReplicas.
 func (p *Pool) Scale(ctx context.Context, desiredReplicas int) error {
-	p.l.Lock()
-	defer p.l.Unlock()
 	if desiredReplicas < 0 {
 		return fmt.Errorf("replica count must not be negative")
 	}
 
-	select {
-	case <-p.ctx.Done():
-		return p.ctx.Err()
-	default:
+	p.l.Lock()
+	defer p.l.Unlock()
+	if err := p.ctx.Err(); err != nil {
+		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	p.setDesiredLocked(desiredReplicas)
 	if !p.isActive {
+		p.cancelIdleProvisioningLocked()
 		return nil
 	}
-
-	curSize := p.GetCurrentSize()
-	pendingCreates := int(p.pendingCreates.Load())
-	pendingDeletes := int(p.pendingDeletes.Load())
-
-	// Calculate effective size accounting for in-flight operations
-	effectiveSize := curSize + pendingCreates - pendingDeletes
-	delta := desiredReplicas - effectiveSize
-
-	if delta == 0 {
-		return nil
-	}
-
-	if delta > 0 {
-		p.scaleUp(
-			ctx, delta, desiredReplicas, curSize, pendingCreates, pendingDeletes)
-	} else {
-		p.scaleDown(
-			ctx, -delta, desiredReplicas, curSize, pendingCreates, pendingDeletes)
-	}
-
+	p.reconcileScaleLocked(ctx, desiredReplicas)
 	return nil
 }
 
-func (p *Pool) scaleUp(ctx context.Context, count, desiredReplicas, curSize, pendingCreates, pendingRemovals int) {
-	p.logger.Debug().Msgf("Scaling up by %d VMs (target: %d, current: %d, pending creates: %d, pending removals: %d)",
-		count, desiredReplicas, curSize, pendingCreates, pendingRemovals)
-
-	for range count {
-		p.pendingCreates.Add(1)
-		p.workWg.Add(1)
-
-		go func() {
-			defer p.pendingCreates.Add(-1)
-			defer p.workWg.Done()
-
-			select {
-			case <-p.ctx.Done():
-				return
-			default:
-			}
-
-			start := time.Now()
-			if err := p.createMachine(ctx); err != nil {
-				metricScaleOperations.WithLabelValues(p.config.Name, "up", "failure").Inc()
-				p.logger.Error().Err(err).Msg("Failed to create machine")
-				return
-			}
-
-			duration := time.Since(start).Seconds()
-			metricScaleOperations.WithLabelValues(p.config.Name, "up", "success").Inc()
-			metricScaleDuration.WithLabelValues(p.config.Name, "up").Observe(duration)
-		}()
+func (p *Pool) setDesiredLocked(desiredReplicas int) {
+	if int(p.replicas.Load()) == desiredReplicas {
+		return
+	}
+	p.replicas.Store(int32(desiredReplicas))
+	p.scaleGeneration++
+	for _, provision := range p.idleProvisioning {
+		if !provision.cancelled {
+			provision.generation = p.scaleGeneration
+		}
 	}
 }
 
-func (p *Pool) scaleDown(ctx context.Context, count, desiredReplicas, curSize, pendingCreates, pendingDeletes int) {
+func (p *Pool) reconcileScaleLocked(ctx context.Context, desiredReplicas int) {
+	idle, pending := p.pruneIdleProvisioningLocked(desiredReplicas)
+	excess := idle + pending - desiredReplicas
+	if excess > 0 {
+		p.removeIdleLocked(excess, ctx)
+		return
+	}
+
+	for range desiredReplicas - idle - pending {
+		p.startIdleProvisionLocked(ctx)
+	}
+}
+
+func (p *Pool) pruneIdleProvisioningLocked(desiredReplicas int) (idle, pending int) {
+	if p.idleProvisioning == nil {
+		p.idleProvisioning = make(map[uint64]*idleProvision)
+	}
+	idle = p.countIdleMachines()
+	for _, provision := range p.idleProvisioning {
+		if !provision.cancelled {
+			pending++
+		}
+	}
+
+	excess := idle + pending - desiredReplicas
+	for _, provision := range p.idleProvisioning {
+		if excess <= 0 {
+			break
+		}
+		if provision.cancelled {
+			continue
+		}
+		provision.cancelled = true
+		provision.cancel()
+		pending--
+		excess--
+	}
+	return idle, pending
+}
+
+func (p *Pool) startIdleProvisionLocked(ctx context.Context) {
+	p.nextIdleCreate++
+	id := p.nextIdleCreate
+	createCtx, cancel := context.WithCancel(ctx)
+	provision := &idleProvision{cancel: cancel, generation: p.scaleGeneration}
+	p.idleProvisioning[id] = provision
+	p.workWg.Add(1)
+	go func() {
+		defer p.workWg.Done()
+		defer p.finishIdleProvision(id, provision)
+		if err := p.createIdleMachine(createCtx, id, provision); err != nil {
+			if p.ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				p.logger.Error().Err(err).Msg("Failed to create idle machine")
+			}
+		}
+	}()
+}
+
+func (p *Pool) finishIdleProvision(id uint64, provision *idleProvision) {
+	p.l.Lock()
+	if p.idleProvisioning[id] == provision {
+		delete(p.idleProvisioning, id)
+	}
+	cancelled := provision.cancelled
+	p.l.Unlock()
+	provision.cancel()
+	if cancelled {
+		p.TriggerScale()
+	}
+}
+
+func (p *Pool) cancelIdleProvisioningLocked() {
+	for _, provision := range p.idleProvisioning {
+		if provision.cancelled {
+			continue
+		}
+		provision.cancelled = true
+		provision.cancel()
+	}
+}
+
+func (p *Pool) countIdleMachines() int {
 	p.machinesMu.Lock()
-	available := 0
+	count := 0
 	for _, machine := range p.machines {
-		state := machine.Metadata().State
-		if state != "claimed" && state != "removing" {
-			available++
+		if machine.Metadata().State == "idle" {
+			count++
 		}
 	}
 	p.machinesMu.Unlock()
-	if count > available {
-		count = available
+	return count
+}
+
+func (p *Pool) removeIdleLocked(count int, ctx context.Context) {
+	p.machinesMu.Lock()
+	removed := make([]*Machine, 0, count)
+	for _, machine := range p.machines {
+		if len(removed) == count {
+			break
+		}
+		if machine.Metadata().State != "idle" {
+			continue
+		}
+		machine.SetState("removing", "")
+		if p.poolCleanup == nil {
+			p.poolCleanup = make(map[*Machine]struct{})
+		}
+		p.poolCleanup[machine] = struct{}{}
+		removed = append(removed, machine)
+	}
+	p.machinesMu.Unlock()
+	if len(removed) > 0 {
+		p.refreshMetrics()
 	}
 
-	p.logger.Debug().Msgf("Scaling down by %d VMs (target: %d, current: %d, pending creates: %d, pending deletes: %d)",
-		count, desiredReplicas, curSize, pendingCreates, pendingDeletes)
-
-	for range count {
-		p.pendingDeletes.Add(1)
+	for _, machine := range removed {
 		p.workWg.Add(1)
-
-		go func() {
-			defer p.pendingDeletes.Add(-1)
+		go func(m *Machine) {
 			defer p.workWg.Done()
-
-			select {
-			case <-p.ctx.Done():
-				return
-			default:
-			}
-
-			start := time.Now()
-			if err := p.deleteMachine(ctx); err != nil {
-				metricScaleOperations.WithLabelValues(p.config.Name, "down", "failure").Inc()
-				p.logger.Error().Err(err).Msg("Failed to delete machine")
+			if p.ctx.Err() != nil {
 				return
 			}
-
-			duration := time.Since(start).Seconds()
-			metricScaleOperations.WithLabelValues(p.config.Name, "down", "success").Inc()
-			metricScaleDuration.WithLabelValues(p.config.Name, "down").Observe(duration)
-		}()
+			if err := p.destroyMachine(ctx, m); err != nil {
+				p.logger.Error().Err(err).Str("vm_id", m.Name).Msg("Failed to delete idle machine")
+			}
+		}(machine)
 	}
 }
 
@@ -324,19 +375,30 @@ func (p *Pool) IsActive() bool {
 func (p *Pool) Pause() {
 	p.l.Lock()
 	p.isActive = false
+	p.scaleGeneration++
+	p.cancelIdleProvisioningLocked()
 	p.l.Unlock()
 }
 
 func (p *Pool) Resume() {
 	p.l.Lock()
 	p.isActive = true
+	p.scaleGeneration++
 	p.l.Unlock()
 	p.TriggerScale()
 }
 
 // SetReplicas updates the desired replica count for the pool in a thread-safe manner.
 func (p *Pool) SetReplicas(replicas int) {
-	p.replicas.Store(int32(replicas))
+	if replicas < 0 {
+		return
+	}
+	p.l.Lock()
+	p.setDesiredLocked(replicas)
+	if p.isActive {
+		p.pruneIdleProvisioningLocked(replicas)
+	}
+	p.l.Unlock()
 	p.TriggerScale()
 }
 
@@ -353,11 +415,9 @@ func (p *Pool) GetReplicas() int {
 	return int(p.replicas.Load())
 }
 
-// GetCurrentSize returns the current size of the pool.
+// GetCurrentSize returns the number of ready, clean-idle VMs in the pool.
 func (p *Pool) GetCurrentSize() int {
-	p.machinesMu.Lock()
-	defer p.machinesMu.Unlock()
-	return len(p.machines)
+	return p.countIdleMachines()
 }
 
 func (p *Pool) ListMachines(ctx context.Context) ([]*Machine, error) {
@@ -385,91 +445,119 @@ func (p *Pool) GetMachine(name string) (*Machine, error) {
 }
 
 func (p *Pool) acquire(ctx context.Context, expiry time.Time) (executor.VM, error) {
-	p.l.Lock()
-	if !p.isActive {
-		p.l.Unlock()
-		return nil, fmt.Errorf("pool %q is paused", p.config.Name)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	if p.ctx.Err() != nil {
+	p.l.Lock()
+	if err := p.ctx.Err(); err != nil {
 		p.l.Unlock()
-		return nil, p.ctx.Err()
+		return nil, err
 	}
 	p.acquireWg.Add(1)
 	p.l.Unlock()
 	defer p.acquireWg.Done()
 
-	acquireCtx, cancelAcquire := context.WithCancel(ctx)
-	stopOnPoolShutdown := context.AfterFunc(p.ctx, cancelAcquire)
-	defer stopOnPoolShutdown()
+	acquireCtx, cancelAcquire := p.acquireContext(ctx, expiry)
 	defer cancelAcquire()
-	if !expiry.IsZero() {
-		var expiryCancel context.CancelFunc
-		acquireCtx, expiryCancel = context.WithDeadline(acquireCtx, expiry)
-		defer expiryCancel()
+	if err := acquireCtx.Err(); err != nil {
+		return nil, err
 	}
-	if p.startupTimeout > 0 {
-		var timeoutCancel context.CancelFunc
-		acquireCtx, timeoutCancel = context.WithTimeout(acquireCtx, p.startupTimeout)
-		defer timeoutCancel()
+
+	if machine := p.claimIdleMachine(); machine != nil {
+		p.TriggerScale()
+		if err := acquireCtx.Err(); err != nil {
+			p.markPoolCleanup(machine)
+			return nil, errors.Join(err, p.destroyMachine(context.Background(), machine))
+		}
+		return machine, nil
 	}
-	machine, err := p.provisionMachine(acquireCtx)
+
+	p.l.Lock()
+	active := p.isActive && p.ctx.Err() == nil
+	p.l.Unlock()
+	if err := acquireCtx.Err(); err != nil {
+		return nil, err
+	}
+	if !active {
+		return nil, executor.NewError(executor.Unavailable, fmt.Sprintf("image profile %q is paused and has no ready idle VM", p.config.Name), nil)
+	}
+
+	startupCtx, cancelStartup := p.startupContext(acquireCtx)
+	defer cancelStartup()
+	machine, err := p.provisionMachine(startupCtx)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := machine.ConnectToGuestAgent(acquireCtx); err != nil {
-		cleanupErr := machine.Destroy(context.Background())
-		if cleanupErr != nil {
-			p.machinesMu.Lock()
-			p.machines[machine.Name] = machine
-			p.machinesMu.Unlock()
-		}
+	if _, err := machine.ConnectToGuestAgent(startupCtx); err != nil {
+		cleanupErr := p.destroyUnpublishedMachine(machine)
 		return nil, errors.Join(fmt.Errorf("guest readiness: %w", err), cleanupErr)
 	}
-	if err := acquireCtx.Err(); err != nil {
-		cleanupErr := machine.Destroy(context.Background())
-		if cleanupErr != nil {
-			p.machinesMu.Lock()
-			p.machines[machine.Name] = machine
-			p.machinesMu.Unlock()
-		}
-		return nil, errors.Join(err, cleanupErr)
+	if err := startupCtx.Err(); err != nil {
+		return nil, errors.Join(err, p.destroyUnpublishedMachine(machine))
+	}
+
+	p.machinesMu.Lock()
+	if err := startupCtx.Err(); err != nil {
+		p.machinesMu.Unlock()
+		return nil, errors.Join(err, p.destroyUnpublishedMachine(machine))
 	}
 	machine.SetState("claimed", "")
-	p.machinesMu.Lock()
 	p.machines[machine.Name] = machine
+	p.watchMachineLocked(machine)
 	p.machinesMu.Unlock()
-	p.cleanupWg.Add(1)
-	go func() {
-		defer p.cleanupWg.Done()
-		_ = machine.Wait(p.ctx)
-		if err := p.destroyMachine(context.Background(), machine); err != nil {
-			p.logger.Error().Err(err).Str("vm_id", machine.Name).Msg("Failed to clean up exited VM")
-		}
-	}()
+	p.refreshMetrics()
+	p.TriggerScale()
+
+	if err := startupCtx.Err(); err != nil {
+		p.markPoolCleanup(machine)
+		return nil, errors.Join(err, p.destroyMachine(context.Background(), machine))
+	}
 	return machine, nil
 }
 
-func (p *Pool) createMachine(ctx context.Context) error {
-	creationCtx, cancel := context.WithCancel(ctx)
-	stopOnPoolShutdown := context.AfterFunc(p.ctx, cancel)
-	defer stopOnPoolShutdown()
-	defer cancel()
-	machine, err := p.provisionMachine(creationCtx)
-	if err != nil {
-		return err
+func (p *Pool) acquireContext(ctx context.Context, expiry time.Time) (context.Context, context.CancelFunc) {
+	baseCtx, cancelBase := context.WithCancel(ctx)
+	stopOnPoolShutdown := context.AfterFunc(p.ctx, cancelBase)
+	acquireCtx := baseCtx
+	var cancelDeadline context.CancelFunc
+	if !expiry.IsZero() {
+		acquireCtx, cancelDeadline = context.WithDeadline(acquireCtx, expiry)
 	}
-	if err := creationCtx.Err(); err != nil {
-		if cleanupErr := machine.Destroy(context.Background()); cleanupErr != nil {
-			p.machinesMu.Lock()
-			p.machines[machine.Name] = machine
-			p.machinesMu.Unlock()
-			return fmt.Errorf("creation cancelled; cleaning up provisioned VM: %w", cleanupErr)
+	return acquireCtx, func() {
+		stopOnPoolShutdown()
+		if cancelDeadline != nil {
+			cancelDeadline()
 		}
-		return err
+		cancelBase()
 	}
+}
+
+func (p *Pool) startupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if p.startupTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, p.startupTimeout)
+}
+
+func (p *Pool) claimIdleMachine() *Machine {
 	p.machinesMu.Lock()
-	p.machines[machine.Name] = machine
+	var target *Machine
+	for _, machine := range p.machines {
+		if machine.Metadata().State != "idle" {
+			continue
+		}
+		machine.SetState("claimed", "")
+		target = machine
+		break
+	}
 	p.machinesMu.Unlock()
+	if target != nil {
+		p.refreshMetrics()
+	}
+	return target
+}
+
+func (p *Pool) watchMachineLocked(machine *Machine) {
 	p.cleanupWg.Add(1)
 	go func() {
 		defer p.cleanupWg.Done()
@@ -478,19 +566,125 @@ func (p *Pool) createMachine(ctx context.Context) error {
 			p.logger.Error().Err(err).Str("vm_id", machine.Name).Msg("Failed to clean up exited VM")
 		}
 	}()
-	p.logger.Info().Str("vm_id", machine.Name).Msg("Created Firecracker VM")
+}
+
+func (p *Pool) createIdleMachine(ctx context.Context, id uint64, provision *idleProvision) error {
+	creationCtx, cancelCreation := context.WithCancel(ctx)
+	stopOnPoolShutdown := context.AfterFunc(p.ctx, cancelCreation)
+	defer stopOnPoolShutdown()
+	defer cancelCreation()
+	startupCtx, cancelStartup := p.startupContext(creationCtx)
+	defer cancelStartup()
+
+	machine, err := p.provisionMachine(startupCtx)
+	if err != nil {
+		return err
+	}
+	if _, err := machine.ConnectToGuestAgent(startupCtx); err != nil {
+		cleanupErr := p.destroyUnpublishedMachine(machine)
+		return errors.Join(fmt.Errorf("guest readiness: %w", err), cleanupErr)
+	}
+	if err := startupCtx.Err(); err != nil {
+		return errors.Join(err, p.destroyUnpublishedMachine(machine))
+	}
+
+	p.l.Lock()
+	currentProvision := p.idleProvisioning[id]
+	if p.ctx.Err() != nil || !p.isActive || startupCtx.Err() != nil ||
+		provision.cancelled || currentProvision != provision ||
+		provision.generation != p.scaleGeneration {
+		p.l.Unlock()
+		cause := startupCtx.Err()
+		if cause == nil {
+			cause = fmt.Errorf("idle provisioning is no longer desired")
+		}
+		return errors.Join(cause, p.destroyUnpublishedMachine(machine))
+	}
+
+	p.machinesMu.Lock()
+	idle := 0
+	for _, owned := range p.machines {
+		if owned.Metadata().State == "idle" {
+			idle++
+		}
+	}
+	if idle >= p.GetReplicas() {
+		p.machinesMu.Unlock()
+		p.l.Unlock()
+		return p.destroyUnpublishedMachine(machine)
+	}
+	delete(p.idleProvisioning, id)
+	machine.SetState("idle", "")
+	p.machines[machine.Name] = machine
+	if err := startupCtx.Err(); err != nil || p.ctx.Err() != nil {
+		delete(p.machines, machine.Name)
+		machine.SetState("removing", "")
+		p.machinesMu.Unlock()
+		p.l.Unlock()
+		if err == nil {
+			err = p.ctx.Err()
+		}
+		return errors.Join(err, p.destroyUnpublishedMachine(machine))
+	}
+	p.watchMachineLocked(machine)
+	p.machinesMu.Unlock()
+	p.l.Unlock()
+
+	p.refreshMetrics()
+	p.logger.Info().Str("vm_id", machine.Name).Msg("Created ready idle Firecracker VM")
 	return nil
 }
 
+func (p *Pool) destroyUnpublishedMachine(machine *Machine) error {
+	if err := machine.Destroy(context.Background()); err != nil {
+		p.markPoolCleanup(machine)
+		p.machinesMu.Lock()
+		p.machines[machine.Name] = machine
+		p.machinesMu.Unlock()
+		p.refreshMetrics()
+		metricCleanupFailures.WithLabelValues(p.config.Name).Inc()
+		return err
+	}
+	return nil
+}
+
+// markPoolCleanup records a teardown owned by the pool, rather than by an
+// environment release through the executor.
+func (p *Pool) markPoolCleanup(machine *Machine) {
+	p.machinesMu.Lock()
+	if p.poolCleanup == nil {
+		p.poolCleanup = make(map[*Machine]struct{})
+	}
+	p.poolCleanup[machine] = struct{}{}
+	p.machinesMu.Unlock()
+}
+
 func (p *Pool) destroyMachine(ctx context.Context, machine *Machine) error {
+	p.machinesMu.Lock()
+	if p.machines[machine.Name] == machine && machine.Metadata().State == "idle" {
+		machine.SetState("removing", "")
+		if p.poolCleanup == nil {
+			p.poolCleanup = make(map[*Machine]struct{})
+		}
+		p.poolCleanup[machine] = struct{}{}
+	}
+	_, poolOwnedCleanup := p.poolCleanup[machine]
+	p.machinesMu.Unlock()
+
 	if err := machine.Destroy(ctx); err != nil {
+		p.refreshMetrics()
+		if poolOwnedCleanup {
+			metricCleanupFailures.WithLabelValues(p.config.Name).Inc()
+		}
 		return err
 	}
 	p.machinesMu.Lock()
 	if p.machines[machine.Name] == machine {
 		delete(p.machines, machine.Name)
 	}
+	delete(p.poolCleanup, machine)
 	p.machinesMu.Unlock()
+	p.refreshMetrics()
 	p.TriggerScale()
 	return nil
 }
@@ -499,18 +693,22 @@ func (p *Pool) deleteMachine(ctx context.Context) error {
 	p.machinesMu.Lock()
 	var target *Machine
 	for _, machine := range p.machines {
-		state := machine.Metadata().State
-		if state == "removing" || state == "claimed" {
+		if machine.Metadata().State != "idle" {
 			continue
 		}
 		target = machine
 		machine.SetState("removing", "")
+		if p.poolCleanup == nil {
+			p.poolCleanup = make(map[*Machine]struct{})
+		}
+		p.poolCleanup[machine] = struct{}{}
 		break
 	}
 	p.machinesMu.Unlock()
 	if target == nil {
-		return fmt.Errorf("no unclaimed machines available to scale down")
+		return fmt.Errorf("no ready idle machines available to scale down")
 	}
+	p.refreshMetrics()
 	return p.destroyMachine(ctx, target)
 }
 

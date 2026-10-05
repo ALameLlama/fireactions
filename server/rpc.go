@@ -44,17 +44,17 @@ func (s *Server) ListPools(ctx context.Context, req *serverv1.ListPoolsRequest) 
 
 // ScalePool implements ServerService.ScalePool.
 func (s *Server) ScalePool(ctx context.Context, req *serverv1.ScalePoolRequest) (*serverv1.ScalePoolResponse, error) {
+	if req.Replicas < 0 {
+		return nil, status.Error(codes.InvalidArgument, "replicas must not be negative")
+	}
 	pool, err := s.findPool(req.Name)
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "pool not found: %v", err)
 	}
 
-	metricPoolScaleRequests.WithLabelValues(pool.config.Name).Inc()
-
 	// Update the pool config with the new replicas value
 	// The Run() loop will handle the actual scaling
 	pool.SetReplicas(int(req.Replicas))
-
 	return &serverv1.ScalePoolResponse{Message: "Pool replicas updated successfully"}, nil
 }
 
@@ -66,7 +66,6 @@ func (s *Server) PausePool(ctx context.Context, req *serverv1.PausePoolRequest) 
 	}
 
 	pool.Pause()
-	metricPoolStatus.WithLabelValues(req.Name).Set(0)
 
 	return &serverv1.PausePoolResponse{Message: "Pool paused successfully"}, nil
 }
@@ -79,7 +78,6 @@ func (s *Server) ResumePool(ctx context.Context, req *serverv1.ResumePoolRequest
 	}
 
 	pool.Resume()
-	metricPoolStatus.WithLabelValues(req.Name).Set(1)
 
 	return &serverv1.ResumePoolResponse{Message: "Pool resumed successfully"}, nil
 }

@@ -36,11 +36,6 @@ func NewRootCommand() *cobra.Command {
 	cmd.SetVersionTemplate(fireactions.GetVersion())
 	cmd.PersistentFlags().SortFlags = false
 	cmd.Flags().SortFlags = false
-	cmd.SetFlagErrorFunc(func(cmd *cobra.Command, err error) error {
-		cmd.Println(err)
-		cmd.Println(cmd.UsageString())
-		return nil
-	})
 
 	cmd.AddGroup(&cobra.Group{ID: "main", Title: "Main application commands:"})
 	cmd.AddCommand(newServerCmd())

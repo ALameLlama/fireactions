@@ -18,6 +18,9 @@
 * Prepare Runner's declared `FORGEJO_WORKSPACE` through rooted guest setup. Other missing execution directories still produce launch failures.
 * Use same-revision remote JavaScript fixtures for pre/main/post hooks because Runner v13.2 skips pre hooks for local actions.
 * Accept Runner v13.2 active-stream keepalive pings so silent commands remain connected until their actual deadline or cancellation.
+* Count replicas as clean idle VMs. Claim each VM once and replenish idle capacity without scaling down active environments.
+* Allow paused pools to supply existing idle VMs but reject new provisioning. Destroy cancelled claims instead of returning them to idle.
+* Replace runner metrics with profile-specific VM lifecycle and operation metrics. Reject invalid replica counts and return nonzero CLI failure status.
 
 ## [2.0.8](https://github.com/hostinger/fireactions/compare/v2.0.7...v2.0.8) (2026-09-15)
 

@@ -2,12 +2,12 @@ package server
 
 import (
 	"context"
-	"sync"
-	"testing"
-
 	serverv1 "github.com/hostinger/fireactions/proto/server/v1"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"sync"
+	"testing"
 )
 
 func TestListPoolsReturnsSortedProfilesAndImages(t *testing.T) {
@@ -54,6 +54,40 @@ func TestScalePoolUpdatesRuntimeTarget(t *testing.T) {
 	}
 	if pool.GetReplicas() != 4 {
 		t.Fatalf("replica target was not updated: %d", pool.GetReplicas())
+	}
+}
+
+func TestScalePoolRejectsNegativeReplicasWithoutChangingTarget(t *testing.T) {
+	pool := &Pool{config: &PoolConfig{Name: "rpc-negative"}, scaleTrigger: make(chan struct{}, 1)}
+	pool.replicas.Store(3)
+	s := &Server{l: &sync.Mutex{}, pools: map[string]*Pool{"rpc-negative": pool}}
+
+	_, err := s.ScalePool(context.Background(), &serverv1.ScalePoolRequest{Name: "rpc-negative", Replicas: -1})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument, got %v", err)
+	}
+	if got := pool.GetReplicas(); got != 3 {
+		t.Fatalf("negative request changed replica target to %d", got)
+	}
+}
+
+func TestPoolMetricsReflectPublishedMachineStates(t *testing.T) {
+	profile := "metrics-state-profile"
+	pool := &Pool{
+		config: &PoolConfig{Name: profile}, machinesMu: &sync.Mutex{},
+		machines: map[string]*Machine{
+			"idle":      {Name: "idle", State: "idle"},
+			"claimed":   {Name: "claimed", State: "claimed"},
+			"provision": {Name: "provision", State: "provisioning"},
+			"removing":  {Name: "removing", State: "removing"},
+		},
+	}
+	pool.refreshMetrics()
+	if got := testutil.ToFloat64(metricCleanIdleVMs.WithLabelValues(profile)); got != 1 {
+		t.Fatalf("clean idle VM gauge = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metricClaimedVMs.WithLabelValues(profile)); got != 1 {
+		t.Fatalf("claimed VM gauge = %v, want 1", got)
 	}
 }
 

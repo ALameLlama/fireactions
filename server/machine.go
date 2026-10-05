@@ -143,6 +143,7 @@ func (m *Machine) ConnectToGuestAgent(ctx context.Context) (executor.Guest, erro
 	}
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
+	readinessStarted := time.Now()
 	for {
 		if err := startupCtx.Err(); err != nil {
 			return nil, err
@@ -157,6 +158,7 @@ func (m *Machine) ConnectToGuestAgent(ctx context.Context) (executor.Guest, erro
 		if state == connectivity.Ready {
 			version, err := client.Ready(startupCtx, ready)
 			if err == nil {
+				metricGuestReadiness.WithLabelValues(m.Pool).Observe(time.Since(readinessStarted).Seconds())
 				m.SetAgentVersion(version)
 				return client, nil
 			}
@@ -402,7 +404,8 @@ func (p *Pool) provisionMachine(ctx context.Context) (_ *Machine, resultErr erro
 			return
 		}
 		if cleanupErr := m.Destroy(context.Background()); cleanupErr != nil {
-			// Incomplete provisioning is still owned and must be retried.
+			metricCleanupFailures.WithLabelValues(p.config.Name).Inc()
+			p.markPoolCleanup(m)
 			p.machinesMu.Lock()
 			p.machines[vmID] = m
 			p.machinesMu.Unlock()
@@ -521,7 +524,9 @@ func (p *Pool) provisionMachine(ctx context.Context) (_ *Machine, resultErr erro
 	vmmCtx, cancel := context.WithCancel(context.Background())
 	m.vmmCancel = cancel
 	stopStartup := context.AfterFunc(ctx, cancel)
+	bootStarted := time.Now()
 	startErr := fcMachine.Start(vmmCtx)
+	metricVMBoot.WithLabelValues(p.config.Name).Observe(time.Since(bootStarted).Seconds())
 	sdkStarted = startErr == nil
 	stopStartup()
 	if cmd.Process != nil {
@@ -537,6 +542,5 @@ func (p *Pool) provisionMachine(ctx context.Context) (_ *Machine, resultErr erro
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	m.SetState("idle", "")
 	return m, nil
 }

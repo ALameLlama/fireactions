@@ -16,10 +16,19 @@ func convertPoolToProto(ctx context.Context, pool *Pool) *serverv1.Pool {
 		state = serverv1.PoolState_POOL_STATE_PAUSED
 	}
 
+	currentReplicas := 0
+	pool.machinesMu.Lock()
+	for _, machine := range pool.machines {
+		switch machine.Metadata().State {
+		case "idle":
+			currentReplicas++
+		}
+	}
+	pool.machinesMu.Unlock()
 	return &serverv1.Pool{
 		Name:            pool.config.Name,
 		Replicas:        int32(pool.GetReplicas()),
-		CurrentReplicas: int32(pool.GetCurrentSize()),
+		CurrentReplicas: int32(currentReplicas),
 		DesiredReplicas: int32(pool.GetReplicas()),
 		Image:           pool.config.Image,
 		State:           state,

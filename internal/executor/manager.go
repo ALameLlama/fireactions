@@ -106,7 +106,9 @@ func (m *Manager) EnvironmentForVM(vmID string) (id string, removing bool) {
 	return e.id, e.state == stateRemoving
 }
 
-func (m *Manager) Create(ctx context.Context, spec CreateSpec) (EnvironmentInfo, error) {
+func (m *Manager) Create(ctx context.Context, spec CreateSpec) (result EnvironmentInfo, err error) {
+	profile := spec.Profile
+	defer m.observeOperation(OperationCreate, &err, &profile)
 	createdAt := time.Now()
 	if spec.Profile == "" || spec.Lifetime < 0 {
 		return EnvironmentInfo{}, NewError(InvalidArgument, "a valid profile and nonnegative lifetime are required", nil)
@@ -234,13 +236,19 @@ func (m *Manager) reserve(profile string, createdAt, deadline time.Time) (*envir
 		e.gate <- struct{}{}
 		m.environments[id] = e
 		m.mu.Unlock()
+		m.observeActiveEntries(e.profile, 1)
 		return e, nil
 	}
 	return nil, NewError(Internal, "could not generate a unique environment ID", nil)
 }
 
-func (m *Manager) Start(ctx context.Context, id string) (map[string]string, error) {
+func (m *Manager) Start(ctx context.Context, id string) (result map[string]string, err error) {
+	profile := ""
+	defer m.observeOperation(OperationStart, &err, &profile)
 	e, opCtx, finish, err := m.operation(ctx, id, false)
+	if e != nil {
+		profile = e.profile
+	}
 	if err != nil {
 		if e != nil && (KindOf(err) == Cancelled || KindOf(err) == DeadlineExceeded) {
 			m.beginRemoval(e)
@@ -267,18 +275,26 @@ func (m *Manager) Start(ctx context.Context, id string) (map[string]string, erro
 		e.state = stateStarted
 		e.mu.Unlock()
 	}
-	result := maps.Clone(e.info.ImageEnv)
+	result = maps.Clone(e.info.ImageEnv)
 	if _, exists := result["PATH"]; !exists {
 		result["PATH"] = e.info.Layout.DefaultPath
 	}
 	return result, nil
 }
 
-func (m *Manager) CopyIn(ctx context.Context, id, destination string, source io.Reader) error {
+func (m *Manager) CopyIn(ctx context.Context, id, destination string, source io.Reader) (err error) {
+	profile := ""
+	if destination == "" || source == nil {
+		profile = m.profileForID(id)
+	}
+	defer m.observeOperation(OperationCopyIn, &err, &profile)
 	if destination == "" || source == nil {
 		return NewError(InvalidArgument, "a destination and archive reader are required", nil)
 	}
 	e, opCtx, finish, err := m.operation(ctx, id, true)
+	if e != nil {
+		profile = e.profile
+	}
 	if err != nil {
 		return err
 	}
@@ -290,11 +306,16 @@ func (m *Manager) CopyIn(ctx context.Context, id, destination string, source io.
 	return err
 }
 
-func (m *Manager) Exec(ctx context.Context, id string, spec ExecSpec, stdout, stderr io.Writer) (ExecResult, error) {
+func (m *Manager) Exec(ctx context.Context, id string, spec ExecSpec, stdout, stderr io.Writer) (result ExecResult, err error) {
+	profile := m.profileForID(id)
+	defer m.observeExecOperation(&err, &result, &profile)
 	if err := validateExecSpec(spec); err != nil {
 		return ExecResult{}, err
 	}
 	e, opCtx, finish, err := m.operation(ctx, id, true)
+	if e != nil {
+		profile = e.profile
+	}
 	if err != nil {
 		if e != nil && (KindOf(err) == Cancelled || KindOf(err) == DeadlineExceeded) {
 			m.beginRemoval(e)
@@ -348,18 +369,26 @@ func (m *Manager) Exec(ctx context.Context, id string, spec ExecSpec, stdout, st
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	result, err := e.guest.Exec(opCtx, spec, stdout, stderr)
+	result, err = e.guest.Exec(opCtx, spec, stdout, stderr)
 	// A terminal result (including LaunchError) wins over the caller cancelling
 	// its completed stream. Only interrupted execution invalidates ownership.
 	m.invalidateOnFailure(e, err)
 	return result, err
 }
 
-func (m *Manager) CopyOut(ctx context.Context, id, source string, destination io.Writer) error {
+func (m *Manager) CopyOut(ctx context.Context, id, source string, destination io.Writer) (err error) {
+	profile := ""
+	if source == "" || destination == nil {
+		profile = m.profileForID(id)
+	}
+	defer m.observeOperation(OperationCopyOut, &err, &profile)
 	if source == "" || destination == nil {
 		return NewError(InvalidArgument, "a source and archive writer are required", nil)
 	}
 	e, opCtx, finish, err := m.operation(ctx, id, true)
+	if e != nil {
+		profile = e.profile
+	}
 	if err != nil {
 		return err
 	}
@@ -369,6 +398,61 @@ func (m *Manager) CopyOut(ctx context.Context, id, source string, destination io
 		m.beginRemoval(e)
 	}
 	return err
+}
+
+func (m *Manager) observeOperation(operation Operation, err *error, profile *string) {
+	observer := m.options.Observer
+	if observer == nil || observer.Operation == nil {
+		return
+	}
+	observer.Operation(*profile, operation, operationOutcome(*err))
+}
+
+func (m *Manager) observeExecOperation(err *error, result *ExecResult, profile *string) {
+	observer := m.options.Observer
+	if observer == nil || observer.Operation == nil {
+		return
+	}
+	outcome := operationOutcome(*err)
+	if *err == nil && result.ExitCode != 0 {
+		outcome = OutcomeFailure
+	}
+	observer.Operation(*profile, OperationExec, outcome)
+}
+
+func operationOutcome(err error) Outcome {
+	if err == nil {
+		return OutcomeSuccess
+	}
+	if KindOf(err) == Cancelled || KindOf(err) == DeadlineExceeded {
+		return OutcomeCancelled
+	}
+	return OutcomeFailure
+}
+
+func (m *Manager) profileForID(id string) string {
+	observer := m.options.Observer
+	if observer == nil || observer.Operation == nil {
+		return ""
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if e := m.environments[id]; e != nil {
+		return e.profile
+	}
+	return ""
+}
+
+func (m *Manager) observeActiveEntries(profile string, delta int) {
+	if observer := m.options.Observer; observer != nil && observer.ActiveEntries != nil {
+		observer.ActiveEntries(profile, delta)
+	}
+}
+
+func (m *Manager) observeCleanupFailure(profile string) {
+	if observer := m.options.Observer; observer != nil && observer.CleanupFailure != nil {
+		observer.CleanupFailure(profile)
+	}
 }
 
 func (m *Manager) invalidateOnFailure(e *environment, err error) {
@@ -459,8 +543,13 @@ func (m *Manager) lookup(id string) (*environment, error) {
 // Remove signals cancellation before waiting for any active operation. Cleanup
 // has its own bounded context, even when the caller's context is already done.
 // A syntactically valid ID that is no longer present is an idempotent success.
-func (m *Manager) Remove(_ context.Context, id string) error {
+func (m *Manager) Remove(_ context.Context, id string) (err error) {
+	profile := m.profileForID(id)
+	defer m.observeOperation(OperationRemove, &err, &profile)
 	e, err := m.lookup(id)
+	if e != nil {
+		profile = e.profile
+	}
 	if err != nil {
 		if KindOf(err) == NotFound {
 			return nil
@@ -535,11 +624,13 @@ func (m *Manager) cleanup(e *environment, attempt *cleanupAttempt) {
 		}
 	}
 	e.mu.Lock()
+	activeDelta := false
 	if err == nil {
 		e.destroyed = true
 		m.mu.Lock()
 		if m.environments[e.id] == e {
 			delete(m.environments, e.id)
+			activeDelta = true
 		}
 		if m.vms[e.vmID] == e {
 			delete(m.vms, e.vmID)
@@ -548,8 +639,15 @@ func (m *Manager) cleanup(e *environment, attempt *cleanupAttempt) {
 	} else {
 		attempt.err = NewError(KindOf(err), "environment cleanup is incomplete", err)
 	}
-	close(attempt.done)
+	failed := err != nil
 	e.mu.Unlock()
+	if activeDelta {
+		m.observeActiveEntries(e.profile, -1)
+	}
+	if failed {
+		m.observeCleanupFailure(e.profile)
+	}
+	close(attempt.done)
 }
 
 // RetryRemovals retries retained, incomplete cleanup without touching healthy

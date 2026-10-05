@@ -96,7 +96,7 @@ All pool management commands accept an `--endpoint` (or `-e`) flag (default: `un
 
 #### `pools list` (alias: `pools ls`)
 
-List all configured pools with their current status.
+List all configured pools with their current status. Current replicas count ready, never-claimed idle VMs, not active environments.
 
 ```bash
 fireactions pools list
@@ -104,33 +104,33 @@ fireactions pools list
 
 #### `pools pause <NAME>`
 
-Pause a pool, preventing it from scaling up. Running VMs continue to operate, but no new VMs will be started.
+Pause idle provisioning and cold acquisition. Existing idle VMs remain available for claims. Claimed VMs continue to run.
 
 ```bash
-fireactions pools pause default
+fireactions pools pause ubuntu-24.04
 ```
 
 #### `pools resume <NAME>`
 
-Resume a paused pool, enabling it to scale up again.
+Resume idle replenishment and cold acquisition. The pool creates clean replacements to reach its idle target.
 
 ```bash
-fireactions pools resume default
+fireactions pools resume ubuntu-24.04
 ```
 
 #### `pools scale <NAME> --replicas <N>`
 
-Scale a pool to the specified number of replicas. The pool will scale up or down to match the desired number.
+Set the target number of ready, never-claimed idle VMs. Scaling down removes idle VMs and cancels excess idle provisioning. It never terminates claimed environments.
 
 ```bash
-# Scale to 5 replicas
-fireactions pools scale default --replicas 5
+# Keep five clean idle VMs
+fireactions pools scale ubuntu-24.04 --replicas 5
 
-# Scale down to 0 (stop all VMs)
-fireactions pools scale default --replicas 0
+# Remove idle capacity without stopping active environments
+fireactions pools scale ubuntu-24.04 --replicas 0
 ```
 
-**Note**: The `--replicas` flag is required and you can scale down to 0 to stop all VMs in a pool.
+The `--replicas` flag is required. Counts must be between 0 and 2147483647. An active pool with zero replicas creates a dedicated cold VM for each acquisition.
 
 ### Machine Management Commands
 

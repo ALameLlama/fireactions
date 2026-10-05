@@ -55,6 +55,24 @@ func TestPoolsListCommand_Structure(t *testing.T) {
 	assert.NotNil(t, cmd.RunE)
 }
 
+func TestPoolsScaleRejectsNegativeAndOverflowBeforeConnecting(t *testing.T) {
+	cmd := newPoolsScaleCmd()
+	if err := cmd.Flags().Set("replicas", "-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runPoolsScaleCmd(cmd, []string{"pool"}); err == nil {
+		t.Fatal("expected negative replicas to be rejected")
+	}
+
+	cmd = newPoolsScaleCmd()
+	if err := cmd.Flags().Set("replicas", "2147483648"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runPoolsScaleCmd(cmd, []string{"pool"}); err == nil {
+		t.Fatal("expected int32 overflow to be rejected")
+	}
+}
+
 func TestAdminEndpointsDefaultToUnixSocket(t *testing.T) {
 	cmd := newPoolsCmd()
 	endpoint, err := cmd.PersistentFlags().GetString("endpoint")

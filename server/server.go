@@ -66,9 +66,9 @@ func New(config *Config, opts ...Opt) (*Server, error) {
 		return nil, fmt.Errorf("containerd: creating client: %w", err)
 	}
 
-	// Runner v13.2 pings active plugin streams every 30 seconds.
+	// Runner v13.2 pings active plugin streams every 30 seconds; allow arrival jitter.
 	grpcServer := grpc.NewServer(grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
-		MinTime: 30 * time.Second,
+		MinTime: 20 * time.Second,
 	}))
 	s := &Server{
 		config: config, grpcServer: grpcServer, pools: make(map[string]*Pool),
@@ -99,6 +99,26 @@ func New(config *Config, opts ...Opt) (*Server, error) {
 				}
 			}
 			return executor.ReadySpec{}, fmt.Errorf("unknown profile %q", profile)
+		},
+		Observer: &executor.Observer{
+			Operation: func(profile string, operation executor.Operation, outcome executor.Outcome) {
+				if _, ok := profiles[profile]; !ok {
+					return
+				}
+				metricOperations.WithLabelValues(profile, string(operation), string(outcome)).Inc()
+			},
+			ActiveEntries: func(profile string, delta int) {
+				if _, ok := profiles[profile]; !ok {
+					return
+				}
+				metricActiveEnvironments.WithLabelValues(profile).Add(float64(delta))
+			},
+			CleanupFailure: func(profile string) {
+				if _, ok := profiles[profile]; !ok {
+					return
+				}
+				metricCleanupFailures.WithLabelValues(profile).Inc()
+			},
 		},
 	})
 	if err != nil {
@@ -176,7 +196,6 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	s.health.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 	s.health.SetServingStatus("plugin.v1alpha.BackendPlugin", healthpb.HealthCheckResponse_SERVING)
-	metricUp.Set(1)
 	s.logger.Info().Str("socket_path", s.config.SocketPath).Msg("Serving Forgejo execution plugin")
 
 	runCtx, cancelRun := context.WithCancel(ctx)

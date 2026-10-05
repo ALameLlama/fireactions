@@ -63,7 +63,7 @@ type pluginHarness struct {
 	stopOnce       sync.Once
 }
 
-func newPluginHarness(t *testing.T) *pluginHarness {
+func newPluginHarness(t *testing.T, configure ...func(*server.Config)) *pluginHarness {
 	t.Helper()
 	configPath, binary, archive := os.Getenv("FIREACTIONS_CONFIG"), os.Getenv("FIREACTIONS_BIN"), os.Getenv("FIREACTIONS_GUEST_ARCHIVE")
 	if configPath == "" || binary == "" || archive == "" {
@@ -79,7 +79,7 @@ func newPluginHarness(t *testing.T) *pluginHarness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := os.MkdirTemp("/tmp", "fireactions-it-")
+	root, err := os.MkdirTemp("/tmp", "fa-it-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,12 +90,18 @@ func newPluginHarness(t *testing.T) *pluginHarness {
 		t.Fatal(err)
 	}
 	config.Containerd.Namespace = "fireactions-it-" + hex.EncodeToString(random[:])
-	config.StateDir = filepath.Join(root, "state")
+	config.StateDir = filepath.Join(root, "s")
 	config.SocketPath = filepath.Join(root, "plugin.sock")
 	config.Metrics.Enabled = false
 	for _, pool := range config.Pools {
 		pool.Replicas = 0
 		pool.ImagePullPolicy = "Never"
+	}
+	if len(configure) > 1 {
+		t.Fatal("newPluginHarness accepts at most one config callback")
+	}
+	if len(configure) == 1 && configure[0] != nil {
+		configure[0](config)
 	}
 	h.ctx = namespaces.WithNamespace(context.Background(), config.Containerd.Namespace)
 	h.containerd, err = containerd.New(config.Containerd.Address, containerd.WithDefaultNamespace(config.Containerd.Namespace))
@@ -316,6 +322,21 @@ func (h *pluginHarness) machines() []*serverv1.Machine {
 		h.t.Fatal(err)
 	}
 	return response.Machines
+}
+func (h *pluginHarness) waitForMachines(description string, timeout time.Duration, ready func([]*serverv1.Machine) bool) []*serverv1.Machine {
+	h.t.Helper()
+	deadline := time.Now().Add(timeout)
+	var machines []*serverv1.Machine
+	for {
+		machines = h.machines()
+		if ready(machines) {
+			return machines
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatalf("timed out waiting for %s: machines=%+v; %s", description, machines, h.log())
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 func (h *pluginHarness) create(profile string) *pluginv1alpha.CreateResponse {
 	h.t.Helper()
@@ -662,6 +683,380 @@ func TestRealPluginColdLifecycle(t *testing.T) {
 	h.remove(next.EnvironmentId)
 	h.assertClean(next.EnvironmentId, owned, vmIDs(machines))
 	t.Log("all seven plugin RPCs exercised against real Firecracker; ci1000, exact stdout/stderr42, binary/mode, fresh filesystem and full owned-resource teardown verified")
+}
+
+func TestRealPluginWarmPoolLifecycle(t *testing.T) {
+	h := newPluginHarness(t, func(config *server.Config) {
+		if len(config.Pools) == 0 {
+			t.Fatal("warm-pool integration config has no profiles")
+		}
+		for _, pool := range config.Pools {
+			pool.Replicas = 0
+		}
+		config.Pools[0].Replicas = 1
+	})
+	profile := h.config.Pools[0].Name
+	timeout := h.config.Guest.StartupTimeout + time.Minute
+
+	owned := make(map[int]string)
+	ownedVMIDs := make(map[string]struct{})
+	remember := func(machines []*serverv1.Machine) {
+		for pid, socket := range ownedVMMs(h.config.StateDir) {
+			owned[pid] = socket
+		}
+		for _, machine := range machines {
+			ownedVMIDs[machine.ID] = struct{}{}
+		}
+	}
+	poolInfo := func() *serverv1.Pool {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		response, err := h.admin.GetPool(ctx, &serverv1.GetPoolRequest{Name: profile})
+		if err != nil {
+			t.Fatalf("GetPool: %v", err)
+		}
+		if response.Pool == nil {
+			t.Fatal("GetPool returned no pool")
+		}
+		return response.Pool
+	}
+	poolSettled := func(machines []*serverv1.Machine, environments map[string]bool, idleCount int) bool {
+		if len(machines) != len(environments)+idleCount {
+			return false
+		}
+		foundEnvironments := make(map[string]bool, len(environments))
+		foundIdle := 0
+		foundVMIDs := make(map[string]bool, len(machines))
+		for _, machine := range machines {
+			if machine.ID == "" || foundVMIDs[machine.ID] {
+				return false
+			}
+			foundVMIDs[machine.ID] = true
+			switch machine.State {
+			case "claimed":
+				if machine.EnvironmentId == "" || !environments[machine.EnvironmentId] || foundEnvironments[machine.EnvironmentId] {
+					return false
+				}
+				foundEnvironments[machine.EnvironmentId] = true
+			case "idle":
+				if machine.AgentVersion == "" {
+					return false
+				}
+				foundIdle++
+			default:
+				return false
+			}
+		}
+		return len(foundEnvironments) == len(environments) && foundIdle == idleCount
+	}
+	claimedVMs := func(machines []*serverv1.Machine, environments map[string]bool) map[string]string {
+		result := make(map[string]string, len(environments))
+		for _, machine := range machines {
+			if machine.State != "claimed" || machine.EnvironmentId == "" || !environments[machine.EnvironmentId] {
+				continue
+			}
+			if _, exists := result[machine.EnvironmentId]; exists {
+				return nil
+			}
+			result[machine.EnvironmentId] = machine.ID
+		}
+		if len(result) != len(environments) {
+			return nil
+		}
+		return result
+	}
+	sameMachineMap := func(left, right map[string]string) bool {
+		if len(left) != len(right) {
+			return false
+		}
+		for environment, machine := range left {
+			if right[environment] != machine {
+				return false
+			}
+		}
+		return true
+	}
+	run := func(environmentID, description, command string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		stdout, stderr, exit, err := h.exec(ctx, environmentID, []string{"/bin/sh", "-c", command})
+		if err != nil || exit != 0 {
+			t.Fatalf("%s: stdout=%q stderr=%q exit=%d err=%v", description, stdout, stderr, exit, err)
+		}
+	}
+
+	initial := h.waitForMachines("the published ready warm VM", timeout, func(machines []*serverv1.Machine) bool {
+		return len(machines) == 1 && machines[0].Pool == profile &&
+			machines[0].State == "idle" && machines[0].AgentVersion != ""
+	})
+	warmVMID := initial[0].ID
+	remember(initial)
+	for _, pool := range h.config.Pools {
+		if strings.Contains(strings.ToLower(pool.Name), "large") && pool.Replicas != 0 {
+			t.Fatalf("large profile %q unexpectedly has warm replicas: %d", pool.Name, pool.Replicas)
+		}
+	}
+
+	type createResult struct {
+		response *pluginv1alpha.CreateResponse
+		err      error
+	}
+	results := make(chan createResult, 2)
+	for index := range 2 {
+		go func(index int) {
+			ctx, cancel := context.WithTimeout(context.Background(), h.config.Guest.StartupTimeout+20*time.Second)
+			defer cancel()
+			response, err := h.plugin.Create(ctx, &pluginv1alpha.CreateRequest{
+				Image: profile,
+				Name:  fmt.Sprintf("warm-concurrent-%d", index),
+			})
+			results <- createResult{response: response, err: err}
+		}(index)
+	}
+	environmentIDs := make([]string, 0, 2)
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("concurrent warm Create: %v; %s", result.err, h.log())
+		}
+		if result.response == nil || len(result.response.EnvironmentId) != 43 {
+			t.Fatalf("concurrent Create returned a non-opaque environment ID: %#v", result.response)
+		}
+		environmentIDs = append(environmentIDs, result.response.EnvironmentId)
+	}
+	if environmentIDs[0] == environmentIDs[1] {
+		t.Fatalf("concurrent Create reused environment ID %q", environmentIDs[0])
+	}
+	expectedTwo := map[string]bool{environmentIDs[0]: true, environmentIDs[1]: true}
+	originalEnvironmentID := ""
+	claimed := h.waitForMachines("both concurrent acquisitions to claim distinct VMs", timeout, func(machines []*serverv1.Machine) bool {
+		found := make(map[string]string, 2)
+		originalClaims := 0
+		for _, machine := range machines {
+			if machine.ID == warmVMID {
+				originalClaims++
+				if machine.State != "claimed" || !expectedTwo[machine.EnvironmentId] {
+					return false
+				}
+				originalEnvironmentID = machine.EnvironmentId
+			}
+			if machine.State == "claimed" && expectedTwo[machine.EnvironmentId] {
+				if _, duplicate := found[machine.EnvironmentId]; duplicate {
+					return false
+				}
+				found[machine.EnvironmentId] = machine.ID
+			}
+		}
+		return len(found) == 2 && originalClaims == 1
+	})
+	remember(claimed)
+	stableTwo := h.waitForMachines("clean replacement after concurrent claims", timeout, func(machines []*serverv1.Machine) bool {
+		return poolSettled(machines, expectedTwo, 1)
+	})
+	remember(stableTwo)
+	initialClaims := claimedVMs(stableTwo, expectedTwo)
+	if initialClaims == nil || initialClaims[originalEnvironmentID] != warmVMID {
+		t.Fatalf("original idle VM was not claimed exactly once: warm=%q environment=%q claims=%v", warmVMID, originalEnvironmentID, initialClaims)
+	}
+	firstEnvironmentID := originalEnvironmentID
+	secondEnvironmentID := environmentIDs[0]
+	if secondEnvironmentID == firstEnvironmentID {
+		secondEnvironmentID = environmentIDs[1]
+	}
+	if initialClaims[firstEnvironmentID] == initialClaims[secondEnvironmentID] {
+		t.Fatalf("concurrent environments share VM %q", initialClaims[firstEnvironmentID])
+	}
+
+	h.start(firstEnvironmentID)
+	h.start(secondEnvironmentID)
+	run(firstEnvironmentID, "write first-job marker", "touch /workspace/warm-job-marker")
+	run(secondEnvironmentID, "second job observed first-job marker", "test ! -e /workspace/warm-job-marker")
+
+	var pausedIdleVMID string
+	for _, machine := range stableTwo {
+		if machine.State == "idle" {
+			pausedIdleVMID = machine.ID
+		}
+	}
+	if pausedIdleVMID == "" || pausedIdleVMID == warmVMID {
+		t.Fatalf("no fresh idle replacement was published: %q", pausedIdleVMID)
+	}
+	pauseCtx, cancelPause := context.WithTimeout(context.Background(), 10*time.Second)
+	_, err := h.admin.PausePool(pauseCtx, &serverv1.PausePoolRequest{Name: profile})
+	cancelPause()
+	if err != nil {
+		t.Fatalf("PausePool: %v", err)
+	}
+	if state := poolInfo().State; state != serverv1.PoolState_POOL_STATE_PAUSED {
+		t.Fatalf("PausePool did not publish paused state: %v", state)
+	}
+
+	third := h.create(profile)
+	if expectedTwo[third.EnvironmentId] {
+		t.Fatalf("paused-pool Create reused environment ID %q", third.EnvironmentId)
+	}
+	expectedThree := map[string]bool{
+		firstEnvironmentID:  true,
+		secondEnvironmentID: true,
+		third.EnvironmentId: true,
+	}
+	pausedClaim := h.waitForMachines("paused pool to claim its existing idle VM", timeout, func(machines []*serverv1.Machine) bool {
+		return poolSettled(machines, expectedThree, 0)
+	})
+	remember(pausedClaim)
+	pausedClaims := claimedVMs(pausedClaim, expectedThree)
+	if pausedClaims == nil || pausedClaims[third.EnvironmentId] != pausedIdleVMID {
+		t.Fatalf("paused acquisition did not claim the existing idle VM %q: %v", pausedIdleVMID, pausedClaims)
+	}
+	h.start(third.EnvironmentId)
+	run(third.EnvironmentId, "replacement VM carried dirty workspace", "test ! -e /workspace/warm-job-marker")
+
+	emptyCtx, cancelEmpty := context.WithTimeout(context.Background(), 10*time.Second)
+	emptyResponse, emptyErr := h.plugin.Create(emptyCtx, &pluginv1alpha.CreateRequest{Image: profile, Name: "warm-paused-empty"})
+	cancelEmpty()
+	if status.Code(emptyErr) != codes.Unavailable {
+		if emptyResponse != nil {
+			h.remove(emptyResponse.EnvironmentId)
+		}
+		t.Fatalf("empty paused pool Create: want Unavailable, got response=%#v err=%v", emptyResponse, emptyErr)
+	}
+	stillPaused := h.waitForMachines("paused pool to remain empty after rejected Create", timeout, func(machines []*serverv1.Machine) bool {
+		return poolSettled(machines, expectedThree, 0)
+	})
+	remember(stillPaused)
+	if !sameMachineMap(pausedClaims, claimedVMs(stillPaused, expectedThree)) {
+		t.Fatal("rejected paused Create changed claimed VM ownership")
+	}
+
+	resumeCtx, cancelResume := context.WithTimeout(context.Background(), 10*time.Second)
+	_, err = h.admin.ResumePool(resumeCtx, &serverv1.ResumePoolRequest{Name: profile})
+	cancelResume()
+	if err != nil {
+		t.Fatalf("ResumePool: %v", err)
+	}
+	if state := poolInfo().State; state != serverv1.PoolState_POOL_STATE_ACTIVE {
+		t.Fatalf("ResumePool did not publish active state: %v", state)
+	}
+	beforeScale := h.waitForMachines("resumed pool to publish one clean idle VM", timeout, func(machines []*serverv1.Machine) bool {
+		return poolSettled(machines, expectedThree, 1)
+	})
+	remember(beforeScale)
+	claimedBeforeScale := claimedVMs(beforeScale, expectedThree)
+	if claimedBeforeScale == nil {
+		t.Fatal("resumed pool changed claimed environment ownership")
+	}
+
+	scaleCtx, cancelScale := context.WithTimeout(context.Background(), 10*time.Second)
+	_, err = h.admin.ScalePool(scaleCtx, &serverv1.ScalePoolRequest{Name: profile, Replicas: 0})
+	cancelScale()
+	if err != nil {
+		t.Fatalf("ScalePool(0): %v", err)
+	}
+	if pool := poolInfo(); pool.DesiredReplicas != 0 || pool.State != serverv1.PoolState_POOL_STATE_ACTIVE {
+		t.Fatalf("scale-to-zero changed wrong pool state: %+v", pool)
+	}
+	scaledDown := h.waitForMachines("scale-down to remove only the idle VM", timeout, func(machines []*serverv1.Machine) bool {
+		return poolSettled(machines, expectedThree, 0)
+	})
+	remember(scaledDown)
+	if !sameMachineMap(claimedBeforeScale, claimedVMs(scaledDown, expectedThree)) {
+		t.Fatalf("scale-down changed claimed VM ownership: before=%v after=%v", claimedBeforeScale, claimedVMs(scaledDown, expectedThree))
+	}
+	run(firstEnvironmentID, "claimed warm VM stopped after scale-down", "test -e /workspace/warm-job-marker")
+	run(secondEnvironmentID, "second claimed VM stopped after scale-down", "test ! -e /workspace/warm-job-marker")
+	run(third.EnvironmentId, "replacement claimed VM stopped after scale-down", "test ! -e /workspace/warm-job-marker")
+
+	h.remove(firstEnvironmentID)
+	remaining := map[string]bool{secondEnvironmentID: true, third.EnvironmentId: true}
+	afterFirstRemove := h.waitForMachines("first environment cleanup at zero replicas", timeout, func(machines []*serverv1.Machine) bool {
+		return poolSettled(machines, remaining, 0)
+	})
+	remember(afterFirstRemove)
+	for _, machine := range afterFirstRemove {
+		if machine.ID == warmVMID {
+			t.Fatalf("removed warm VM %q remained registered", warmVMID)
+		}
+	}
+	previousVMIDs := make(map[string]struct{}, len(ownedVMIDs))
+	for vmID := range ownedVMIDs {
+		previousVMIDs[vmID] = struct{}{}
+	}
+	if pool := poolInfo(); pool.DesiredReplicas != 0 || pool.State != serverv1.PoolState_POOL_STATE_ACTIVE {
+		t.Fatalf("cold acquisition precondition was not active at zero replicas: %+v", pool)
+	}
+
+	fresh := h.create(profile)
+	expectedFresh := map[string]bool{
+		secondEnvironmentID: true,
+		third.EnvironmentId: true,
+		fresh.EnvironmentId: true,
+	}
+	freshMachines := h.waitForMachines("zero-replica active Create to cold-provision a VM", timeout, func(machines []*serverv1.Machine) bool {
+		return poolSettled(machines, expectedFresh, 0)
+	})
+	freshClaims := claimedVMs(freshMachines, expectedFresh)
+	if freshClaims == nil {
+		t.Fatal("fresh cold environment was not claimed")
+	}
+	if _, existed := previousVMIDs[freshClaims[fresh.EnvironmentId]]; existed {
+		t.Fatalf("zero-replica Create reused an existing VM %q", freshClaims[fresh.EnvironmentId])
+	}
+	remember(freshMachines)
+	h.start(fresh.EnvironmentId)
+	run(fresh.EnvironmentId, "zero-replica cold VM carried dirty workspace", "test ! -e /workspace/warm-job-marker")
+
+	finalMachines := h.waitForMachines("all active environments before teardown", timeout, func(machines []*serverv1.Machine) bool {
+		return poolSettled(machines, expectedFresh, 0)
+	})
+	remember(finalMachines)
+	h.remove(secondEnvironmentID)
+	h.remove(third.EnvironmentId)
+	h.remove(fresh.EnvironmentId)
+
+	allVMIDList := make([]string, 0, len(ownedVMIDs))
+	for vmID := range ownedVMIDs {
+		allVMIDList = append(allVMIDList, vmID)
+	}
+	for _, environmentID := range []string{firstEnvironmentID, secondEnvironmentID, third.EnvironmentId, fresh.EnvironmentId} {
+		h.assertClean(environmentID, owned, allVMIDList)
+	}
+	t.Log("warm publication, concurrent unique claims, clean replacement, paused idle-only claim, claimed-VM scale-down protection, zero-replica cold filesystem and complete resource cleanup verified")
+}
+
+func TestRealPluginConfiguredLargeProfileSMP(t *testing.T) {
+	h := newPluginHarness(t)
+	if len(h.config.Pools) < 2 {
+		t.Skip("requires a second configured Firecracker profile")
+	}
+	profile := h.config.Pools[1]
+	expectedVCPUs := profile.Firecracker.MachineConfig.VcpuCount
+	environment := h.create(profile.Name)
+	h.start(environment.EnvironmentId)
+
+	machines := h.machines()
+	owned := ownedVMMs(h.config.StateDir)
+	if len(machines) != 1 || machines[0].State != "claimed" || machines[0].EnvironmentId != environment.EnvironmentId || machines[0].Pool != profile.Name {
+		t.Fatalf("large-profile environment did not own one claimed VM: %#v", machines)
+	}
+	if len(owned) != 1 {
+		t.Fatalf("large-profile environment did not own one VMM: %v", owned)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	stdout, stderr, exit, err := h.exec(ctx, environment.EnvironmentId, []string{"nproc"})
+	cancel()
+	if err != nil || exit != 0 {
+		t.Fatalf("large-profile nproc: stdout=%q stderr=%q exit=%d err=%v", stdout, stderr, exit, err)
+	}
+	actualVCPUs, parseErr := strconv.ParseInt(strings.TrimSpace(stdout), 10, 64)
+	if parseErr != nil || actualVCPUs != expectedVCPUs {
+		t.Fatalf("guest reported %q CPUs, configured Firecracker profile %q requires %d: parse error=%v", strings.TrimSpace(stdout), profile.Name, expectedVCPUs, parseErr)
+	}
+
+	h.remove(environment.EnvironmentId)
+	h.assertClean(environment.EnvironmentId, owned, vmIDs(machines))
+	t.Logf("configured profile %s exposed all %d vCPUs to the guest", profile.Name, expectedVCPUs)
 }
 
 func TestRealPluginSilentCancellationAndRemove(t *testing.T) {

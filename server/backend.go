@@ -10,9 +10,8 @@ import (
 
 var _ executor.Backend = (*Server)(nil)
 
-// Acquire creates a dedicated Firecracker VM for the configured image profile.
-// Stage 5 deliberately does not claim idle replicas: every environment gets a
-// fresh VM and ownership remains with its pool until cleanup completes.
+// Acquire claims a ready idle Firecracker VM when available, or provisions a
+// dedicated claimed VM when the pool is active and has no warm replica.
 func (s *Server) Acquire(ctx context.Context, profile string, absoluteExpiry time.Time) (executor.VM, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -21,8 +20,9 @@ func (s *Server) Acquire(ctx context.Context, profile string, absoluteExpiry tim
 	if err != nil {
 		return nil, executor.NewError(executor.InvalidArgument, fmt.Sprintf("unknown image profile %q", profile), err)
 	}
-	if !pool.IsActive() {
-		return nil, executor.NewError(executor.FailedPrecondition, fmt.Sprintf("image profile %q is paused", profile), nil)
-	}
+	started := time.Now()
+	defer func() {
+		metricVMAcquisition.WithLabelValues(pool.config.Name).Observe(time.Since(started).Seconds())
+	}()
 	return pool.acquire(ctx, absoluteExpiry)
 }

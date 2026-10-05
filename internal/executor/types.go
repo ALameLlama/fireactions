@@ -109,4 +109,35 @@ type Options struct {
 	MaxLifetime    time.Duration
 	CleanupTimeout time.Duration
 	ReadySpec      func(profile string) (ReadySpec, error)
+	Observer       *Observer
+}
+
+// Operation identifies a public environment operation reported to an Observer.
+type Operation string
+
+const (
+	OperationCreate  Operation = "create"
+	OperationStart   Operation = "start"
+	OperationCopyIn  Operation = "copy_in"
+	OperationExec    Operation = "exec"
+	OperationCopyOut Operation = "copy_out"
+	OperationRemove  Operation = "remove"
+)
+
+// Outcome is the result category reported for a public operation.
+type Outcome string
+
+const (
+	OutcomeSuccess   Outcome = "success"
+	OutcomeFailure   Outcome = "failure"
+	OutcomeCancelled Outcome = "cancelled"
+)
+
+// Observer receives protocol-independent ownership and operation events.
+// Nil callbacks are ignored. Callbacks should be fast and must be safe for
+// concurrent calls.
+type Observer struct {
+	Operation      func(profile string, operation Operation, outcome Outcome)
+	ActiveEntries  func(profile string, delta int)
+	CleanupFailure func(profile string)
 }

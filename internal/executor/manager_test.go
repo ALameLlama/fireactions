@@ -125,6 +125,122 @@ func startEnvironment(t *testing.T, manager *Manager, id string) map[string]stri
 	return env
 }
 
+func TestObserverReportsOperationsAndOwnedEntryDeltas(t *testing.T) {
+	var mu sync.Mutex
+	var operations []struct {
+		profile   string
+		operation Operation
+		outcome   Outcome
+	}
+	var deltas []int
+	var cleanupFailures int
+	observer := &Observer{
+		Operation: func(profile string, operation Operation, outcome Outcome) {
+			mu.Lock()
+			defer mu.Unlock()
+			operations = append(operations, struct {
+				profile   string
+				operation Operation
+				outcome   Outcome
+			}{profile, operation, outcome})
+		},
+		ActiveEntries: func(_ string, delta int) {
+			mu.Lock()
+			defer mu.Unlock()
+			deltas = append(deltas, delta)
+		},
+		CleanupFailure: func(_ string) {
+			mu.Lock()
+			defer mu.Unlock()
+			cleanupFailures++
+		},
+	}
+	vm := newTestVM("observer-vm")
+	manager := testManager(t, fixedBackend(vm), Options{Observer: observer})
+	info := createEnvironment(t, manager, CreateSpec{Profile: "ubuntu-24.04"})
+	startEnvironment(t, manager, info.ID)
+	require.NoError(t, manager.CopyIn(context.Background(), info.ID, "/tmp/input", strings.NewReader("data")))
+	_, err := manager.Exec(context.Background(), info.ID, ExecSpec{Command: []string{"true"}}, nil, nil)
+	require.NoError(t, err)
+	vm.guest.exec = func(context.Context, ExecSpec, io.Writer, io.Writer) (ExecResult, error) {
+		return ExecResult{ExitCode: 3}, nil
+	}
+	_, err = manager.Exec(context.Background(), info.ID, ExecSpec{Command: []string{"exit", "3"}}, nil, nil)
+	require.NoError(t, err)
+	require.NoError(t, manager.CopyOut(context.Background(), info.ID, "/tmp/output", io.Discard))
+	require.NoError(t, manager.Remove(context.Background(), info.ID))
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = manager.Create(cancelled, CreateSpec{Profile: "ubuntu-24.04"})
+	require.ErrorIs(t, err, context.Canceled)
+	deadline, deadlineCancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer deadlineCancel()
+	_, err = manager.Create(deadline, CreateSpec{Profile: "ubuntu-24.04"})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Error(t, manager.CopyIn(context.Background(), "bad", "", nil))
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []struct {
+		profile   string
+		operation Operation
+		outcome   Outcome
+	}{
+		{"ubuntu-24.04", OperationCreate, OutcomeSuccess},
+		{"ubuntu-24.04", OperationStart, OutcomeSuccess},
+		{"ubuntu-24.04", OperationCopyIn, OutcomeSuccess},
+		{"ubuntu-24.04", OperationExec, OutcomeSuccess},
+		{"ubuntu-24.04", OperationExec, OutcomeFailure},
+		{"ubuntu-24.04", OperationCopyOut, OutcomeSuccess},
+		{"ubuntu-24.04", OperationRemove, OutcomeSuccess},
+		{"ubuntu-24.04", OperationCreate, OutcomeCancelled},
+		{"ubuntu-24.04", OperationCreate, OutcomeCancelled},
+		{"", OperationCopyIn, OutcomeFailure},
+	}, operations)
+	require.Equal(t, []int{1, -1}, deltas)
+	require.Zero(t, cleanupFailures)
+}
+
+func TestObserverCountsCleanupFailurePerAttemptAndKeepsEntryUntilCleanup(t *testing.T) {
+	var mu sync.Mutex
+	var deltas []int
+	failures := 0
+	observer := &Observer{
+		ActiveEntries: func(_ string, delta int) {
+			mu.Lock()
+			defer mu.Unlock()
+			deltas = append(deltas, delta)
+		},
+		CleanupFailure: func(_ string) {
+			mu.Lock()
+			defer mu.Unlock()
+			failures++
+		},
+	}
+	vm := newTestVM("observer-cleanup-vm")
+	var destroys atomic.Int32
+	vm.destroy = func(context.Context) error {
+		if destroys.Add(1) == 1 {
+			return errors.New("temporary destroy failure")
+		}
+		return nil
+	}
+	manager := testManager(t, fixedBackend(vm), Options{Observer: observer})
+	info := createEnvironment(t, manager, CreateSpec{Profile: "ubuntu-24.04"})
+	require.Error(t, manager.Remove(context.Background(), info.ID))
+	mu.Lock()
+	require.Equal(t, []int{1}, deltas)
+	require.Equal(t, 1, failures)
+	mu.Unlock()
+
+	require.NoError(t, manager.Remove(context.Background(), info.ID))
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []int{1, -1}, deltas)
+	require.Equal(t, 1, failures)
+}
+
 func TestDefaultLayoutAndInvalidSettings(t *testing.T) {
 	for _, test := range []struct{ architecture, expected string }{
 		{"amd64", "X64"}, {"X64", "X64"}, {"arm64", "ARM64"}, {"ARM64", "ARM64"},

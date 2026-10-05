@@ -14,7 +14,7 @@ func TestConvertPoolUsesProfileImageAndCurrentTarget(t *testing.T) {
 	pool := &Pool{
 		config:       &PoolConfig{Name: "ubuntu-large", Image: "registry.example/guest@sha256:abc", Replicas: 9},
 		machinesMu:   &sync.Mutex{},
-		machines:     map[string]*Machine{"vm-1": {}, "vm-2": {}},
+		machines:     map[string]*Machine{"vm-1": {State: "idle"}, "vm-2": {State: "claimed"}},
 		scaleTrigger: make(chan struct{}, 1),
 		isActive:     true,
 	}
@@ -24,8 +24,8 @@ func TestConvertPoolUsesProfileImageAndCurrentTarget(t *testing.T) {
 	if got.Name != "ubuntu-large" || got.Image != pool.config.Image {
 		t.Fatalf("profile identity/image lost: %v", got)
 	}
-	if got.CurrentReplicas != 2 || got.DesiredReplicas != 3 || got.Replicas != 3 {
-		t.Fatalf("expected current VM count 2 and runtime replica target 3: %v", got)
+	if got.CurrentReplicas != 1 || got.DesiredReplicas != 3 || got.Replicas != 3 {
+		t.Fatalf("expected one clean idle replica and runtime target 3: %v", got)
 	}
 	if got.State != serverv1.PoolState_POOL_STATE_ACTIVE {
 		t.Fatalf("expected active profile: %v", got.State)
