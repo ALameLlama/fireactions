@@ -135,24 +135,9 @@ func (s *Server) ListMachines(ctx context.Context, req *serverv1.ListMachinesReq
 		return machines[i].Name < machines[j].Name
 	})
 
-	// Convert machines to proto in parallel for better performance
 	protoMachines := make([]*serverv1.Machine, len(machines))
-	type result struct {
-		index int
-		proto *serverv1.Machine
-	}
-	results := make(chan result, len(machines))
-
 	for i, machine := range machines {
-		go func(idx int, m *Machine) {
-			results <- result{index: idx, proto: convertMachineToProto(ctx, m)}
-		}(i, machine)
-	}
-
-	// Collect results
-	for range machines {
-		r := <-results
-		protoMachines[r.index] = r.proto
+		protoMachines[i] = convertMachineToProto(ctx, machine)
 	}
 
 	return &serverv1.ListMachinesResponse{Machines: protoMachines}, nil
@@ -187,11 +172,10 @@ func (s *Server) GetMachineLogs(req *serverv1.GetMachineLogsRequest, stream serv
 		return status.Errorf(codes.NotFound, "machine not found: %v", err)
 	}
 
-	conn, client, err := machine.ConnectToGuestAgent(ctx)
+	_, client, err := machine.ConnectToGuestAgent(ctx)
 	if err != nil {
 		return status.Errorf(codes.Internal, "connect to agent: %v", err)
 	}
-	defer conn.Close()
 
 	agentStream, err := client.GetLogs(ctx, &agentv1.GetLogsRequest{
 		Follow:    req.Follow,

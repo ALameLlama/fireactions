@@ -7,6 +7,8 @@
 * Remove GitHub App/JIT registration, runner processes and MMDS bootstrap. Pools now select bootable OCI image profiles while retaining Firecracker, devmapper, CNI and rate limits.
 * Reject obsolete and unknown YAML settings; require unique safe profile names and positive VM resources.
 * Replace runner diagnostics with VM state and generic agent readiness/version. The guest agent starts directly with `--port` and `--log-level` flags.
+* Isolate disposable environment ownership from wire protocols, with opaque IDs, hard deadlines, per-environment serialization and cancellation-first removal.
+* Give writable snapshots, leases, CNI namespaces, VMM processes and control connections one retryable cleanup owner; verify process identity before force-stop.
 
 ## [2.0.8](https://github.com/hostinger/fireactions/compare/v2.0.7...v2.0.8) (2026-09-15)
 

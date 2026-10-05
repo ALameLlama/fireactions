@@ -112,6 +112,11 @@ func New(config *Config, opts ...Opt) (*Server, error) {
 
 // Run starts the server and blocks until the context is canceled.
 func (s *Server) Run(ctx context.Context) error {
+	owner, err := acquireOwnerLock("/var/lib/fireactions")
+	if err != nil {
+		return err
+	}
+	defer owner.Close()
 	s.logger.Info().Str("version", fireactions.Version).Str("date", fireactions.Date).Str("commit", fireactions.Commit).Msgf("Starting gRPC server on %s", s.config.BindAddress)
 	listener, err := net.Listen("tcp", s.config.BindAddress)
 	if err != nil {
@@ -119,6 +124,12 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	defer func() {
 		_ = listener.Close()
+	}()
+	defer func() {
+		for _, pool := range s.pools {
+			pool.Stop()
+		}
+		_ = s.containerd.Close()
 	}()
 
 	for _, poolConfig := range s.config.Pools {
