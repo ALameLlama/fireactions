@@ -11,15 +11,18 @@ import (
 )
 
 func (a *Agent) applyReady(req *agentv1.ReadyRequest) error {
-	settings, err := a.prepareReady(req)
+	settings, err := a.parseReady(req)
 	if err != nil {
+		return err
+	}
+	if err := a.prepareDirectories(settings); err != nil {
 		return err
 	}
 	a.publishReady(settings)
 	return nil
 }
 
-func (a *Agent) prepareReady(req *agentv1.ReadyRequest) (readySettings, error) {
+func (a *Agent) parseReady(req *agentv1.ReadyRequest) (readySettings, error) {
 	userSpec := req.GetDefaultUser()
 	if userSpec == "" {
 		userSpec = a.cfg.DefaultUser
@@ -60,15 +63,6 @@ func (a *Agent) prepareReady(req *agentv1.ReadyRequest) (readySettings, error) {
 	}
 	slices.Sort(cleanDirectories)
 
-	for _, directory := range cleanDirectories {
-		if err := a.fs.EnsureDirectory(directory, identity.UID, identity.GID, 0755); err != nil {
-			if errors.Is(err, guestfs.ErrInvalidPath) {
-				return readySettings{}, status.Error(codes.InvalidArgument, "invalid workspace directory")
-			}
-			return readySettings{}, status.Error(codes.Internal, "could not prepare workspace directories")
-		}
-	}
-
 	return readySettings{
 		identity:          cloneIdentity(identity),
 		directories:       cleanDirectories,
@@ -76,6 +70,18 @@ func (a *Agent) prepareReady(req *agentv1.ReadyRequest) (readySettings, error) {
 		maxArchiveEntries: maxEntries,
 		ready:             true,
 	}, nil
+}
+
+func (a *Agent) prepareDirectories(settings readySettings) error {
+	for _, directory := range settings.directories {
+		if err := a.fs.EnsureDirectory(directory, settings.identity.UID, settings.identity.GID, 0755); err != nil {
+			if errors.Is(err, guestfs.ErrInvalidPath) {
+				return status.Error(codes.InvalidArgument, "invalid workspace directory")
+			}
+			return status.Error(codes.Internal, "could not prepare workspace directories")
+		}
+	}
+	return nil
 }
 
 func (a *Agent) publishReady(settings readySettings) {

@@ -1,5 +1,5 @@
 // Package guest translates the private guest protocol without exposing wire types
-// to execution ownership. File transfer and process RPCs are added separately.
+// to execution ownership.
 package guest
 
 import (
@@ -17,6 +17,8 @@ type Client struct {
 	conn *grpc.ClientConn
 	rpc  agentv1.AgentServiceClient
 }
+
+var _ executor.Guest = (*Client)(nil)
 
 func New(conn *grpc.ClientConn) *Client {
 	return &Client{conn: conn, rpc: agentv1.NewAgentServiceClient(conn)}

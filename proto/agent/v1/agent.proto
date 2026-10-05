@@ -16,6 +16,12 @@ service AgentService {
 
   // GetLogs streams logs from the agent service (server-side streaming).
   rpc GetLogs(GetLogsRequest) returns (stream GetLogsResponse);
+
+  // Exec runs a process and streams output and a terminal result.
+  rpc Exec(ExecRequest) returns (stream ExecOutput);
+
+  // Kill terminates one process scope or all tracked scopes when process_id is empty.
+  rpc Kill(KillRequest) returns (KillResponse);
 }
 
 message ReadyRequest {
@@ -51,6 +57,38 @@ message GetLogsRequest {
   bool follow = 1; // If true, stream continuously
   int32 tail_lines = 2; // Number of recent lines to send first (0 = all)
 }
+
+enum ExecStream {
+  STDOUT = 0;
+  STDERR = 1;
+}
+
+message ExecRequest {
+  repeated string command = 1;
+  map<string, string> env = 2;
+  string user = 3;
+  string workdir = 4;
+  string process_id = 5;
+}
+
+message ExecData {
+  ExecStream stream = 1;
+  bytes data = 2;
+}
+
+message ExecComplete { int32 exit_code = 1; }
+message ExecFailed { string error_message = 1; }
+
+message ExecOutput {
+  oneof result {
+    ExecData data = 1;
+    ExecComplete complete = 2;
+    ExecFailed failed = 3;
+  }
+}
+
+message KillRequest { string process_id = 1; }
+message KillResponse {}
 
 // GetLogsResponse is the response for GetLogs.
 message GetLogsResponse {

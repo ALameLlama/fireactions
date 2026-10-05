@@ -34,6 +34,7 @@ type Agent struct {
 	agentv1.UnimplementedAgentServiceServer
 	cfg           Config
 	fs            *guestfs.RootFS
+	processes     *execManager
 	readyMu       sync.RWMutex
 	readySettings readySettings
 	closeOnce     sync.Once
@@ -64,6 +65,8 @@ func New(cfg Config, opts ...Opt) (*Agent, error) {
 	for _, opt := range opts {
 		opt(a)
 	}
+
+	a.processes = newExecManager(a)
 
 	if err := a.setupLogger(); err != nil {
 		_ = root.Close()
@@ -105,8 +108,15 @@ func (a *Agent) setupLogger() error {
 // Close closes the agent resources, including the log file and workspace root.
 func (a *Agent) Close() error {
 	a.closeOnce.Do(func() {
+		if a.processes != nil {
+			if err := a.processes.shutdown(); err != nil {
+				a.closeErr = errors.Join(a.closeErr, err)
+			}
+		}
 		if a.logFileWriter != nil {
-			a.closeErr = a.logFileWriter.Close()
+			if err := a.logFileWriter.Close(); err != nil {
+				a.closeErr = errors.Join(a.closeErr, err)
+			}
 			a.logFileWriter = nil
 		}
 		if err := a.fs.Close(); err != nil {

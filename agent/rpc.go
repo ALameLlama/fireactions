@@ -9,16 +9,48 @@ import (
 	"github.com/hostinger/fireactions"
 	"github.com/hostinger/fireactions/agent/tail"
 	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func (a *Agent) Ready(ctx context.Context, req *agentv1.ReadyRequest) (*agentv1.ReadyResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := a.applyReady(req); err != nil {
+	if a.processes == nil {
+		return nil, status.Error(codes.FailedPrecondition, "process manager unavailable")
+	}
+
+	settings, err := a.parseReady(req)
+	if err != nil {
 		return nil, err
 	}
+
+	a.processes.mu.Lock()
+	defer a.processes.mu.Unlock()
+	if a.processes.closing {
+		return nil, status.Error(codes.FailedPrecondition, "agent is shutting down")
+	}
+	a.readyMu.Lock()
+	defer a.readyMu.Unlock()
+	if !equalReadySettings(a.readySettings, settings) && len(a.processes.scopes) != 0 {
+		return nil, status.Error(codes.FailedPrecondition, "cannot change settings while process scopes exist")
+	}
+	if err := a.validateProcessReadinessLocked(); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "guest process cgroups are not ready: %v", err)
+	}
+	if err := a.prepareDirectories(settings); err != nil {
+		return nil, err
+	}
+	a.readySettings = settings
 	return &agentv1.ReadyResponse{Version: fireactions.Version}, nil
+}
+
+func (a *Agent) Exec(req *agentv1.ExecRequest, stream agentv1.AgentService_ExecServer) error {
+	if a.processes == nil {
+		return status.Error(codes.FailedPrecondition, "process manager unavailable")
+	}
+	return a.processes.exec(stream, req)
 }
 
 func (a *Agent) GetLogs(req *agentv1.GetLogsRequest, stream agentv1.AgentService_GetLogsServer) error {

@@ -23,6 +23,8 @@ const (
 	AgentService_CopyIn_FullMethodName  = "/fireactions.agent.v1.AgentService/CopyIn"
 	AgentService_CopyOut_FullMethodName = "/fireactions.agent.v1.AgentService/CopyOut"
 	AgentService_GetLogs_FullMethodName = "/fireactions.agent.v1.AgentService/GetLogs"
+	AgentService_Exec_FullMethodName    = "/fireactions.agent.v1.AgentService/Exec"
+	AgentService_Kill_FullMethodName    = "/fireactions.agent.v1.AgentService/Kill"
 )
 
 // AgentServiceClient is the client API for AgentService service.
@@ -39,6 +41,10 @@ type AgentServiceClient interface {
 	CopyOut(ctx context.Context, in *CopyOutRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[CopyOutChunk], error)
 	// GetLogs streams logs from the agent service (server-side streaming).
 	GetLogs(ctx context.Context, in *GetLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GetLogsResponse], error)
+	// Exec runs a process and streams output and a terminal result.
+	Exec(ctx context.Context, in *ExecRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExecOutput], error)
+	// Kill terminates one process scope or all tracked scopes when process_id is empty.
+	Kill(ctx context.Context, in *KillRequest, opts ...grpc.CallOption) (*KillResponse, error)
 }
 
 type agentServiceClient struct {
@@ -110,6 +116,35 @@ func (c *agentServiceClient) GetLogs(ctx context.Context, in *GetLogsRequest, op
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type AgentService_GetLogsClient = grpc.ServerStreamingClient[GetLogsResponse]
 
+func (c *agentServiceClient) Exec(ctx context.Context, in *ExecRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExecOutput], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &AgentService_ServiceDesc.Streams[3], AgentService_Exec_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ExecRequest, ExecOutput]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AgentService_ExecClient = grpc.ServerStreamingClient[ExecOutput]
+
+func (c *agentServiceClient) Kill(ctx context.Context, in *KillRequest, opts ...grpc.CallOption) (*KillResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(KillResponse)
+	err := c.cc.Invoke(ctx, AgentService_Kill_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AgentServiceServer is the server API for AgentService service.
 // All implementations must embed UnimplementedAgentServiceServer
 // for forward compatibility.
@@ -124,6 +159,10 @@ type AgentServiceServer interface {
 	CopyOut(*CopyOutRequest, grpc.ServerStreamingServer[CopyOutChunk]) error
 	// GetLogs streams logs from the agent service (server-side streaming).
 	GetLogs(*GetLogsRequest, grpc.ServerStreamingServer[GetLogsResponse]) error
+	// Exec runs a process and streams output and a terminal result.
+	Exec(*ExecRequest, grpc.ServerStreamingServer[ExecOutput]) error
+	// Kill terminates one process scope or all tracked scopes when process_id is empty.
+	Kill(context.Context, *KillRequest) (*KillResponse, error)
 	mustEmbedUnimplementedAgentServiceServer()
 }
 
@@ -145,6 +184,12 @@ func (UnimplementedAgentServiceServer) CopyOut(*CopyOutRequest, grpc.ServerStrea
 }
 func (UnimplementedAgentServiceServer) GetLogs(*GetLogsRequest, grpc.ServerStreamingServer[GetLogsResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method GetLogs not implemented")
+}
+func (UnimplementedAgentServiceServer) Exec(*ExecRequest, grpc.ServerStreamingServer[ExecOutput]) error {
+	return status.Errorf(codes.Unimplemented, "method Exec not implemented")
+}
+func (UnimplementedAgentServiceServer) Kill(context.Context, *KillRequest) (*KillResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Kill not implemented")
 }
 func (UnimplementedAgentServiceServer) mustEmbedUnimplementedAgentServiceServer() {}
 func (UnimplementedAgentServiceServer) testEmbeddedByValue()                      {}
@@ -214,6 +259,35 @@ func _AgentService_GetLogs_Handler(srv interface{}, stream grpc.ServerStream) er
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type AgentService_GetLogsServer = grpc.ServerStreamingServer[GetLogsResponse]
 
+func _AgentService_Exec_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(ExecRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(AgentServiceServer).Exec(m, &grpc.GenericServerStream[ExecRequest, ExecOutput]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AgentService_ExecServer = grpc.ServerStreamingServer[ExecOutput]
+
+func _AgentService_Kill_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(KillRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServiceServer).Kill(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AgentService_Kill_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServiceServer).Kill(ctx, req.(*KillRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // AgentService_ServiceDesc is the grpc.ServiceDesc for AgentService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -224,6 +298,10 @@ var AgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Ready",
 			Handler:    _AgentService_Ready_Handler,
+		},
+		{
+			MethodName: "Kill",
+			Handler:    _AgentService_Kill_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
@@ -240,6 +318,11 @@ var AgentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "GetLogs",
 			Handler:       _AgentService_GetLogs_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "Exec",
+			Handler:       _AgentService_Exec_Handler,
 			ServerStreams: true,
 		},
 	},
