@@ -9,6 +9,7 @@
 * Replace runner diagnostics with VM state and generic agent readiness/version. The guest agent starts directly with `--port` and `--log-level` flags.
 * Isolate disposable environment ownership from wire protocols, with opaque IDs, hard deadlines, per-environment serialization and cancellation-first removal.
 * Give writable snapshots, leases, CNI namespaces, VMM processes and control connections one retryable cleanup owner; verify process identity before force-stop.
+* Stream bounded tar transfers through the private guest channel, confining filesystem access to the rooted workspace and preserving safe links, ownership, executable modes and timestamps.
 
 ## [2.0.8](https://github.com/hostinger/fireactions/compare/v2.0.7...v2.0.8) (2026-09-15)
 

@@ -5,19 +5,45 @@ option go_package = "github.com/hostinger/fireactions/proto/agent/v1;agentv1";
 
 // AgentService provides readiness and diagnostics for the generic guest agent.
 service AgentService {
-  // Ready reports the agent version once it can accept guest requests.
+  // Ready validates the guest workspace and applies trusted transfer settings.
   rpc Ready(ReadyRequest) returns (ReadyResponse);
+
+  // CopyIn extracts a streaming tar archive under a workspace destination.
+  rpc CopyIn(stream CopyInChunk) returns (CopyInResponse);
+
+  // CopyOut streams a tar archive of a workspace path.
+  rpc CopyOut(CopyOutRequest) returns (stream CopyOutChunk);
 
   // GetLogs streams logs from the agent service (server-side streaming).
   rpc GetLogs(GetLogsRequest) returns (stream GetLogsResponse);
 }
 
-// ReadyRequest is the request for Ready.
-message ReadyRequest {}
+message ReadyRequest {
+  repeated string directories = 1;
+  string default_user = 2;
+  int64 max_transfer_bytes = 3;
+  int32 max_archive_entries = 4;
+}
 
 // ReadyResponse reports the guest agent version.
 message ReadyResponse {
   string version = 1;
+}
+
+// CopyInChunk carries the destination only on its first message.
+message CopyInChunk {
+  optional string dest_path = 1;
+  bytes data = 2;
+}
+
+message CopyInResponse {}
+
+message CopyOutRequest {
+  string src_path = 1;
+}
+
+message CopyOutChunk {
+  bytes data = 1;
 }
 
 // GetLogsRequest is the request for GetLogs.

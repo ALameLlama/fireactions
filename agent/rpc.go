@@ -12,6 +12,12 @@ import (
 )
 
 func (a *Agent) Ready(ctx context.Context, req *agentv1.ReadyRequest) (*agentv1.ReadyResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := a.applyReady(req); err != nil {
+		return nil, err
+	}
 	return &agentv1.ReadyResponse{Version: fireactions.Version}, nil
 }
 

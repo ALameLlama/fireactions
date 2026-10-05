@@ -20,6 +20,8 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	AgentService_Ready_FullMethodName   = "/fireactions.agent.v1.AgentService/Ready"
+	AgentService_CopyIn_FullMethodName  = "/fireactions.agent.v1.AgentService/CopyIn"
+	AgentService_CopyOut_FullMethodName = "/fireactions.agent.v1.AgentService/CopyOut"
 	AgentService_GetLogs_FullMethodName = "/fireactions.agent.v1.AgentService/GetLogs"
 )
 
@@ -29,8 +31,12 @@ const (
 //
 // AgentService provides readiness and diagnostics for the generic guest agent.
 type AgentServiceClient interface {
-	// Ready reports the agent version once it can accept guest requests.
+	// Ready validates the guest workspace and applies trusted transfer settings.
 	Ready(ctx context.Context, in *ReadyRequest, opts ...grpc.CallOption) (*ReadyResponse, error)
+	// CopyIn extracts a streaming tar archive under a workspace destination.
+	CopyIn(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[CopyInChunk, CopyInResponse], error)
+	// CopyOut streams a tar archive of a workspace path.
+	CopyOut(ctx context.Context, in *CopyOutRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[CopyOutChunk], error)
 	// GetLogs streams logs from the agent service (server-side streaming).
 	GetLogs(ctx context.Context, in *GetLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GetLogsResponse], error)
 }
@@ -53,9 +59,41 @@ func (c *agentServiceClient) Ready(ctx context.Context, in *ReadyRequest, opts .
 	return out, nil
 }
 
+func (c *agentServiceClient) CopyIn(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[CopyInChunk, CopyInResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &AgentService_ServiceDesc.Streams[0], AgentService_CopyIn_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[CopyInChunk, CopyInResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AgentService_CopyInClient = grpc.ClientStreamingClient[CopyInChunk, CopyInResponse]
+
+func (c *agentServiceClient) CopyOut(ctx context.Context, in *CopyOutRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[CopyOutChunk], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &AgentService_ServiceDesc.Streams[1], AgentService_CopyOut_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[CopyOutRequest, CopyOutChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AgentService_CopyOutClient = grpc.ServerStreamingClient[CopyOutChunk]
+
 func (c *agentServiceClient) GetLogs(ctx context.Context, in *GetLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GetLogsResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &AgentService_ServiceDesc.Streams[0], AgentService_GetLogs_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &AgentService_ServiceDesc.Streams[2], AgentService_GetLogs_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -78,8 +116,12 @@ type AgentService_GetLogsClient = grpc.ServerStreamingClient[GetLogsResponse]
 //
 // AgentService provides readiness and diagnostics for the generic guest agent.
 type AgentServiceServer interface {
-	// Ready reports the agent version once it can accept guest requests.
+	// Ready validates the guest workspace and applies trusted transfer settings.
 	Ready(context.Context, *ReadyRequest) (*ReadyResponse, error)
+	// CopyIn extracts a streaming tar archive under a workspace destination.
+	CopyIn(grpc.ClientStreamingServer[CopyInChunk, CopyInResponse]) error
+	// CopyOut streams a tar archive of a workspace path.
+	CopyOut(*CopyOutRequest, grpc.ServerStreamingServer[CopyOutChunk]) error
 	// GetLogs streams logs from the agent service (server-side streaming).
 	GetLogs(*GetLogsRequest, grpc.ServerStreamingServer[GetLogsResponse]) error
 	mustEmbedUnimplementedAgentServiceServer()
@@ -94,6 +136,12 @@ type UnimplementedAgentServiceServer struct{}
 
 func (UnimplementedAgentServiceServer) Ready(context.Context, *ReadyRequest) (*ReadyResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Ready not implemented")
+}
+func (UnimplementedAgentServiceServer) CopyIn(grpc.ClientStreamingServer[CopyInChunk, CopyInResponse]) error {
+	return status.Errorf(codes.Unimplemented, "method CopyIn not implemented")
+}
+func (UnimplementedAgentServiceServer) CopyOut(*CopyOutRequest, grpc.ServerStreamingServer[CopyOutChunk]) error {
+	return status.Errorf(codes.Unimplemented, "method CopyOut not implemented")
 }
 func (UnimplementedAgentServiceServer) GetLogs(*GetLogsRequest, grpc.ServerStreamingServer[GetLogsResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method GetLogs not implemented")
@@ -137,6 +185,24 @@ func _AgentService_Ready_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
+func _AgentService_CopyIn_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(AgentServiceServer).CopyIn(&grpc.GenericServerStream[CopyInChunk, CopyInResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AgentService_CopyInServer = grpc.ClientStreamingServer[CopyInChunk, CopyInResponse]
+
+func _AgentService_CopyOut_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(CopyOutRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(AgentServiceServer).CopyOut(m, &grpc.GenericServerStream[CopyOutRequest, CopyOutChunk]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AgentService_CopyOutServer = grpc.ServerStreamingServer[CopyOutChunk]
+
 func _AgentService_GetLogs_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(GetLogsRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -161,6 +227,16 @@ var AgentService_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "CopyIn",
+			Handler:       _AgentService_CopyIn_Handler,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "CopyOut",
+			Handler:       _AgentService_CopyOut_Handler,
+			ServerStreams: true,
+		},
 		{
 			StreamName:    "GetLogs",
 			Handler:       _AgentService_GetLogs_Handler,

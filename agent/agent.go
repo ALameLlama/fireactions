@@ -2,13 +2,16 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/firecracker-microvm/firecracker-go-sdk/vsock"
+	"github.com/hostinger/fireactions/internal/guestfs"
 	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
 	"github.com/rs/zerolog"
 	"github.com/sirupsen/logrus"
@@ -19,9 +22,22 @@ const (
 	logFilePath = "/var/log/fireactions-agent.log"
 )
 
+type readySettings struct {
+	identity          Identity
+	directories       []string
+	maxTransferBytes  int64
+	maxArchiveEntries int
+	ready             bool
+}
+
 type Agent struct {
 	agentv1.UnimplementedAgentServiceServer
 	cfg           Config
+	fs            *guestfs.RootFS
+	readyMu       sync.RWMutex
+	readySettings readySettings
+	closeOnce     sync.Once
+	closeErr      error
 	logFile       string
 	logFileWriter *os.File
 	logger        *zerolog.Logger
@@ -30,12 +46,18 @@ type Agent struct {
 type Opt func(a *Agent)
 
 func New(cfg Config, opts ...Opt) (*Agent, error) {
+	cfg = cfg.withDefaults()
 	if cfgErr := cfg.Validate(); cfgErr != nil {
 		return nil, fmt.Errorf("validate config: %w", cfgErr)
 	}
 
+	root, err := guestfs.OpenRoot(cfg.WorkspaceRoot)
+	if err != nil {
+		return nil, fmt.Errorf("open workspace root: %w", err)
+	}
 	a := &Agent{
 		cfg:     cfg,
+		fs:      root,
 		logFile: logFilePath,
 	}
 
@@ -44,6 +66,7 @@ func New(cfg Config, opts ...Opt) (*Agent, error) {
 	}
 
 	if err := a.setupLogger(); err != nil {
+		_ = root.Close()
 		return nil, err
 	}
 
@@ -79,15 +102,18 @@ func (a *Agent) setupLogger() error {
 	return nil
 }
 
-// Close closes the agent resources, including the log file.
+// Close closes the agent resources, including the log file and workspace root.
 func (a *Agent) Close() error {
-	if a.logFileWriter != nil {
-		err := a.logFileWriter.Close()
-		a.logFileWriter = nil
-		return err
-	}
-
-	return nil
+	a.closeOnce.Do(func() {
+		if a.logFileWriter != nil {
+			a.closeErr = a.logFileWriter.Close()
+			a.logFileWriter = nil
+		}
+		if err := a.fs.Close(); err != nil {
+			a.closeErr = errors.Join(a.closeErr, err)
+		}
+	})
+	return a.closeErr
 }
 
 func (a *Agent) Run(ctx context.Context) error {
