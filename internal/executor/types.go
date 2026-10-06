@@ -100,14 +100,17 @@ type EnvironmentInfo struct {
 	Layout Layout
 }
 
-// Options configures environment ownership. Zero durations select defaults;
-// CleanupTimeout must not exceed the 30-second bound on a cleanup attempt.
+// Options configures environment ownership. Zero durations select defaults:
+// MaxLifetime is 3h2m, CleanupTimeout is 30s, and CleanupGrace is 2m.
+// CleanupTimeout must not exceed 30s; attempts are also bounded by CleanupGrace.
+// CleanupGrace bounds cleanup windows, never extends execution lifetime.
 // ReadySpec supplies trusted profile-specific guest limits and identity. The
 // manager always supplies the canonical layout directories; zero-valued fields
 // in the returned spec inherit defaults from the VM and manager.
 type Options struct {
 	MaxLifetime    time.Duration
 	CleanupTimeout time.Duration
+	CleanupGrace   time.Duration
 	ReadySpec      func(profile string) (ReadySpec, error)
 	Observer       *Observer
 }
@@ -140,4 +143,6 @@ type Observer struct {
 	Operation      func(profile string, operation Operation, outcome Outcome)
 	ActiveEntries  func(profile string, delta int)
 	CleanupFailure func(profile string)
+	// TTLExpiration reports a deadline-caused removal transition once, not retries.
+	TTLExpiration func(profile string)
 }

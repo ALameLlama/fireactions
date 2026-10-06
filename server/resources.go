@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/containerd/errdefs"
@@ -125,19 +126,27 @@ type cleanupAttempt struct {
 // ownedResources serializes exit-monitor, explicit removal and pool-stop cleanup.
 // Failed attempts preserve their unfinished steps; a later caller retries them.
 type ownedResources struct {
-	mu          sync.Mutex
-	active      *cleanupAttempt
-	complete    bool
-	steps       []cleanupStep
-	cniConfig   []byte
-	cniBinPaths []string
-	cniCacheDir string
-	netnsPath   string
-	snapshotID  string
-	leaseID     string
+	mu                   sync.Mutex
+	active               *cleanupAttempt
+	complete             bool
+	steps                []cleanupStep
+	cniConfig            []byte
+	cniBinPaths          []string
+	cniCacheDir          string
+	netnsPath            string
+	snapshotID           string
+	leaseID              string
+	journal              *StateStore
+	record               *stateRecord
+	cniIfName            string
+	cniArgs              [][2]string
+	provisioningFinished atomic.Bool
+	processStopped       atomic.Bool
 }
 
-func (r *ownedResources) destroy() error {
+func (r *ownedResources) destroy() error { return r.destroyContext(context.Background()) }
+
+func (r *ownedResources) destroyContext(parent context.Context) error {
 	r.mu.Lock()
 	if r.complete {
 		r.mu.Unlock()
@@ -152,22 +161,47 @@ func (r *ownedResources) destroy() error {
 	r.active = a
 	r.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), resourceCleanupTimeout)
+	ctx, cancel := cleanupContext(parent, resourceCleanupTimeout)
+	if r.journal != nil {
+		cancel()
+		ctx, cancel = cleanupContext(parent, r.journal.cleanupGrace)
+	}
 	defer cancel()
-	for i := range r.steps {
-		step := &r.steps[i]
-		if step.done {
-			continue
+	if r.journal != nil {
+		// Publication failure must isolate the exact VMM even when the same
+		// persistent fsync failure prevents writing a removing transition.
+		a.err = stopRecordedProcesses(ctx, r.record)
+		if a.err == nil {
+			r.processStopped.Store(true)
 		}
-		if err := ctx.Err(); err != nil {
-			a.err = err
-			break
+		if a.err == nil && r.provisioningFinished.Load() {
+			state, err := r.journal.State(r.record.VMID)
+			if err == nil && (state == "provisioning" || state == "removing") {
+				a.err = r.journal.finishProvisioning(r.record.VMID)
+			}
+			if err != nil && !alreadyGone(err) {
+				a.err = err
+			}
 		}
-		if err := step.run(ctx); err != nil && !alreadyGone(err) {
-			a.err = fmt.Errorf("%s: %w", step.name, err)
-			break
+		if a.err == nil {
+			a.err = r.journal.destroyRecord(ctx, r.record.VMID)
 		}
-		step.done = true
+	} else {
+		for i := range r.steps {
+			step := &r.steps[i]
+			if step.done {
+				continue
+			}
+			if err := ctx.Err(); err != nil {
+				a.err = err
+				break
+			}
+			if err := step.run(ctx); err != nil && !alreadyGone(err) {
+				a.err = fmt.Errorf("%s: %w", step.name, err)
+				break
+			}
+			step.done = true
+		}
 	}
 
 	r.mu.Lock()
@@ -231,7 +265,8 @@ func deleteOwnedNetwork(ctx context.Context, r *ownedResources, vmID string) err
 	return plugin.DelNetworkList(ctx, conf, &libcni.RuntimeConf{
 		ContainerID: vmID,
 		NetNS:       r.netnsPath,
-		IfName:      "eth0",
+		IfName:      r.cniIfName,
+		Args:        r.cniArgs,
 	})
 }
 
@@ -275,6 +310,122 @@ func removeOwnedNetNS(path string) error {
 	return os.Remove(path)
 }
 
+// stopRecordedProcesses also covers a daemon killed after exec.Cmd.Start but
+// before the SDK's socket wait returned and the PID could be journaled.
+func stopRecordedProcesses(ctx context.Context, r *stateRecord) error {
+	// A captured PID/start pair is authoritative independently of /proc scan
+	// order. Conflicts in that still-live identity remain fail-closed.
+	if r.VMMPID > 0 {
+		start, err := processStartTime(r.VMMPID)
+		if err != nil && !alreadyGone(err) {
+			return err
+		}
+		if err == nil && start == r.VMMStartTime {
+			identity := processIdentity{pid: r.VMMPID, startTime: r.VMMStartTime, binary: r.VMMBinary, apiSocket: r.APISocketPath, device: r.VMMDevice, inode: r.VMMInode}
+			if err := identity.kill(ctx); err != nil && !alreadyGone(err) {
+				return err
+			}
+		}
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		args, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if alreadyGone(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !hasAPISocket(args, r.APISocketPath) {
+			continue
+		}
+		binary, err := os.Readlink(filepath.Join("/proc", entry.Name(), "exe"))
+		if alreadyGone(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		// Socket argv is public, attacker-controlled candidate evidence. A
+		// foreign executable must survive without vetoing the owned child.
+		if strings.TrimSuffix(binary, " (deleted)") != r.VMMBinary {
+			continue
+		}
+		var executable unix.Stat_t
+		if err := unix.Stat(filepath.Join("/proc", entry.Name(), "exe"), &executable); err != nil {
+			if alreadyGone(err) {
+				continue
+			}
+			return err
+		}
+		if uint64(executable.Dev) != r.VMMDevice || executable.Ino != r.VMMInode {
+			continue
+		}
+		start, err := processStartTime(pid)
+		if alreadyGone(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if pid == r.VMMPID && r.VMMStartTime != start {
+			return fmt.Errorf("owned API socket has conflicting PID start-time identity")
+		}
+		identity := processIdentity{pid: pid, startTime: start, binary: r.VMMBinary, apiSocket: r.APISocketPath, device: r.VMMDevice, inode: r.VMMInode}
+		if err := identity.kill(ctx); err != nil && !alreadyGone(err) {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
+func hasAPISocket(data []byte, socket string) bool {
+	argv := strings.Split(string(data), "\x00")
+	for i, arg := range argv {
+		if (arg == "--api-sock" && i+1 < len(argv) && argv[i+1] == socket) || arg == "--api-sock="+socket {
+			return true
+		}
+	}
+	return false
+}
+
+func (p processIdentity) kill(ctx context.Context) error {
+	fd, err := unix.PidfdOpen(p.pid, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	if err := p.verify(); err != nil {
+		exited, pollErr := pidfdExited(fd, 0)
+		if pollErr == nil && exited {
+			return nil
+		}
+		return err
+	}
+	if err := unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0); err != nil && !alreadyGone(err) {
+		return err
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		exited, err := pidfdExited(fd, 50)
+		if err != nil || exited {
+			return err
+		}
+	}
+}
+
 // processIdentity uses both kernel start time and the intended VMM binary/socket.
 // The pidfd is opened before rechecking identity, so PID reuse cannot redirect a
 // subsequent signal. No signal is sent when any ownership evidence conflicts.
@@ -283,6 +434,8 @@ type processIdentity struct {
 	startTime string
 	binary    string
 	apiSocket string
+	device    uint64
+	inode     uint64
 }
 
 func processStartTime(pid int) (string, error) {
@@ -317,8 +470,17 @@ func (p processIdentity) verify() error {
 	if err != nil {
 		return err
 	}
-	if binary != p.binary {
+	if strings.TrimSuffix(binary, " (deleted)") != p.binary {
 		return fmt.Errorf("VMM executable identity changed")
+	}
+	if p.inode != 0 {
+		var st unix.Stat_t
+		if err := unix.Stat(fmt.Sprintf("/proc/%d/exe", p.pid), &st); err != nil {
+			return err
+		}
+		if uint64(st.Dev) != p.device || st.Ino != p.inode {
+			return fmt.Errorf("VMM executable inode identity changed")
+		}
 	}
 	args, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", p.pid))
 	if err != nil {

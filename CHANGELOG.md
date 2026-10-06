@@ -21,6 +21,9 @@
 * Count replicas as clean idle VMs. Claim each VM once and replenish idle capacity without scaling down active environments.
 * Allow paused pools to supply existing idle VMs but reject new provisioning. Destroy cancelled claims instead of returning them to idle.
 * Replace runner metrics with profile-specific VM lifecycle and operation metrics. Reject invalid replica counts and return nonzero CLI failure status.
+* Persist version-1 VM ownership before allocation and publication. Replay saved network configuration and verify process identities and resource labels during cleanup.
+* Add independent `reap --config`, startup reconciliation, and systemd reaper units. Destroy abandoned VMs without resuming jobs or deleting unrelated resources.
+* Stop VMs at their hard deadline without adding cleanup grace to execution. Bound cleanup attempts and retain unfinished ownership for retry.
 
 ## [2.0.8](https://github.com/hostinger/fireactions/compare/v2.0.7...v2.0.8) (2026-09-15)
 

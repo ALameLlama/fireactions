@@ -1,6 +1,7 @@
 package server
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -82,6 +83,10 @@ func TestConfigRequiredProfileSettings(t *testing.T) {
 		{"empty dotted segment", func(c *Config) { c.Pools[0].Name = "ubuntu..04" }},
 		{"duplicate name", func(c *Config) { c.Pools[1].Name = c.Pools[0].Name }},
 		{"missing image", func(c *Config) { c.Pools[0].Image = "" }},
+		{"replicas overflow int32", func(c *Config) {
+			replicas := int64(math.MaxInt32) + 1
+			c.Pools[0].Replicas = int(replicas)
+		}},
 		{"missing pull policy", func(c *Config) { c.Pools[0].ImagePullPolicy = "" }},
 		{"unknown pull policy", func(c *Config) { c.Pools[0].ImagePullPolicy = "sometimes" }},
 		{"missing binary", func(c *Config) { c.Pools[0].Firecracker.BinaryPath = "" }},

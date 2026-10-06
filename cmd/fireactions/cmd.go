@@ -38,6 +38,7 @@ func NewRootCommand() *cobra.Command {
 	cmd.Flags().SortFlags = false
 
 	cmd.AddGroup(&cobra.Group{ID: "main", Title: "Main application commands:"})
+	cmd.AddCommand(newReapCmd())
 	cmd.AddCommand(newServerCmd())
 	cmd.AddCommand(newAgentCmd())
 	cmd.AddCommand(newValidateCmd())

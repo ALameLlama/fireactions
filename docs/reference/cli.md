@@ -90,6 +90,32 @@ Validates a server configuration file without starting the server. This is usefu
 fireactions validate /path/to/config.yaml
 ```
 
+#### `reap --config <PATH>`
+
+Run independent cleanup for expired VMs and VMs whose daemon owner is no longer alive. The command does not require a running plugin.
+
+```bash
+sudo fireactions reap --config /etc/fireactions/config.yaml
+```
+
+The default path is `/etc/fireactions/config.yaml`. The command preserves healthy, unexpired VMs owned by a live daemon.
+The reaper uses saved process identities, CNI configuration, and containerd ownership labels. It never deletes resources based only on a process name.
+
+The host daemon writes version-1 records under `state_dir/journal/<vmID>.json`. Records contain resource identities, not Runner registration credentials.
+Root permissions protect these records. Each record has a separate lock for short state changes.
+The daemon reserves a private staging name and publishes only a fully marked directory without replacing an existing path.
+The durable `allocation_ready` barrier precedes network, disk, and VMM allocation. Recovery preserves unmarked final directories, including empty foreign directories.
+Startup destroys old claimed and idle VMs before the plugin accepts jobs. It never resumes an old job.
+
+Hard expiry starts when Create arrives and includes provisioning time. A missing or zero requested lifetime uses `leases.max_lifetime`.
+A positive request cannot exceed that maximum. At expiry, the daemon cancels operations and stops the VM.
+`leases.cleanup_grace` bounds a cleanup window, not extra execution time. Each cleanup attempt lasts at most 30 seconds.
+Failed cleanup retains its record for later recovery.
+
+The `fireactions-reaper.timer` unit runs independently of the main service. Keep the timer enabled when the main service stops or crashes.
+Corrupt records remain as `.json.corrupt-<id>` evidence and prevent startup until an operator resolves them.
+Do not delete that evidence blindly. A live VM or unresolved resource can still require safe isolation and cleanup.
+
 ### Pool Management Commands
 
 All pool management commands accept an `--endpoint` (or `-e`) flag (default: `unix:///run/fireactions/plugin.sock`).

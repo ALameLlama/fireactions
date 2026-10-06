@@ -45,6 +45,14 @@ var (
 		Name: "cleanup_failures_total", Namespace: namespace,
 		Help: "Environment cleanup attempts that failed",
 	}, []string{"profile"})
+	metricVMTTLExpirations = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "vm_ttl_expirations_total", Namespace: namespace,
+		Help: "Environment hard leases that expired",
+	}, []string{"profile"})
+	metricStaleVMReconciliations = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "stale_vm_reconciliations_total", Namespace: namespace,
+		Help: "Owned stale virtual machines transitioned to cleanup during reconciliation",
+	}, []string{"profile"})
 )
 
 // refreshMetrics must be called without machinesMu held.

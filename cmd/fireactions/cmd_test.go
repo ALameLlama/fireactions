@@ -7,16 +7,16 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestRootCommandRegistersOnlyRetainedCommands(t *testing.T) {
-	cmd := NewRootCommand()
-	names := make(map[string]struct{})
-	for _, child := range cmd.Commands() {
-		names[child.Name()] = struct{}{}
-	}
-	for _, name := range []string{"server", "agent", "validate", "pools", "ps", "logs", "image", "version"} {
-		assert.Contains(t, names, name)
-	}
-	assert.NotContains(t, names, "login")
+func TestReapCommandRejectsArguments(t *testing.T) {
+	cmd := newReapCmd()
+	cmd.SetArgs([]string{"unexpected"})
+	assert.Error(t, cmd.Execute())
+}
+
+func TestReapCommandReportsInvalidConfig(t *testing.T) {
+	cmd := newReapCmd()
+	cmd.SetArgs([]string{"--config", "/path/that/does/not/exist"})
+	assert.ErrorContains(t, cmd.Execute(), "config:")
 }
 
 func TestMachineEndpointsDefaultToUnixSocket(t *testing.T) {

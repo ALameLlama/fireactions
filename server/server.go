@@ -2,9 +2,11 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,6 +35,7 @@ type Server struct {
 	containerd    *containerd.Client
 	imageManager  *imageManager
 	executor      *executor.Manager
+	journal       *StateStore
 	health        *health.Server
 	l             *sync.Mutex
 	logger        *zerolog.Logger
@@ -87,6 +90,7 @@ func New(config *Config, opts ...Opt) (*Server, error) {
 	}
 	manager, err := executor.NewManager(s, executor.Options{
 		MaxLifetime:    config.Leases.MaxLifetime,
+		CleanupGrace:   config.Leases.CleanupGrace,
 		CleanupTimeout: min(config.Leases.CleanupGrace, 30*time.Second),
 		ReadySpec: func(profile string) (executor.ReadySpec, error) {
 			for _, pool := range config.Pools {
@@ -118,6 +122,12 @@ func New(config *Config, opts ...Opt) (*Server, error) {
 					return
 				}
 				metricCleanupFailures.WithLabelValues(profile).Inc()
+			},
+			TTLExpiration: func(profile string) {
+				if _, ok := profiles[profile]; !ok {
+					return
+				}
+				s.logger.Warn().Str("profile", profile).Msg("Environment hard lease expired; forcing VM cleanup")
 			},
 		},
 	})
@@ -166,6 +176,13 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	ownerRelease = func() { _ = owner.Close() }
+	s.journal, err = NewStateStore(s.config, s.containerd)
+	if err != nil {
+		return fmt.Errorf("create durable VM journal: %w", err)
+	}
+	if err := s.journal.ReconcileStartup(ctx); err != nil {
+		return fmt.Errorf("reconcile stale VM ownership before serving: %w", err)
+	}
 	listener, err := listenUnixSocket(s.config.SocketPath, s.config.SocketGroup)
 	if err != nil {
 		return err
@@ -179,7 +196,7 @@ func (s *Server) Run(ctx context.Context) error {
 		pool.configureRuntime(s.config.StateDir, s.config.Network.ResolverPath, s.config.Guest.StartupTimeout, executor.ReadySpec{
 			DefaultUser: poolConfig.DefaultUser, MaxTransferBytes: s.config.Guest.MaxTransferBytes,
 			MaxArchiveEntries: s.config.Guest.MaxArchiveEntries,
-		})
+		}, s.journal)
 		s.l.Lock()
 		s.pools[poolConfig.Name] = pool
 		s.l.Unlock()
@@ -218,7 +235,9 @@ func (s *Server) Run(ctx context.Context) error {
 				return
 			case <-ticker.C:
 				reconcileCtx, cancel := context.WithTimeout(runCtx, s.config.Leases.CleanupGrace)
-				_ = s.executor.RetryRemovals(reconcileCtx)
+				if err := s.reconcileOwnedVMs(reconcileCtx); err != nil && runCtx.Err() == nil {
+					s.logger.Error().Err(err).Msg("Owned VM reconciliation failed; retaining incomplete cleanup")
+				}
 				cancel()
 			}
 		}
@@ -273,6 +292,84 @@ func (s *Server) Run(ctx context.Context) error {
 		return runErr
 	}
 	return nil
+}
+
+// reconcileOwnedVMs converges daemon ownership with external journal cleanup.
+// Registry VM IDs remain observable even if an exit watcher already removed the
+// corresponding pool entry, so external cleanup cannot strand active gauges.
+func (s *Server) reconcileOwnedVMs(ctx context.Context) error {
+	reaped, result := s.journal.Reap(ctx)
+	type ownedMachine struct {
+		pool    *Pool
+		machine *Machine
+	}
+	owned := make(map[string]ownedMachine)
+	for _, pool := range s.poolSnapshot() {
+		machines, _ := pool.ListMachines(ctx)
+		for _, machine := range machines {
+			owned[machine.Name] = ownedMachine{pool: pool, machine: machine}
+		}
+	}
+	for _, vmID := range s.executor.VMIDs() {
+		if _, ok := owned[vmID]; !ok {
+			owned[vmID] = ownedMachine{}
+		}
+	}
+	removed := make(map[string]struct{}, len(reaped))
+	for _, vmID := range reaped {
+		removed[vmID] = struct{}{}
+	}
+	var cleanup sync.WaitGroup
+	var errorsMu sync.Mutex
+	for vmID, entry := range owned {
+		if err := ctx.Err(); err != nil {
+			errorsMu.Lock()
+			result = errors.Join(result, err)
+			errorsMu.Unlock()
+			break
+		}
+		_, needsCleanup := removed[vmID]
+		if !needsCleanup {
+			state, err := s.journal.State(vmID)
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				errorsMu.Lock()
+				result = errors.Join(result, fmt.Errorf("read live VM journal %s: %w", vmID, err))
+				errorsMu.Unlock()
+				continue
+			}
+			needsCleanup = errors.Is(err, os.ErrNotExist) || state == "removing"
+		}
+		if !needsCleanup {
+			continue
+		}
+		cleanup.Add(1)
+		go func(id string, entry ownedMachine) {
+			defer cleanup.Done()
+			err := ctx.Err()
+			environmentID, _ := s.executor.EnvironmentForVM(id)
+			if err == nil && environmentID != "" {
+				err = s.executor.Remove(ctx, environmentID)
+			}
+			if entry.machine != nil {
+				if environmentID == "" {
+					entry.pool.markPoolCleanup(entry.machine)
+				}
+				if err == nil {
+					if err = ctx.Err(); err == nil {
+						err = entry.pool.destroyMachine(ctx, entry.machine)
+					}
+				}
+				entry.pool.refreshMetrics()
+			}
+			if err != nil {
+				errorsMu.Lock()
+				result = errors.Join(result, fmt.Errorf("reconcile live VM %s: %w", id, err))
+				errorsMu.Unlock()
+			}
+		}(vmID, entry)
+	}
+	cleanup.Wait()
+	return errors.Join(result, s.executor.RetryRemovals(ctx))
 }
 
 func (s *Server) shutdown(pools []*Pool) {

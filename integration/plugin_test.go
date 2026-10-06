@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -41,6 +42,7 @@ import (
 	healthv1 "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"gopkg.in/yaml.v3"
 )
 
@@ -159,7 +161,7 @@ func newPluginHarness(t *testing.T, configure ...func(*server.Config)) *pluginHa
 	return h
 }
 
-func (h *pluginHarness) launch() {
+func (h *pluginHarness) launch(beforeServing ...func()) {
 	h.t.Helper()
 	log, err := os.OpenFile(filepath.Join(h.root, "daemon.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
@@ -172,8 +174,9 @@ func (h *pluginHarness) launch() {
 		_ = log.Close()
 		h.t.Fatal(err)
 	}
-	h.exited = make(chan error, 1)
-	go func() { err := h.process.Wait(); _ = log.Close(); h.exited <- err; close(h.exited) }()
+	process, exited := h.process, make(chan error, 1)
+	h.exited = exited
+	go func() { err := process.Wait(); _ = log.Close(); exited <- err; close(exited) }()
 	h.conn, err = grpc.NewClient("unix://"+h.config.SocketPath, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 30 * time.Second, Timeout: 10 * time.Second, PermitWithoutStream: false}))
 	if err != nil {
 		h.t.Fatal(err)
@@ -181,12 +184,15 @@ func (h *pluginHarness) launch() {
 	h.plugin = pluginv1alpha.NewBackendPluginClient(h.conn)
 	h.admin = serverv1.NewServerServiceClient(h.conn)
 	health := healthv1.NewHealthClient(h.conn)
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(h.config.Guest.StartupTimeout + time.Minute)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		response, callErr := health.Check(ctx, &healthv1.HealthCheckRequest{Service: "plugin.v1alpha.BackendPlugin"})
 		cancel()
 		if callErr == nil && response.Status == healthv1.HealthCheckResponse_SERVING {
+			for _, check := range beforeServing {
+				check()
+			}
 			break
 		}
 		select {
@@ -218,6 +224,34 @@ func (h *pluginHarness) close() {
 				_ = h.process.Process.Kill()
 				<-h.exited
 				h.t.Errorf("daemon needed forced shutdown; %s", h.log())
+			}
+		}
+		// Crash/restart cases must use the same independent cleanup path as the
+		// deployed timer before namespace teardown can remove image/base layers.
+		if h.configPath != "" {
+			if err := h.reap(); err != nil {
+				h.t.Errorf("harness recovery failed; retaining namespace and journal at %s: %v", h.root, err)
+				if h.containerd != nil {
+					_ = h.containerd.Close()
+				}
+				return
+			}
+			if entries, err := os.ReadDir(filepath.Join(h.config.StateDir, "journal")); err == nil {
+				for _, entry := range entries {
+					if strings.HasSuffix(entry.Name(), ".json") {
+						h.t.Errorf("retaining unrecovered journal and namespace: %s", h.root)
+						if h.containerd != nil {
+							_ = h.containerd.Close()
+						}
+						return
+					}
+				}
+			} else if !errors.Is(err, os.ErrNotExist) {
+				h.t.Errorf("cannot inspect recovery journal; retaining namespace at %s: %v", h.root, err)
+				if h.containerd != nil {
+					_ = h.containerd.Close()
+				}
+				return
 			}
 		}
 		if alive := ownedVMMs(h.config.StateDir); len(alive) != 0 {
@@ -551,15 +585,7 @@ func (h *pluginHarness) assertClean(id string, owned map[int]string, vmIDs []str
 			}
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	stream, err := h.plugin.CopyOut(ctx, &pluginv1alpha.CopyOutRequest{EnvironmentId: id, SrcPath: "/workspace"})
-	if err == nil {
-		_, err = stream.Recv()
-	}
-	if status.Code(err) != codes.NotFound {
-		h.t.Fatalf("removed environment lookup: %v", err)
-	}
+	h.assertUnknownEnvironment(id)
 }
 
 func vmIDs(machines []*serverv1.Machine) []string {
@@ -1395,4 +1421,645 @@ func TestRealPluginCancelledTransferRemovesPartialFile(t *testing.T) {
 	h.remove(environment.EnvironmentId)
 	h.assertClean(environment.EnvironmentId, owned, vmIDs(machines))
 	t.Log("client cancellation interrupted an observed partial extraction and removed temporary data without dirty VM reuse")
+}
+
+// recoveryRecord is read from the real daemon's durable journal, not assembled
+// from guessed resource names. Unknown fields remain intact during PID fault injection.
+type recoveryRecord struct {
+	Version             int             `json:"version"`
+	InstanceID          string          `json:"instance_id"`
+	ContainerdNamespace string          `json:"containerd_namespace"`
+	Snapshotter         string          `json:"snapshotter"`
+	VMID                string          `json:"vm_id"`
+	State               string          `json:"state"`
+	OwnerPID            int             `json:"owner_pid"`
+	OwnerStartTime      string          `json:"owner_start_time"`
+	VMMPID              int             `json:"vmm_pid"`
+	VMMStartTime        string          `json:"vmm_start_time"`
+	SnapshotID          string          `json:"snapshot_id"`
+	LeaseID             string          `json:"lease_id"`
+	APISocketPath       string          `json:"api_socket_path"`
+	VsockPath           string          `json:"vsock_path"`
+	NetNSPath           string          `json:"netns_path"`
+	CNICacheDir         string          `json:"cni_cache_dir"`
+	CNIConfig           json.RawMessage `json:"cni_config"`
+	ExpiresAt           *time.Time      `json:"expires_at"`
+}
+
+func (h *pluginHarness) journal(vmID string) recoveryRecord {
+	h.t.Helper()
+	path := filepath.Join(h.config.StateDir, "journal", vmID+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		h.t.Fatalf("read published VM journal %s: %v", path, err)
+	}
+	var record recoveryRecord
+	if err = json.Unmarshal(data, &record); err != nil {
+		h.t.Fatal(err)
+	}
+	if record.Version != 1 || record.VMID != vmID || record.InstanceID == "" || record.ContainerdNamespace != h.config.Containerd.Namespace || record.Snapshotter == "" || record.VMMPID <= 0 || record.VMMStartTime == "" || record.SnapshotID == "" || record.LeaseID == "" || record.APISocketPath == "" || record.NetNSPath == "" || record.CNICacheDir == "" {
+		h.t.Fatalf("published VM has incomplete durable ownership: %+v", record)
+	}
+	return record
+}
+
+func hostProcessStartTime(pid int) (uint64, error) {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return 0, err
+	}
+	end := strings.LastIndexByte(string(data), ')')
+	if end < 0 {
+		return 0, fmt.Errorf("malformed /proc/%d/stat", pid)
+	}
+	fields := strings.Fields(string(data[end+1:]))
+	if len(fields) <= 19 {
+		return 0, fmt.Errorf("short /proc/%d/stat", pid)
+	}
+	return strconv.ParseUint(fields[19], 10, 64)
+}
+
+func recoveryVMMAlive(record recoveryRecord) bool {
+	start, err := hostProcessStartTime(record.VMMPID)
+	if err != nil || strconv.FormatUint(start, 10) != record.VMMStartTime {
+		return false
+	}
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(record.VMMPID), "cmdline"))
+	return err == nil && bytes.Contains(data, []byte(record.APISocketPath))
+}
+
+func (h *pluginHarness) crash() {
+	h.t.Helper()
+	if h.conn != nil {
+		_ = h.conn.Close()
+		h.conn = nil
+	}
+	if err := h.process.Process.Kill(); err != nil {
+		h.t.Fatal(err)
+	}
+	select {
+	case err := <-h.exited:
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) || exit.Sys().(syscall.WaitStatus).Signal() != syscall.SIGKILL {
+			h.t.Fatalf("expected actual daemon SIGKILL: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		h.t.Fatal("SIGKILL daemon did not exit")
+	}
+	h.process = nil
+}
+
+func (h *pluginHarness) reap() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, h.binary, "reap", "--config", h.configPath).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("independent reap: %w: %s", err, output)
+	}
+	return nil
+}
+
+func (h *pluginHarness) pauseWarmPool(replicas int) []*serverv1.Machine {
+	h.t.Helper()
+	profile := h.config.Pools[0].Name
+	machines := h.waitForMachines("ready idle pool before lease/recovery", h.config.Guest.StartupTimeout+time.Minute, func(machines []*serverv1.Machine) bool {
+		if len(machines) != replicas {
+			return false
+		}
+		for _, machine := range machines {
+			if machine.Pool != profile || machine.State != "idle" || machine.AgentVersion == "" {
+				return false
+			}
+		}
+		return true
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := h.admin.PausePool(ctx, &serverv1.PausePoolRequest{Name: profile}); err != nil {
+		h.t.Fatal(err)
+	}
+	return machines
+}
+
+func (h *pluginHarness) claimedRecord(environmentID string) recoveryRecord {
+	h.t.Helper()
+	machines := h.waitForMachines("durably published claimed VM", 5*time.Second, func(machines []*serverv1.Machine) bool {
+		for _, machine := range machines {
+			if machine.State == "claimed" && machine.EnvironmentId == environmentID {
+				return true
+			}
+		}
+		return false
+	})
+	for _, machine := range machines {
+		if machine.EnvironmentId == environmentID {
+			record := h.journal(machine.ID)
+			if record.State != "claimed" || record.ExpiresAt == nil {
+				h.t.Fatalf("claim published without hard durable expiry: %+v", record)
+			}
+			return record
+		}
+	}
+	h.t.Fatal("claimed machine disappeared")
+	return recoveryRecord{}
+}
+
+func cniAllocationRoots(record recoveryRecord) []string {
+	// Journal []byte encoding is base64; accept a raw JSON list as well so the
+	// assertions inspect the persisted effective conflist, not host configuration.
+	data := []byte(record.CNIConfig)
+	var decoded []byte
+	if json.Unmarshal(record.CNIConfig, &decoded) == nil {
+		data = decoded
+	}
+	var config struct {
+		Name    string `json:"name"`
+		Plugins []struct {
+			IPAM struct {
+				Type    string `json:"type"`
+				DataDir string `json:"dataDir"`
+			} `json:"ipam"`
+		} `json:"plugins"`
+	}
+	if json.Unmarshal(data, &config) != nil || config.Name == "" {
+		return nil
+	}
+	roots := []string{filepath.Join("/var/run/cni", config.Name), filepath.Join("/var/run/cni/networks", config.Name), filepath.Join("/var/lib/cni/networks", config.Name)}
+	for _, plugin := range config.Plugins {
+		if plugin.IPAM.Type == "host-local" && plugin.IPAM.DataDir != "" {
+			roots = append(roots, filepath.Join(plugin.IPAM.DataDir, config.Name))
+		}
+	}
+	return roots
+}
+
+func (h *pluginHarness) recoveryResourcesGone(record recoveryRecord) error {
+	if recoveryVMMAlive(record) {
+		return fmt.Errorf("original VMM %d remains live", record.VMMPID)
+	}
+	for _, path := range []string{record.APISocketPath, record.VsockPath, record.NetNSPath, record.NetNSPath + ".owner", record.CNICacheDir, filepath.Dir(record.APISocketPath), filepath.Join(h.config.StateDir, "journal", record.VMID+".json")} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("owned path remains %s: %v", path, err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
+	defer cancel()
+	if _, err := h.containerd.SnapshotService(record.Snapshotter).Stat(ctx, record.SnapshotID); !errdefs.IsNotFound(err) {
+		return fmt.Errorf("owned snapshot %s remains: %v", record.SnapshotID, err)
+	}
+	list, err := h.containerd.LeasesService().List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, lease := range list {
+		if lease.ID == record.LeaseID {
+			return fmt.Errorf("owned lease %s remains", record.LeaseID)
+		}
+	}
+	roots := cniAllocationRoots(record)
+	if len(roots) == 0 {
+		return fmt.Errorf("cannot inspect captured CNI allocation identity for %s", record.VMID)
+	}
+	for _, root := range roots {
+		entries, err := os.ReadDir(root)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(root, entry.Name()))
+			if err != nil {
+				return err
+			}
+			if strings.Split(strings.TrimSpace(string(data)), "\n")[0] == record.VMID {
+				return fmt.Errorf("owned CNI allocation remains: %s", filepath.Join(root, entry.Name()))
+			}
+		}
+	}
+	return nil
+}
+
+func (h *pluginHarness) waitRecoveryClean(records []recoveryRecord) {
+	h.t.Helper()
+	deadline := time.Now().Add(35 * time.Second)
+	for _, record := range records {
+		for {
+			err := h.recoveryResourcesGone(record)
+			if err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				h.t.Fatalf("recovery cleanup: %v; %s", err, h.log())
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+}
+
+func (h *pluginHarness) assertUnknownEnvironment(id string) {
+	h.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	defer cancel()
+	for {
+		probe, cancelProbe := context.WithTimeout(ctx, 5*time.Second)
+		stream, err := h.plugin.CopyOut(probe, &pluginv1alpha.CopyOutRequest{EnvironmentId: id, SrcPath: "/workspace"})
+		if err == nil {
+			_, err = stream.Recv()
+		}
+		cancelProbe()
+		if status.Code(err) == codes.NotFound {
+			return
+		}
+		// Durable resources disappear inside Destroy before Manager.cleanup
+		// publishes registry deletion. An external reap can likewise complete
+		// before the daemon's reconciliation removes its cached environment.
+		// Only this observed removal transition may converge; success still
+		// requires NotFound, never permanent FailedPrecondition or a live entry.
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(status.Convert(err).Message(), "environment is being removed") {
+			h.t.Fatalf("removed environment lookup must converge to NotFound: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			h.t.Fatalf("removed environment registry did not converge to NotFound within 35s: %v; %s", err, h.log())
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+func (h *pluginHarness) waitHardExpirations(records []recoveryRecord) {
+	h.t.Helper()
+	remaining := append([]recoveryRecord(nil), records...)
+	for len(remaining) != 0 {
+		for index := 0; index < len(remaining); {
+			record := remaining[index]
+			now := time.Now()
+			if recoveryVMMAlive(record) {
+				// This bound is intentionally much shorter than cleanup_grace.
+				if now.After(record.ExpiresAt.Add(2 * time.Second)) {
+					h.t.Fatalf("VMM %d executed past hard expiry %s (cleanup grace %s); %s", record.VMMPID, record.ExpiresAt, h.config.Leases.CleanupGrace, h.log())
+				}
+				index++
+				continue
+			}
+			if now.Before(record.ExpiresAt.Add(-250 * time.Millisecond)) {
+				h.t.Fatalf("VMM %s died before configured lifetime: now=%s expiry=%s; %s", record.VMID, now, record.ExpiresAt, h.log())
+			}
+			remaining = append(remaining[:index], remaining[index+1:]...)
+		}
+		if len(remaining) != 0 {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+}
+
+func TestRealPluginHardLeaseExpiration(t *testing.T) {
+	h := newPluginHarness(t, func(config *server.Config) {
+		config.Pools[0].Replicas = 1
+		if config.Leases.MaxLifetime < 30*time.Second {
+			config.Leases.MaxLifetime = 30 * time.Second
+		}
+		config.Leases.CleanupGrace = 20 * time.Second
+		config.Leases.ReapInterval = time.Second
+	})
+	h.pauseWarmPool(1)
+	before := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	environment, err := h.plugin.Create(ctx, &pluginv1alpha.CreateRequest{Image: h.config.Pools[0].Name, Name: "hard-lease", EnvironmentTimeout: durationpb.New(8 * time.Second)})
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now()
+	record := h.claimedRecord(environment.EnvironmentId)
+	if record.ExpiresAt.Before(before.Add(8*time.Second)) || record.ExpiresAt.After(after.Add(8*time.Second)) {
+		t.Fatalf("hard expiry not bounded by Create receipt: %s before=%s after=%s", record.ExpiresAt, before, after)
+	}
+	h.start(environment.EnvironmentId)
+	execCtx, cancelExec := context.WithDeadline(context.Background(), record.ExpiresAt.Add(3*time.Second))
+	defer cancelExec()
+	stream, err := h.plugin.Exec(execCtx, &pluginv1alpha.ExecRequest{EnvironmentId: environment.EnvironmentId, Command: []string{"/bin/sh", "-c", "echo lease-exec-running; sleep 300"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output strings.Builder
+	for !strings.Contains(output.String(), "lease-exec-running\n") {
+		message, err := stream.Recv()
+		if err != nil {
+			t.Fatalf("execution did not start before hard expiry: %v", err)
+		}
+		if chunk := message.GetData(); chunk != nil {
+			output.Write(chunk.Data)
+		}
+	}
+	h.waitHardExpirations([]recoveryRecord{record})
+	for {
+		message, err := stream.Recv()
+		if err != nil {
+			break
+		}
+		if message.GetExecComplete() != nil || message.GetExecFailed() != nil {
+			break
+		}
+	}
+	if time.Now().After(record.ExpiresAt.Add(3 * time.Second)) {
+		t.Fatal("active Exec did not terminate with hard lease")
+	}
+	h.waitRecoveryClean([]recoveryRecord{record})
+	h.assertClean(environment.EnvironmentId, map[int]string{record.VMMPID: record.APISocketPath}, []string{record.VMID})
+	t.Log("requested 8s lifetime killed an executing prewarmed VMM without Remove or execution cleanup grace")
+}
+
+func TestRealPluginLifetimeCaps(t *testing.T) {
+	const maximum = 45 * time.Second
+	h := newPluginHarness(t, func(config *server.Config) {
+		config.Pools[0].Replicas = 3
+		config.Leases.MaxLifetime = maximum
+		config.Leases.CleanupGrace = 20 * time.Second
+		config.Leases.ReapInterval = time.Second
+		if config.Guest.StartupTimeout > maximum {
+			config.Guest.StartupTimeout = maximum
+		}
+	})
+	h.pauseWarmPool(3)
+	var records []recoveryRecord
+	var environments []string
+	for _, test := range []struct {
+		name    string
+		timeout *durationpb.Duration
+	}{
+		{name: "Absent"},
+		{name: "Zero", timeout: durationpb.New(0)},
+		{name: "Oversized", timeout: durationpb.New(2 * maximum)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			before := time.Now()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			response, err := h.plugin.Create(ctx, &pluginv1alpha.CreateRequest{Image: h.config.Pools[0].Name, Name: test.name, EnvironmentTimeout: test.timeout})
+			cancel()
+			if err != nil {
+				t.Fatal(err)
+			}
+			after := time.Now()
+			record := h.claimedRecord(response.EnvironmentId)
+			if record.ExpiresAt.Before(before.Add(maximum)) || record.ExpiresAt.After(after.Add(maximum)) {
+				t.Fatalf("%s effective cap is not %s: receipt=[%s,%s] expiry=%s", test.name, maximum, before, after, record.ExpiresAt)
+			}
+			h.start(response.EnvironmentId)
+			records = append(records, record)
+			environments = append(environments, response.EnvironmentId)
+		})
+	}
+	if len(records) != 3 {
+		t.Fatal("not all lifetime variants acquired real VMs")
+	}
+	h.waitHardExpirations(records)
+	h.waitRecoveryClean(records)
+	for _, id := range environments {
+		h.assertUnknownEnvironment(id)
+	}
+	h.waitForMachines("all capped environments removed", 5*time.Second, func(machines []*serverv1.Machine) bool { return len(machines) == 0 })
+	t.Log("absent, zero and oversized lifetimes each used the configured 45s cap and actual VMM timers without Remove")
+}
+
+func (h *pluginHarness) assertRecoveryLive(record recoveryRecord) {
+	h.t.Helper()
+	if !recoveryVMMAlive(record) {
+		h.t.Fatalf("healthy owner's VMM %d was killed", record.VMMPID)
+	}
+	current := h.journal(record.VMID)
+	if current.OwnerPID != record.OwnerPID || current.OwnerStartTime != record.OwnerStartTime || current.State != record.State || current.VMMPID != record.VMMPID {
+		h.t.Fatalf("healthy journal changed ownership/state: before=%+v after=%+v", record, current)
+	}
+	for _, path := range []string{record.APISocketPath, record.VsockPath, record.NetNSPath, record.NetNSPath + ".owner", record.CNICacheDir} {
+		if _, err := os.Stat(path); err != nil {
+			h.t.Fatalf("healthy resource %s disappeared: %v", path, err)
+		}
+	}
+	if !h.snapshots()[record.SnapshotID] || !h.leases()[record.LeaseID] {
+		h.t.Fatalf("healthy VMM's snapshot/lease disappeared: %+v", record)
+	}
+}
+
+func (h *pluginHarness) recoveryPair() (string, []recoveryRecord) {
+	h.t.Helper()
+	h.waitForMachines("initial warm VM", h.config.Guest.StartupTimeout+time.Minute, func(machines []*serverv1.Machine) bool {
+		return len(machines) == 1 && machines[0].State == "idle" && machines[0].AgentVersion != ""
+	})
+	environment := h.create(h.config.Pools[0].Name)
+	h.start(environment.EnvironmentId)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	stdout, stderr, exit, err := h.exec(ctx, environment.EnvironmentId, []string{"/bin/sh", "-c", "printf old-job > /workspace/recovery-job-marker"})
+	cancel()
+	if err != nil || exit != 0 {
+		h.t.Fatalf("write old-job marker: stdout=%q stderr=%q exit=%d err=%v", stdout, stderr, exit, err)
+	}
+	machines := h.waitForMachines("claimed job and replacement idle VM", h.config.Guest.StartupTimeout+time.Minute, func(machines []*serverv1.Machine) bool {
+		if len(machines) != 2 {
+			return false
+		}
+		claimed, idle := 0, 0
+		for _, machine := range machines {
+			if machine.State == "claimed" && machine.EnvironmentId == environment.EnvironmentId {
+				claimed++
+			}
+			if machine.State == "idle" && machine.AgentVersion != "" {
+				idle++
+			}
+		}
+		return claimed == 1 && idle == 1
+	})
+	records := make([]recoveryRecord, 0, len(machines))
+	for _, machine := range machines {
+		record := h.journal(machine.ID)
+		if record.State != machine.State || (record.State == "idle" && record.ExpiresAt != nil) || (record.State == "claimed" && record.ExpiresAt == nil) {
+			h.t.Fatalf("published state and durable expiry disagree: machine=%+v record=%+v", machine, record)
+		}
+		records = append(records, record)
+	}
+	return environment.EnvironmentId, records
+}
+
+func TestRealPluginCrashIndependentReaper(t *testing.T) {
+	h := newPluginHarness(t, configureRecoveryPool)
+	_, records := h.recoveryPair()
+
+	// Both sentinels inhabit the harness namespace, but lack Fireactions instance
+	// ownership. A namespace-wide sweep would destroy them and fail this test.
+	ctx, cancel := context.WithTimeout(h.ctx, 10*time.Second)
+	const sentinelID = "integration-unrelated-snapshot"
+	_, err := h.containerd.SnapshotService("devmapper").Prepare(ctx, sentinelID, "")
+	cancel()
+	if err != nil {
+		t.Fatalf("create unrelated real devmapper snapshot: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(h.ctx, 10*time.Second)
+		defer cancel()
+		if err := h.containerd.SnapshotService("devmapper").Remove(ctx, sentinelID); err != nil && !errdefs.IsNotFound(err) {
+			t.Errorf("cleanup unrelated snapshot: %v", err)
+		}
+	})
+	ctx, cancel = context.WithTimeout(h.ctx, 10*time.Second)
+	sentinelLease, err := h.containerd.LeasesService().Create(ctx, leases.WithID("integration-unrelated-lease"))
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(h.ctx, 10*time.Second)
+		defer cancel()
+		if err := h.containerd.LeasesService().Delete(ctx, sentinelLease, leases.SynchronousDelete); err != nil && !errdefs.IsNotFound(err) {
+			t.Errorf("cleanup unrelated lease: %v", err)
+		}
+	})
+	ctx, cancel = context.WithTimeout(h.ctx, 10*time.Second)
+	err = h.containerd.LeasesService().AddResource(ctx, sentinelLease, leases.Resource{ID: sentinelID, Type: "snapshots/devmapper"})
+	cancel()
+	if err != nil {
+		t.Fatalf("pin unrelated snapshot against containerd GC: %v", err)
+	}
+	sleeper := exec.Command("sleep", "600")
+	if err = sleeper.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sleeper.Process.Kill(); _ = sleeper.Wait() })
+	sleeperStart, err := hostProcessStartTime(sleeper.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertUnrelated := func() {
+		t.Helper()
+		start, err := hostProcessStartTime(sleeper.Process.Pid)
+		if err != nil || start != sleeperStart || sleeper.Process.Signal(syscall.Signal(0)) != nil {
+			t.Fatalf("unrelated process did not survive: pid=%d start=%d err=%v", sleeper.Process.Pid, start, err)
+		}
+		cmdline, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(sleeper.Process.Pid), "cmdline"))
+		if err != nil || !bytes.Equal(cmdline, []byte("sleep\x00600\x00")) {
+			t.Fatalf("unrelated process exited or became zombie: pid=%d cmdline=%q err=%v", sleeper.Process.Pid, cmdline, err)
+		}
+		if !h.snapshots()[sentinelID] || !h.leases()[sentinelLease.ID] {
+			t.Fatal("independent reaper deleted unowned containerd resources")
+		}
+	}
+	if err = h.reap(); err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range records {
+		h.assertRecoveryLive(record)
+	}
+	assertUnrelated()
+
+	h.crash()
+	for _, record := range records {
+		if !recoveryVMMAlive(record) {
+			t.Fatalf("daemon SIGKILL did not leave VMM %d for independent recovery", record.VMMPID)
+		}
+	}
+	// Simulate recycled owner and VMM PID evidence in an otherwise genuine
+	// durable record. The independent scanner must locate the original owned
+	// API-socket process, never signal this live PID with a different starttime.
+	var claimed recoveryRecord
+	for _, record := range records {
+		if record.State == "claimed" {
+			claimed = record
+		}
+	}
+	path := filepath.Join(h.config.StateDir, "journal", claimed.VMID+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err = json.Unmarshal(data, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range map[string]any{
+		"owner_pid": sleeper.Process.Pid, "owner_start_time": strconv.FormatUint(sleeperStart+1, 10),
+		"vmm_pid": sleeper.Process.Pid, "vmm_start_time": strconv.FormatUint(sleeperStart+1, 10),
+	} {
+		fields[key], err = json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err = json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path+".test-tmp", data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Rename(path+".test-tmp", path); err != nil {
+		t.Fatal(err)
+	}
+	if err = h.reap(); err != nil {
+		t.Fatal(err)
+	}
+	h.waitRecoveryClean(records)
+	assertUnrelated()
+	if len(ownedVMMs(h.config.StateDir)) != 0 {
+		t.Fatal("owned VMM survived plugin-independent reap")
+	}
+	if h.process != nil {
+		t.Fatal("independent recovery restarted the plugin")
+	}
+	t.Log("healthy claimed/idle live-owner VMs survived reap; SIGKILL owner and recycled PID evidence were recovered while stopped, with VMM/CNI/netns/socket/snapshot/lease removal and unrelated process/resources intact")
+}
+
+func TestRealPluginRestartReconcilesBeforeServing(t *testing.T) {
+	h := newPluginHarness(t, configureRecoveryPool)
+	oldEnvironment, records := h.recoveryPair()
+	h.crash()
+	for _, record := range records {
+		if !recoveryVMMAlive(record) {
+			t.Fatalf("old VMM %d disappeared before startup reconciliation", record.VMMPID)
+		}
+	}
+	// No reaper is invoked here. At the first observed SERVING response, every
+	// old claimed AND idle resource must already have been destroyed by startup.
+	h.launch(func() {
+		for _, record := range records {
+			if err := h.recoveryResourcesGone(record); err != nil {
+				t.Fatalf("restart advertised SERVING before reconciling old VM %s: %v", record.VMID, err)
+			}
+		}
+	})
+	h.assertUnknownEnvironment(oldEnvironment)
+	freshIdle := h.pauseWarmPool(1)
+	for _, record := range records {
+		if freshIdle[0].ID == record.VMID {
+			t.Fatal("restart resumed an old idle/claimed VM")
+		}
+	}
+	fresh := h.create(h.config.Pools[0].Name)
+	if fresh.EnvironmentId == oldEnvironment {
+		t.Fatal("restart resumed an old job environment")
+	}
+	h.start(fresh.EnvironmentId)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	stdout, stderr, exit, err := h.exec(ctx, fresh.EnvironmentId, []string{"/bin/sh", "-c", "test ! -e /workspace/recovery-job-marker && printf fresh-job-filesystem"})
+	cancel()
+	if err != nil || exit != 0 || stdout != "fresh-job-filesystem" {
+		t.Fatalf("restarted job filesystem: stdout=%q stderr=%q exit=%d err=%v", stdout, stderr, exit, err)
+	}
+	freshRecord := h.claimedRecord(fresh.EnvironmentId)
+	if freshRecord.VMID != freshIdle[0].ID {
+		t.Fatal("fresh job did not claim the restarted idle pool")
+	}
+	h.remove(fresh.EnvironmentId)
+	h.waitRecoveryClean([]recoveryRecord{freshRecord})
+	h.assertClean(fresh.EnvironmentId, map[int]string{freshRecord.VMMPID: freshRecord.APISocketPath}, []string{freshRecord.VMID})
+	t.Log("restart destroyed all old claimed and idle resources before SERVING, forgot the old job and supplied a fresh ready idle VM/filesystem")
+}
+
+func configureRecoveryPool(config *server.Config) {
+	config.Pools[0].Replicas = 1
+	// Recovery setup includes a second real boot. Keep its healthy claimed VM
+	// unexpired while testing owner death independently of lease expiry.
+	minimum := config.Guest.StartupTimeout + 3*time.Minute
+	if config.Leases.MaxLifetime < minimum {
+		config.Leases.MaxLifetime = minimum
+	}
 }

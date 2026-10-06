@@ -259,6 +259,7 @@ func TestDefaultLayoutAndInvalidSettings(t *testing.T) {
 	require.Equal(t, InvalidArgument, KindOf(err))
 	for _, options := range []Options{
 		{MaxLifetime: -time.Second}, {CleanupTimeout: -time.Second}, {CleanupTimeout: time.Minute},
+		{CleanupGrace: -time.Second},
 	} {
 		_, err = NewManager(fixedBackend(newTestVM("vm")), options)
 		require.Equal(t, InvalidArgument, KindOf(err))
@@ -835,6 +836,7 @@ func TestCloseRetainsCancelledAcquisitionUntilVMIsKnown(t *testing.T) {
 		}()
 		<-started
 		require.ErrorIs(t, manager.Close(context.Background()), context.DeadlineExceeded)
+		synctest.Wait()
 		require.Len(t, manager.environments, 1)
 		require.Zero(t, vm.destroyCalls.Load())
 		close(release)
@@ -1029,5 +1031,317 @@ func TestOperationsSerializeWithinOneEnvironment(t *testing.T) {
 		require.NoError(t, <-execDone)
 		require.NoError(t, <-copyDone)
 		require.Equal(t, int32(1), copies.Load())
+	})
+}
+
+func TestExpiryBypassesBlockedGuestKillAndActiveOperationGate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		vm := newTestVM("expired-vm")
+		var kills atomic.Int32
+		vm.guest.kill = func(ctx context.Context, _ string) error {
+			kills.Add(1)
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		started, cancelled := make(chan struct{}), make(chan struct{})
+		vm.guest.exec = func(ctx context.Context, _ ExecSpec, _, _ io.Writer) (ExecResult, error) {
+			close(started)
+			<-ctx.Done()
+			close(cancelled)
+			// Keep the operation gate held until host destruction completes.
+			<-vm.destroyed
+			return ExecResult{}, context.Cause(ctx)
+		}
+		destroyStarted := make(chan time.Time, 1)
+		vm.destroy = func(context.Context) error {
+			destroyStarted <- time.Now()
+			return nil
+		}
+		manager := testManager(t, fixedBackend(vm), Options{CleanupGrace: time.Minute})
+		defer manager.Close(context.Background())
+		received := time.Now()
+		info := createEnvironment(t, manager, CreateSpec{Lifetime: time.Second})
+		startEnvironment(t, manager, info.ID)
+		result := make(chan error, 1)
+		go func() {
+			_, err := manager.Exec(context.Background(), info.ID, ExecSpec{Command: []string{"sleep"}}, nil, nil)
+			result <- err
+		}()
+		<-started
+		time.Sleep(time.Second)
+		synctest.Wait()
+		select {
+		case at := <-destroyStarted:
+			require.Equal(t, received.Add(time.Second), at)
+		default:
+			t.Fatal("host destruction did not start at the hard deadline")
+		}
+		<-cancelled
+		require.ErrorIs(t, <-result, context.DeadlineExceeded)
+		require.Zero(t, kills.Load())
+		require.Empty(t, manager.VMIDs())
+	})
+}
+
+func TestCleanupAttemptBoundsRetainOwnershipEvenOnLateSuccess(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		grace, timeout time.Duration
+		bound          time.Duration
+	}{
+		{"grace", 100 * time.Millisecond, time.Second, 100 * time.Millisecond},
+		{"attempt", time.Second, 100 * time.Millisecond, 100 * time.Millisecond},
+		{"default attempt", time.Minute, 0, 30 * time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				vm := newTestVM("retry-vm")
+				var succeed atomic.Bool
+				deadlines := make(chan time.Time, 1)
+				vm.destroy = func(ctx context.Context) error {
+					if succeed.Load() {
+						return nil
+					}
+					deadline, _ := ctx.Deadline()
+					deadlines <- deadline
+					<-ctx.Done()
+					return nil // A late nil must not discard canonical ownership.
+				}
+				manager := testManager(t, fixedBackend(vm), Options{CleanupGrace: test.grace, CleanupTimeout: test.timeout})
+				defer manager.Close(context.Background())
+				info := createEnvironment(t, manager, CreateSpec{})
+				cancelled, cancel := context.WithCancel(context.Background())
+				cancel()
+				before := time.Now()
+				require.ErrorIs(t, manager.Remove(cancelled, info.ID), context.DeadlineExceeded)
+				require.Equal(t, before.Add(test.bound), <-deadlines)
+				require.Equal(t, test.bound, time.Since(before))
+				synctest.Wait()
+				require.Equal(t, []string{"retry-vm"}, manager.VMIDs())
+				id, removing := manager.EnvironmentForVM("retry-vm")
+				require.Equal(t, info.ID, id)
+				require.True(t, removing)
+				succeed.Store(true)
+				require.NoError(t, manager.RetryRemovals(context.Background()))
+				require.Equal(t, int32(2), vm.destroyCalls.Load())
+				require.Empty(t, manager.VMIDs())
+			})
+		})
+	}
+}
+
+func TestLiveCleanupCallerDeadlineBoundsRemoveRetryAndClose(t *testing.T) {
+	for _, operation := range []string{"remove", "retry", "close"} {
+		t.Run(operation, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				vm := newTestVM("bounded-vm")
+				var succeed atomic.Bool
+				deadlines := make(chan time.Time, 1)
+				destroy := func(ctx context.Context) error {
+					if succeed.Load() {
+						return nil
+					}
+					deadline, _ := ctx.Deadline()
+					deadlines <- deadline
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				vm.destroy = destroy
+				manager := testManager(t, fixedBackend(vm), Options{CleanupGrace: time.Second})
+				defer manager.Close(context.Background())
+				info := createEnvironment(t, manager, CreateSpec{})
+				if operation == "retry" {
+					// Seed an incomplete removal without consuming the deadline channel.
+					vm.destroy = func(context.Context) error { return errors.New("initial failure") }
+					require.Error(t, manager.Remove(context.Background(), info.ID))
+					vm.destroy = destroy
+				}
+				before := time.Now()
+				ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+				defer cancel()
+				var err error
+				switch operation {
+				case "remove":
+					err = manager.Remove(ctx, info.ID)
+				case "retry":
+					err = manager.RetryRemovals(ctx)
+				case "close":
+					err = manager.Close(ctx)
+				}
+				require.ErrorIs(t, err, context.DeadlineExceeded)
+				require.Equal(t, before.Add(25*time.Millisecond), <-deadlines)
+				require.Equal(t, 25*time.Millisecond, time.Since(before))
+				synctest.Wait()
+				require.Equal(t, []string{"bounded-vm"}, manager.VMIDs())
+				succeed.Store(true)
+				require.NoError(t, manager.RetryRemovals(context.Background()))
+				require.Empty(t, manager.VMIDs())
+			})
+		})
+	}
+}
+
+func TestTTLExpirationCountsDeadlineTransitionNotCleanupRetries(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		vm := newTestVM("ttl-vm")
+		var succeed atomic.Bool
+		vm.destroy = func(context.Context) error {
+			if !succeed.Load() {
+				return errors.New("retained teardown")
+			}
+			return nil
+		}
+		var expirations atomic.Int32
+		profiles := make(chan string, 4)
+		manager := testManager(t, fixedBackend(vm), Options{Observer: &Observer{
+			TTLExpiration: func(profile string) {
+				expirations.Add(1)
+				profiles <- profile
+			},
+		}})
+		defer manager.Close(context.Background())
+		info := createEnvironment(t, manager, CreateSpec{Profile: "ubuntu-24.04", Lifetime: time.Second})
+		time.Sleep(time.Second)
+		synctest.Wait()
+		require.Equal(t, int32(1), expirations.Load())
+		require.Equal(t, "ubuntu-24.04", <-profiles)
+		require.Error(t, manager.RetryRemovals(context.Background()))
+		require.Equal(t, int32(2), vm.destroyCalls.Load())
+		succeed.Store(true)
+		require.NoError(t, manager.Remove(context.Background(), info.ID))
+		require.Equal(t, int32(3), vm.destroyCalls.Load())
+		require.Equal(t, int32(1), expirations.Load())
+		require.Empty(t, manager.VMIDs())
+	})
+}
+
+func TestLifetimeCapIncludesValidationAndAcquisitionTime(t *testing.T) {
+	for _, lifetime := range []time.Duration{0, 2 * time.Second} {
+		t.Run(lifetime.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				vm := newTestVM("capped-vm")
+				received := time.Now()
+				backend := backendFunc(func(ctx context.Context, _ string, expiry time.Time) (VM, error) {
+					deadline, ok := ctx.Deadline()
+					if !ok || !deadline.Equal(received.Add(time.Second)) || !expiry.Equal(deadline) {
+						return nil, errors.New("acquisition lost the receipt-time cap")
+					}
+					time.Sleep(250 * time.Millisecond)
+					return vm, nil
+				})
+				manager := testManager(t, backend, Options{
+					MaxLifetime: time.Second,
+					ReadySpec: func(string) (ReadySpec, error) {
+						time.Sleep(250 * time.Millisecond)
+						return ReadySpec{}, nil
+					},
+				})
+				defer manager.Close(context.Background())
+				info := createEnvironment(t, manager, CreateSpec{Lifetime: lifetime})
+				require.Equal(t, 500*time.Millisecond, time.Since(received))
+				time.Sleep(500 * time.Millisecond)
+				synctest.Wait()
+				require.Equal(t, int32(1), vm.destroyCalls.Load())
+				_, err := manager.Start(context.Background(), info.ID)
+				require.Equal(t, NotFound, KindOf(err))
+			})
+		})
+	}
+}
+
+func TestTimedOutCleanupRemainsSingleFlightUntilAttemptReturns(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		vm := newTestVM("slow-cleanup-vm")
+		release := make(chan struct{})
+		vm.destroy = func(context.Context) error {
+			if vm.destroyCalls.Load() == 1 {
+				<-release // Simulate cleanup that does not promptly observe cancellation.
+			}
+			return nil
+		}
+		manager := testManager(t, fixedBackend(vm), Options{CleanupGrace: 100 * time.Millisecond})
+		defer manager.Close(context.Background())
+		info := createEnvironment(t, manager, CreateSpec{})
+		require.ErrorIs(t, manager.Remove(context.Background(), info.ID), context.DeadlineExceeded)
+		require.Equal(t, []string{"slow-cleanup-vm"}, manager.VMIDs())
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		require.ErrorIs(t, manager.RetryRemovals(ctx), context.DeadlineExceeded)
+		require.Equal(t, int32(1), vm.destroyCalls.Load())
+		close(release)
+		synctest.Wait()
+		require.Equal(t, []string{"slow-cleanup-vm"}, manager.VMIDs())
+		require.NoError(t, manager.RetryRemovals(context.Background()))
+		require.Equal(t, int32(2), vm.destroyCalls.Load())
+		require.Empty(t, manager.VMIDs())
+	})
+}
+
+func TestBlockedGuestKillCannotConsumeShortCleanupGrace(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		vm := newTestVM("short-grace-vm")
+		killStarted := make(chan struct{})
+		vm.guest.kill = func(context.Context, string) error {
+			close(killStarted)
+			<-vm.destroyed // Deliberately ignore Kill's cancelled context.
+			return nil
+		}
+		destroyStarted := make(chan time.Time, 1)
+		destroyDeadline := make(chan time.Time, 1)
+		vm.destroy = func(ctx context.Context) error {
+			destroyStarted <- time.Now()
+			deadline, _ := ctx.Deadline()
+			destroyDeadline <- deadline
+			return ctx.Err()
+		}
+		manager := testManager(t, fixedBackend(vm), Options{CleanupGrace: 100 * time.Millisecond})
+		defer manager.Close(context.Background())
+		info := createEnvironment(t, manager, CreateSpec{})
+		before := time.Now()
+		require.NoError(t, manager.Remove(context.Background(), info.ID))
+		<-killStarted
+		require.Equal(t, before.Add(50*time.Millisecond), <-destroyStarted)
+		require.Equal(t, before.Add(100*time.Millisecond), <-destroyDeadline)
+		require.Equal(t, int32(1), vm.destroyCalls.Load())
+		require.Empty(t, manager.VMIDs())
+	})
+}
+
+func TestRemovalCooperationCannotOutliveOriginalLease(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		vm := newTestVM("removing-at-expiry-vm")
+		started := make(chan struct{})
+		vm.guest.exec = func(ctx context.Context, _ ExecSpec, _, _ io.Writer) (ExecResult, error) {
+			close(started)
+			<-ctx.Done()
+			<-vm.destroyed // Hold the operation gate until definitive destruction.
+			return ExecResult{}, context.Cause(ctx)
+		}
+		vm.guest.kill = func(context.Context, string) error {
+			<-vm.destroyed
+			return nil
+		}
+		destroyStarted := make(chan time.Time, 1)
+		vm.destroy = func(ctx context.Context) error {
+			destroyStarted <- time.Now()
+			return ctx.Err()
+		}
+		manager := testManager(t, fixedBackend(vm), Options{CleanupGrace: time.Second})
+		defer manager.Close(context.Background())
+		received := time.Now()
+		info := createEnvironment(t, manager, CreateSpec{Lifetime: 500 * time.Millisecond})
+		startEnvironment(t, manager, info.ID)
+		result := make(chan error, 1)
+		go func() {
+			_, err := manager.Exec(context.Background(), info.ID, ExecSpec{Command: []string{"sleep"}}, nil, nil)
+			result <- err
+		}()
+		<-started
+		time.Sleep(400 * time.Millisecond)
+		require.NoError(t, manager.Remove(context.Background(), info.ID))
+		require.Equal(t, received.Add(500*time.Millisecond), <-destroyStarted)
+		require.ErrorIs(t, <-result, context.Canceled)
+		require.Equal(t, int32(1), vm.destroyCalls.Load())
+		require.Empty(t, manager.VMIDs())
 	})
 }

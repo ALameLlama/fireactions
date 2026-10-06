@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -234,6 +235,9 @@ func (c *Config) Validate() error {
 
 	names := make(map[string]struct{}, len(c.Pools))
 	for _, pool := range c.Pools {
+		if pool.Replicas > math.MaxInt32 {
+			return fmt.Errorf("profile %q replicas must fit int32", pool.Name)
+		}
 		if !profileNamePattern.MatchString(pool.Name) {
 			return fmt.Errorf("invalid profile name %q: use only letters, digits, underscores and hyphens", pool.Name)
 		}

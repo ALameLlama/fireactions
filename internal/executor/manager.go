@@ -27,6 +27,7 @@ const (
 )
 
 type cleanupAttempt struct {
+	ctx  context.Context
 	done chan struct{}
 	err  error
 }
@@ -74,8 +75,11 @@ func NewManager(backend Backend, options Options) (*Manager, error) {
 	if options.CleanupTimeout == 0 {
 		options.CleanupTimeout = 30 * time.Second
 	}
-	if options.MaxLifetime < 0 || options.CleanupTimeout < 0 {
-		return nil, NewError(InvalidArgument, "environment lifetime and cleanup timeout must be positive", nil)
+	if options.CleanupGrace == 0 {
+		options.CleanupGrace = 2 * time.Minute
+	}
+	if options.MaxLifetime < 0 || options.CleanupTimeout < 0 || options.CleanupGrace < 0 {
+		return nil, NewError(InvalidArgument, "environment lifetime, cleanup timeout and cleanup grace must be positive", nil)
 	}
 	if options.CleanupTimeout > 30*time.Second {
 		return nil, NewError(InvalidArgument, "cleanup attempts cannot exceed 30 seconds", nil)
@@ -104,6 +108,18 @@ func (m *Manager) EnvironmentForVM(vmID string) (id string, removing bool) {
 		return "", false
 	}
 	return e.id, e.state == stateRemoving
+}
+
+// VMIDs snapshots administrative VM ownership, including incomplete removals,
+// without consulting guests. The returned slice is independent of the registry.
+func (m *Manager) VMIDs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ids := make([]string, 0, len(m.vms))
+	for id := range m.vms {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 func (m *Manager) Create(ctx context.Context, spec CreateSpec) (result EnvironmentInfo, err error) {
@@ -540,10 +556,10 @@ func (m *Manager) lookup(id string) (*environment, error) {
 	return e, nil
 }
 
-// Remove signals cancellation before waiting for any active operation. Cleanup
-// has its own bounded context, even when the caller's context is already done.
+// Remove cancels operations immediately and honors a live caller's cleanup
+// window. An already-cancelled caller still gets independent bounded cleanup.
 // A syntactically valid ID that is no longer present is an idempotent success.
-func (m *Manager) Remove(_ context.Context, id string) (err error) {
+func (m *Manager) Remove(ctx context.Context, id string) (err error) {
 	profile := m.profileForID(id)
 	defer m.observeOperation(OperationRemove, &err, &profile)
 	e, err := m.lookup(id)
@@ -556,17 +572,44 @@ func (m *Manager) Remove(_ context.Context, id string) (err error) {
 		}
 		return err
 	}
-	return m.removeEntry(e)
+	if ctx.Err() != nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, m.options.CleanupGrace)
+	defer cancel()
+	attempt := m.beginRemovalContext(ctx, e)
+	return waitCleanup(ctx, attempt)
 }
 
 func (m *Manager) removeEntry(e *environment) error {
 	attempt := m.beginRemoval(e)
-	<-attempt.done
-	return attempt.err
+	return waitCleanup(attempt.ctx, attempt)
+}
+
+func waitCleanup(ctx context.Context, attempt *cleanupAttempt) error {
+	select {
+	case <-attempt.done:
+		return attempt.err
+	default:
+	}
+	select {
+	case <-attempt.done:
+		return attempt.err
+	case <-ctx.Done():
+		return NewError(KindOf(ctx.Err()), "environment cleanup is incomplete", ctx.Err())
+	case <-attempt.ctx.Done():
+		return NewError(KindOf(attempt.ctx.Err()), "environment cleanup is incomplete", attempt.ctx.Err())
+	}
 }
 
 func (m *Manager) beginRemoval(e *environment) *cleanupAttempt {
+	return m.beginRemovalContext(context.Background(), e)
+}
+
+func (m *Manager) beginRemovalContext(ctx context.Context, e *environment) *cleanupAttempt {
 	e.mu.Lock()
+	lifetimeExpired := errors.Is(e.ctx.Err(), context.DeadlineExceeded)
+	expired := e.state != stateRemoving && lifetimeExpired
 	e.state = stateRemoving
 	e.cancel()
 	if e.cleanup != nil {
@@ -583,15 +626,21 @@ func (m *Manager) beginRemoval(e *environment) *cleanupAttempt {
 			return attempt
 		}
 	}
-	attempt := &cleanupAttempt{done: make(chan struct{})}
+	cleanupCtx, cancel := context.WithTimeout(ctx, min(m.options.CleanupTimeout, m.options.CleanupGrace))
+	attempt := &cleanupAttempt{ctx: cleanupCtx, done: make(chan struct{})}
 	e.cleanup = attempt
 	e.mu.Unlock()
-	go m.cleanup(e, attempt)
+	go m.cleanup(e, attempt, cancel, lifetimeExpired)
+	if expired {
+		if observer := m.options.Observer; observer != nil && observer.TTLExpiration != nil {
+			observer.TTLExpiration(e.profile)
+		}
+	}
 	return attempt
 }
 
-func (m *Manager) cleanup(e *environment, attempt *cleanupAttempt) {
-	ctx, cancel := context.WithTimeout(context.Background(), m.options.CleanupTimeout)
+func (m *Manager) cleanup(e *environment, attempt *cleanupAttempt, cancel context.CancelFunc, expired bool) {
+	ctx := attempt.ctx
 	defer cancel()
 	var err error
 	select {
@@ -600,28 +649,54 @@ func (m *Manager) cleanup(e *environment, attempt *cleanupAttempt) {
 		err = ctx.Err()
 	}
 	if err == nil {
+		err = ctx.Err()
+	}
+	if err == nil {
 		e.mu.Lock()
 		vm, guest := e.vm, e.guest
 		e.mu.Unlock()
 		if vm != nil {
-			cooperationCtx, stopCooperation := context.WithTimeout(ctx, guestCooperationTimeout)
-			if guest != nil {
-				// A failed Kill does not prevent definitive host-side destruction.
-				_ = guest.Kill(cooperationCtx, "")
-			}
 			gateHeld := false
-			select {
-			case e.gate <- struct{}{}:
-				gateHeld = true
-			case <-cooperationCtx.Done():
+			if !expired && time.Now().Before(e.deadline) {
+				// Reserve half the remaining cleanup attempt for host teardown.
+				// Removal cancels e.ctx, so retain the original hard deadline as a
+				// separate bound even when its cancellation cause is not expiry.
+				deadline, _ := ctx.Deadline()
+				cooperationBudget := min(guestCooperationTimeout, time.Until(deadline)/2, time.Until(e.deadline))
+				cooperationCtx, stopCooperation := context.WithTimeout(ctx, cooperationBudget)
+				if guest != nil {
+					killDone := make(chan struct{})
+					go func() {
+						_ = guest.Kill(cooperationCtx, "")
+						close(killDone)
+					}()
+					select {
+					case <-killDone:
+					case <-cooperationCtx.Done():
+					}
+				}
+				select {
+				case e.gate <- struct{}{}:
+					gateHeld = true
+				case <-cooperationCtx.Done():
+				}
+				stopCooperation()
 			}
-			stopCooperation()
-			// An uncooperative operation cannot hold a live VM indefinitely.
-			err = vm.Destroy(ctx)
+			// Never pass an expired window to a host cleanup implementation that
+			// might substitute its own independent timeout for a cancelled context.
+			err = ctx.Err()
+			if err == nil {
+				err = vm.Destroy(ctx)
+			}
 			if gateHeld {
 				<-e.gate
 			}
 		}
+	}
+	// A cleanup implementation returning nil after its window ended is not proof
+	// of complete teardown. Retain ownership until a later bounded attempt succeeds.
+	if err == nil {
+		err = ctx.Err()
 	}
 	e.mu.Lock()
 	activeDelta := false
@@ -653,6 +728,8 @@ func (m *Manager) cleanup(e *environment, attempt *cleanupAttempt) {
 // RetryRemovals retries retained, incomplete cleanup without touching healthy
 // environments. It is suitable for the host's periodic reconciliation loop.
 func (m *Manager) RetryRemovals(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, m.options.CleanupGrace)
+	defer cancel()
 	m.mu.Lock()
 	entries := make([]*environment, 0, len(m.environments))
 	for _, e := range m.environments {
@@ -665,24 +742,26 @@ func (m *Manager) RetryRemovals(ctx context.Context) error {
 		removing := e.state == stateRemoving
 		e.mu.Unlock()
 		if removing {
-			attempts = append(attempts, m.beginRemoval(e))
+			attempts = append(attempts, m.beginRemovalContext(ctx, e))
 		}
 	}
 	var result error
 	for _, attempt := range attempts {
-		select {
-		case <-ctx.Done():
-			return errors.Join(result, ctx.Err())
-		case <-attempt.done:
+		if err := waitCleanup(ctx, attempt); err != nil {
+			result = errors.Join(result, err)
 		}
-		result = errors.Join(result, attempt.err)
+		if ctx.Err() != nil {
+			return result
+		}
 	}
 	return result
 }
 
-// Close prevents acquisition, cancels every environment first, and waits for
-// independent bounded cleanup. Calling it again retries incomplete destruction.
-func (m *Manager) Close(_ context.Context) error {
+// Close prevents acquisition, cancels every environment first, and waits within
+// the caller's cleanup deadline and CleanupGrace. Later calls retry failures.
+func (m *Manager) Close(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, m.options.CleanupGrace)
+	defer cancel()
 	m.mu.Lock()
 	m.closed = true
 	entries := make([]*environment, 0, len(m.environments))
@@ -692,12 +771,14 @@ func (m *Manager) Close(_ context.Context) error {
 	m.mu.Unlock()
 	attempts := make([]*cleanupAttempt, len(entries))
 	for i, e := range entries {
-		attempts[i] = m.beginRemoval(e)
+		attempts[i] = m.beginRemovalContext(ctx, e)
 	}
 	var result error
 	for _, attempt := range attempts {
-		<-attempt.done
-		result = errors.Join(result, attempt.err)
+		result = errors.Join(result, waitCleanup(ctx, attempt))
+		if ctx.Err() != nil {
+			return errors.Join(result, ctx.Err())
+		}
 	}
 	return result
 }

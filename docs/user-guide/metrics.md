@@ -29,6 +29,8 @@ Do not expose this endpoint directly to an untrusted network.
 | `fireactions_guest_readiness_seconds` | Histogram | Time spent waiting for the guest agent | `profile` |
 | `fireactions_operations_total` | Counter | Environment operations and their results | `profile`, `operation`, `outcome` |
 | `fireactions_cleanup_failures_total` | Counter | Cleanup attempts that failed | `profile` |
+| `fireactions_vm_ttl_expirations_total` | Counter | Owned VMs revoked after their hard lifetime expired | `profile` |
+| `fireactions_stale_vm_reconciliations_total` | Counter | Stale owned VMs moved into recovery cleanup | `profile` |
 
 Operation values are `create`, `start`, `copy_in`, `exec`, `copy_out`, and `remove`.
 Outcome values are `success`, `failure`, and `cancelled`.
@@ -40,6 +42,9 @@ Provisioning contributes to pending idle capacity but does not appear in the cle
 A claim triggers replacement provisioning when the pool is active.
 A paused pool can supply an existing idle VM but cannot create a replacement or a cold VM.
 Scaling down removes only idle VMs and cancels excess idle provisioning.
+
+Hard lifetime and stale-owner counters count the first durable cleanup transition, not each retry.
+The independent reaper writes service logs. The daemon observes removed records and clears its environment and VM gauges.
 
 Histograms and counters appear after their first event.
 Labels contain configured profile names, never environment IDs, job arguments, or secrets.

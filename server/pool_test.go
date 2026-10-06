@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"errors"
+	"math"
+	"os"
 	"runtime"
 	"sync"
 	"testing"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/hostinger/fireactions/internal/executor"
 	"github.com/rs/zerolog"
+	"golang.org/x/sys/unix"
 )
 
 func ownershipTestPool(t *testing.T, machines ...*Machine) *Pool {
@@ -33,6 +36,92 @@ func ownershipTestPool(t *testing.T, machines ...*Machine) *Pool {
 		pool.machines[machine.Name] = machine
 	}
 	return pool
+}
+
+func TestNewPoolRejectsReplicaOverflowBeforeConversion(t *testing.T) {
+	replicas := int64(math.MaxInt32) + 1
+	if int64(int(replicas)) != replicas {
+		t.Skip("int32 overflow is already outside the host int range")
+	}
+	logger := zerolog.Nop()
+	pool, err := NewPool(&logger, &PoolConfig{Name: "overflow", Replicas: int(replicas)}, nil, nil, nil)
+	if err == nil || pool != nil {
+		t.Fatalf("initial replica overflow allocated a pool: pool=%v err=%v", pool, err)
+	}
+}
+
+func TestFailedDurableWarmClaimNeverPublishesSelectedVM(t *testing.T) {
+	for _, failure := range []string{"record fsync", "directory fsync"} {
+		t.Run(failure, func(t *testing.T) {
+			store := newTestStateStore(t)
+			profile := "persist-claim"
+			record := testStateRecord(store, profile, profile+"-vm", "idle", nil)
+			cmd := startJournalProcess(t, record)
+			pidfd, err := unix.PidfdOpen(cmd.Process.Pid, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer unix.Close(pidfd)
+			if err := store.create(record); err != nil {
+				t.Fatal(err)
+			}
+			machine := &Machine{Name: record.VMID, State: "idle", resources: &ownedResources{journal: store, record: record}}
+			pool := ownershipTestPool(t, machine)
+			pool.config.Name, pool.journal = profile, store
+			pool.Pause()
+			persistErr := errors.New("persistent disk sync failure")
+			syncFile, syncDir := store.syncFile, store.syncDir
+			t.Cleanup(func() { store.syncFile, store.syncDir = syncFile, syncDir; pool.Stop() })
+			if failure == "record fsync" {
+				store.syncFile = func(*os.File) error { return persistErr }
+			} else {
+				store.syncDir = func(*os.File) error { return persistErr }
+			}
+			vm, err := pool.acquire(context.Background(), time.Now().Add(time.Hour))
+			if vm != nil || !errors.Is(err, persistErr) {
+				t.Fatalf("failed durable claim published vm=%v err=%v", vm, err)
+			}
+			if state := machine.Metadata().State; state != "removing" {
+				t.Fatalf("failed durable claim left selected VM available: state=%q", state)
+			}
+			if pool.GetCurrentSize() != 0 {
+				t.Fatal("failed durable claim returned the selected VM to idle inventory")
+			}
+			if exited, err := pidfdExited(pidfd, 0); err != nil || !exited {
+				t.Fatalf("selected VMM survived failed durable publication: exited=%v err=%v", exited, err)
+			}
+			store.syncFile, store.syncDir = syncFile, syncDir
+			pool.retryRemovals()
+			pool.workWg.Wait()
+			if _, err := pool.GetMachine(record.VMID); err == nil {
+				t.Fatal("failed durable claim ownership remained after successful cleanup retry")
+			}
+			if _, err := store.State(record.VMID); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("cleanup retry retained durable selected VM ownership: %v", err)
+			}
+		})
+	}
+}
+
+func TestDurablyRemovingIdleVMCannotBeClaimed(t *testing.T) {
+	store := newTestStateStore(t)
+	profile := "revoked-claim"
+	record := testStateRecord(store, profile, profile+"-vm", "removing", nil)
+	if err := store.create(record); err != nil {
+		t.Fatal(err)
+	}
+	machine := &Machine{Name: record.VMID, State: "idle", resources: &ownedResources{journal: store, record: record}}
+	pool := ownershipTestPool(t, machine)
+	pool.config.Name, pool.journal = profile, store
+	pool.Pause()
+	vm, err := pool.acquire(context.Background(), time.Now().Add(time.Hour))
+	if vm != nil || err == nil {
+		t.Fatalf("durably revoked idle VM was claimed: vm=%v err=%v", vm, err)
+	}
+	if _, err := pool.GetMachine(record.VMID); err == nil || pool.GetCurrentSize() != 0 {
+		t.Fatal("durably revoked VM remained claimable after failed acquisition")
+	}
+	pool.Stop()
 }
 
 func TestScaleDownRetainsFailedCleanupAndReconcilesIt(t *testing.T) {

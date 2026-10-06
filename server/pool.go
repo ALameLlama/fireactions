@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -48,6 +49,7 @@ type Pool struct {
 	stateDir         string
 	resolverPath     string
 	startupTimeout   time.Duration
+	journal          *StateStore
 	ready            executor.ReadySpec
 }
 
@@ -68,15 +70,19 @@ type PoolConfig struct {
 
 // configureRuntime injects daemon-owned paths and trusted guest readiness values
 // before Run begins.
-func (p *Pool) configureRuntime(stateDir, resolverPath string, startupTimeout time.Duration, ready executor.ReadySpec) {
+func (p *Pool) configureRuntime(stateDir, resolverPath string, startupTimeout time.Duration, ready executor.ReadySpec, journal *StateStore) {
 	p.stateDir = stateDir
 	p.resolverPath = resolverPath
 	p.startupTimeout = startupTimeout
 	p.ready = ready
+	p.journal = journal
 }
 
 // NewPool creates a new Pool.
 func NewPool(logger *zerolog.Logger, config *PoolConfig, imageManager *imageManager, containerdClient *containerd.Client, nextCID *atomic.Uint32) (*Pool, error) {
+	if config.Replicas < 0 || config.Replicas > math.MaxInt32 {
+		return nil, fmt.Errorf("replica count must fit a nonnegative int32")
+	}
 	l := logger.With().Str("pool", config.Name).Logger()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -202,8 +208,8 @@ func (p *Pool) GetDir() string {
 
 // Scale reconciles the number of ready clean-idle VMs to desiredReplicas.
 func (p *Pool) Scale(ctx context.Context, desiredReplicas int) error {
-	if desiredReplicas < 0 {
-		return fmt.Errorf("replica count must not be negative")
+	if desiredReplicas < 0 || desiredReplicas > math.MaxInt32 {
+		return fmt.Errorf("replica count must fit a nonnegative int32")
 	}
 
 	p.l.Lock()
@@ -390,7 +396,7 @@ func (p *Pool) Resume() {
 
 // SetReplicas updates the desired replica count for the pool in a thread-safe manner.
 func (p *Pool) SetReplicas(replicas int) {
-	if replicas < 0 {
+	if replicas < 0 || replicas > math.MaxInt32 {
 		return
 	}
 	p.l.Lock()
@@ -463,7 +469,11 @@ func (p *Pool) acquire(ctx context.Context, expiry time.Time) (executor.VM, erro
 		return nil, err
 	}
 
-	if machine := p.claimIdleMachine(); machine != nil {
+	machine, claimErr := p.claimIdleMachine(expiry)
+	if claimErr != nil {
+		return nil, claimErr
+	}
+	if machine != nil {
 		p.TriggerScale()
 		if err := acquireCtx.Err(); err != nil {
 			p.markPoolCleanup(machine)
@@ -501,7 +511,10 @@ func (p *Pool) acquire(ctx context.Context, expiry time.Time) (executor.VM, erro
 		p.machinesMu.Unlock()
 		return nil, errors.Join(err, p.destroyUnpublishedMachine(machine))
 	}
-	machine.SetState("claimed", "")
+	if err := machine.publishState("claimed", &expiry); err != nil {
+		p.machinesMu.Unlock()
+		return nil, errors.Join(fmt.Errorf("persist claimed VM: %w", err), p.destroyUnpublishedMachine(machine))
+	}
 	p.machines[machine.Name] = machine
 	p.watchMachineLocked(machine)
 	p.machinesMu.Unlock()
@@ -539,22 +552,33 @@ func (p *Pool) startupContext(ctx context.Context) (context.Context, context.Can
 	return context.WithTimeout(ctx, p.startupTimeout)
 }
 
-func (p *Pool) claimIdleMachine() *Machine {
+func (p *Pool) claimIdleMachine(expiry time.Time) (*Machine, error) {
 	p.machinesMu.Lock()
 	var target *Machine
+	var persistErr error
 	for _, machine := range p.machines {
 		if machine.Metadata().State != "idle" {
 			continue
 		}
-		machine.SetState("claimed", "")
 		target = machine
+		persistErr = machine.publishState("claimed", &expiry)
+		if persistErr != nil {
+			machine.SetState("removing", "")
+			if p.poolCleanup == nil {
+				p.poolCleanup = make(map[*Machine]struct{})
+			}
+			p.poolCleanup[machine] = struct{}{}
+		}
 		break
 	}
 	p.machinesMu.Unlock()
 	if target != nil {
 		p.refreshMetrics()
 	}
-	return target
+	if persistErr != nil {
+		return nil, errors.Join(fmt.Errorf("persist idle VM claim: %w", persistErr), p.destroyMachine(context.Background(), target))
+	}
+	return target, nil
 }
 
 func (p *Pool) watchMachineLocked(machine *Machine) {
@@ -613,8 +637,12 @@ func (p *Pool) createIdleMachine(ctx context.Context, id uint64, provision *idle
 		p.l.Unlock()
 		return p.destroyUnpublishedMachine(machine)
 	}
+	if err := machine.publishState("idle", nil); err != nil {
+		p.machinesMu.Unlock()
+		p.l.Unlock()
+		return errors.Join(fmt.Errorf("persist idle VM: %w", err), p.destroyUnpublishedMachine(machine))
+	}
 	delete(p.idleProvisioning, id)
-	machine.SetState("idle", "")
 	p.machines[machine.Name] = machine
 	if err := startupCtx.Err(); err != nil || p.ctx.Err() != nil {
 		delete(p.machines, machine.Name)
