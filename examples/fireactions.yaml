@@ -23,7 +23,7 @@ leases:
 
 pools:
   - name: ubuntu-24.04
-    replicas: 0
+    replicas: 1
     image: localhost/fireactions-guest:ubuntu-24.04
     image_pull_policy: Never
     default_user: ci

@@ -1,106 +1,54 @@
-# Upgrading
+# Upgrade Fireactions
 
-This guide covers the process of upgrading Fireactions to a newer version.
+Use a Fireactions binary built from the intended source revision. GitHub hosts the source repository and release files, but the host must run the fork-built Fireactions binary. Do not install an upstream runner product in its place.
 
-## Upgrade Steps
+A host service restart destroys old claimed and idle VMs before Fireactions accepts jobs. Jobs do not resume after a restart. Schedule an upgrade when interrupting active jobs is acceptable.
 
-### 1. Stop the Fireactions service
+## Replace the binary
 
-Stop the Fireactions service to prevent new runners from starting:
+Copy the new binary to the host. Make sure it is executable and keep a backup of the current binary outside the active install path.
 
-```bash
-sudo systemctl stop fireactions
-```
-
-Verify the service is stopped:
+Stop the host service before replacing the binary:
 
 ```bash
-sudo systemctl status fireactions
+sudo systemctl stop fireactions.service
 ```
 
-### 2. Download new Fireactions binary
-
-Download the new release from the [GitHub releases page](https://github.com/hostinger/fireactions/releases):
+Install the new binary at the existing Fireactions binary path. The default installer uses `/usr/local/bin/fireactions`:
 
 ```bash
-# Example for version X.Y.Z
-wget https://github.com/hostinger/fireactions/releases/download/vX.Y.Z/fireactions_X.Y.Z_linux_amd64.tar.gz
-tar -xzf fireactions_X.Y.Z_linux_amd64.tar.gz
+sudo install -m 0755 ./fireactions /usr/local/bin/fireactions
 ```
 
-### 3. Replace the binary
-
-Replace the old binary with the new one:
+Validate the current configuration, including existing host prerequisites:
 
 ```bash
-sudo mv fireactions /usr/local/bin/fireactions
-sudo chmod +x /usr/local/bin/fireactions
+sudo /usr/local/bin/fireactions validate /etc/fireactions/config.yaml
+sudo /usr/local/bin/fireactions validate --host /etc/fireactions/config.yaml
 ```
 
-### 4. Verify the binary
+Review release notes and update the configuration when the new version requires a schema change. Do not replace the host state directory or delete journal records as part of an upgrade.
 
-Confirm the new version is installed:
+Start the service and confirm that the independent reaper timer remains enabled:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl start fireactions.service
+sudo systemctl enable --now fireactions-reaper.timer
+sudo systemctl status fireactions.service
+sudo systemctl status fireactions-reaper.timer
+```
+
+The reaper timer must stay enabled even when the main service is stopped or crashes. It cleans expired or abandoned resources independently.
+
+## Verify the upgrade
+
+Check the installed binary version, pool state, and host service journal:
 
 ```bash
 fireactions version
+fireactions pools list
+sudo journalctl -u fireactions.service -n 100
 ```
 
-### 5. Validate configuration
-
-Check your configuration for compatibility with the new version:
-
-```bash
-fireactions validate /etc/fireactions/config.yaml
-```
-
-If validation fails, review the error messages and update your configuration according to the release notes. Breaking changes are typically documented in the release notes with migration instructions.
-
-### 6. Start the Fireactions service
-
-Start Fireactions with the new version:
-
-```bash
-sudo systemctl start fireactions
-```
-
-## Post-Upgrade Verification
-
-After starting the service, verify the upgrade was successful:
-
-### Check Service Status
-
-```bash
-sudo systemctl status fireactions
-```
-
-The service should be `active (running)`.
-
-### Review Logs
-
-Check the logs for any errors or warnings:
-
-```bash
-sudo journalctl -u fireactions -n 100 -f
-```
-
-Look for specific error messages or warnings that might indicate issues.
-
-### Verify Pool Status
-
-List the pools to ensure they are running correctly:
-
-```bash
-fireactions pools ls
-```
-
-### Monitor Metrics
-
-If metrics are enabled, check the metrics endpoint:
-
-```bash
-curl http://127.0.0.1:8081/metrics
-```
-
-### Test with a Workflow
-
-Trigger a test GitHub workflow to verify runners are being created and jobs execute successfully.
+Run a Forgejo workflow with a configured Fireactions profile label after the host service is ready. Fireactions supports Forgejo Runner protocol 13.2 on Linux. Keep the Runner and its registration token on the host.

@@ -60,3 +60,21 @@ func TestValidateCommand_NoArgs(t *testing.T) {
 	err := cmd.Execute()
 	assert.Error(t, err)
 }
+
+func TestValidateCommand_HostModeRequiresConfiguration(t *testing.T) {
+	cmd := newValidateCmd()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"--host"})
+	assert.Error(t, cmd.Execute())
+}
+
+func TestValidateCommand_HostModeRejectsExtraArguments(t *testing.T) {
+	cmd := newValidateCmd()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"--host", "config.yaml", "unexpected"})
+	assert.Error(t, cmd.Execute())
+}

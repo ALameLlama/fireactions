@@ -1,502 +1,121 @@
-# Manual Installation
+# Installation
 
-This guide will walk you through manually installing and configuring Fireactions on a Linux machine.
+This guide installs the Fireactions host service on Linux and connects a Forgejo Runner. Fireactions uses an existing KVM, containerd, devmapper snapshotter, CNI network, Firecracker binary, kernel, and CNI plugin executables.
 
-## Overview
+## Requirements
 
-Fireactions consists of several components working together:
+Use a Linux host with root or `sudo` access. The host needs usable `/dev/kvm`, containerd with devmapper configured, a CNI network for Fireactions, the configured Firecracker binary and guest kernel, and the CNI plugins named by that network.
 
-- **Firecracker**: A lightweight virtual machine monitor that runs the runner environments
-- **Containerd**: Container runtime that pulls and manages runner images
-- **CNI Plugins**: Networking layer that connects VMs to the host network
-- **Linux Kernel**: A minimal kernel image optimized for Firecracker VMs
-- **Fireactions**: The orchestration service that ties everything together
+Configure a host resolver file with usable nameservers. The example uses `/run/systemd/resolve/resolv.conf`. Set `network.resolver_path` to the real resolver file on your host. The guest network must reach Forgejo and any package registries or services that workflows use.
 
-## Prerequisites
+The host service needs privileges to use KVM, containerd, CNI, host networking, and guest root filesystems. This is privileged host execution. Fireactions does not add a Firecracker jailer or a stronger host isolation boundary.
 
-Before you begin, ensure you have:
+The supplied host profiles use Ubuntu 24.04. The `ubuntu-24.04` profile uses 2 CPUs and 4 GiB of memory. The `ubuntu-24.04-large` profile uses 4 CPUs and 8 GiB. Each profile needs a bootable guest image, a readable kernel, and an executable Firecracker binary.
 
-### Required
+## Prepare the configuration and image
 
-- **Linux server** with x86_64 (amd64) or aarch64 (arm64) architecture
-- **Root or sudo access** for system-level configuration
-- **KVM virtualization support** - Firecracker requires hardware virtualization
-- **GitHub App credentials**:
-    - App ID
-    - App must be installed on your target organization
-    - Private key (PEM format)
-    - See [Creating GitHub Apps](https://docs.github.com/en/apps/creating-github-apps) for setup instructions
-- **Dedicated block device** for Containerd storage (e.g., `/dev/nvme1n1`, `/dev/sdb`)
-    - This will be used exclusively for container image storage via LVM
-    - Minimum 50GB recommended, though this depends on your image sizes
+Start from [`examples/fireactions.yaml`](../../examples/fireactions.yaml). Set the containerd socket, namespace, Firecracker path, kernel path, and host resolver path to values that exist on your host. Use an image name that you import into the same containerd namespace. The example namespace is `fireactions`.
 
-### Verify Hardware Virtualization
-
-Firecracker requires KVM (Kernel-based Virtual Machine) support:
+Build and export the guest image as a Docker image archive. Import that archive with the devmapper snapshotter into the configured namespace. The example commands use the `fireactions` namespace:
 
 ```bash
-# Check if KVM device exists
-ls -la /dev/kvm
-
-# Check if your CPU supports virtualization
-grep -E '(vmx|svm)' /proc/cpuinfo
+sudo ctr --namespace fireactions images import --snapshotter devmapper fireactions-guest.tar
+sudo ctr --namespace fireactions images list
 ```
 
-If `/dev/kvm` doesn't exist: Enable VT-x in BIOS (Intel) or AMD-V in BIOS (AMD) or ensure nested virtualization is enabled (Cloud providers).
+The image name in the configuration must match the imported image reference. See [Images](images.md) for the guest image contract and build/export/import flow.
 
-## Step 1: Install System Dependencies
+## Install Fireactions
 
-Install the base packages needed for downloading and managing components.
-
-**For Ubuntu/Debian:**
-```bash
-apt-get update
-apt-get install -y curl gnupg lvm2 tar
-```
-
-**For RHEL/CentOS/Rocky Linux:**
-```bash
-yum install -y curl lvm2 tar
-```
-
-## Step 2: Install Firecracker
-
-[Firecracker](https://github.com/firecracker-microvm/firecracker) is an open-source virtualization technology that enables lightweight virtual machines. It provides the isolation layer for each GitHub Actions runner.
-
-First, determine your system architecture and find the latest version:
+Build the static Linux amd64 `fireactions` binary from the repository root as described in [Images](images.md). Then use that fork-built binary. The default installer preflights the host and installs Fireactions without replacing the existing containerd service or configuration, LVM, or CNI configuration.
 
 ```bash
-# Set architecture variable
-export ARCH=$(case $(uname -m) in
-  x86_64) echo "amd64" ;;
-  aarch64) echo "arm64" ;;
-esac)
-
-# Check latest release at: https://github.com/firecracker-microvm/firecracker/releases
-export FIRECRACKER_VERSION=1.9.1  # Replace with latest version
+sudo ./install.sh --binary ./fireactions --config examples/fireactions.yaml
 ```
 
-Download and install the Firecracker binary:
+The installer installs the Fireactions binary and configuration, creates the socket group and systemd units, writes the documented IP-forwarding sysctl setting, reloads systemd, and enables the main service and independent reaper timer. It does not download an upstream Fireactions binary.
+
+Check host prerequisites with the same binary and configuration. Host validation needs root access to inspect the configured host resources:
 
 ```bash
-curl -fsSL -o firecracker.tgz \
-  "https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}/firecracker-v${FIRECRACKER_VERSION}-$(uname -m).tgz"
-
-tar -xzf firecracker.tgz --strip-components=1
-mv firecracker-v${FIRECRACKER_VERSION}-$(uname -m) /usr/local/bin/firecracker
-chmod +x /usr/local/bin/firecracker
-rm firecracker.tgz
+sudo ./fireactions validate --host examples/fireactions.yaml
 ```
 
-Verify the installation:
+The regular `validate CONFIG` command checks configuration without the host preflight.
+
+Apply the IP-forwarding sysctl configuration and reload systemd after installation:
 
 ```bash
-firecracker --version
+sudo sysctl --system
+sudo systemctl daemon-reload
+sudo systemctl enable --now fireactions.service fireactions-reaper.timer
 ```
 
-You should see output like: `Firecracker v1.9.1`
+The installer enables the main service and independent reaper timer. Keep `fireactions-reaper.timer` enabled when the main service stops or crashes. The timer performs independent cleanup of expired or abandoned VM resources.
 
-## Step 3: Install Containerd
+## Register Forgejo Runner on the host
 
-[Containerd](https://containerd.io) is an industry-standard container runtime that manages the lifecycle of containers. Fireactions uses it to pull runner images from container registries and prepare root filesystems for the VMs.
-
-### Download and Install Containerd
-
-Check for the latest release at https://github.com/containerd/containerd/releases:
+Use Forgejo Runner 13.2 on Linux. Register the Runner on the Forgejo server with the Forgejo CLI. Run the command as the Forgejo service user, and replace the work path, configuration path, owner, and secret path with values for that server:
 
 ```bash
-export CONTAINERD_VERSION=1.7.24  # Replace with latest 1.7.x version
-
-curl -fsSL -o containerd.tar.gz \
-  "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-${ARCH}.tar.gz"
-
-tar -xzf containerd.tar.gz
-mv bin/containerd /usr/local/bin/containerd
-mv bin/ctr /usr/local/bin/ctr
-rm -rf bin containerd.tar.gz
+install -d -m 0700 /secure/path
+umask 077
+openssl rand -hex 20 | tr -d '\n' > /secure/path/runner-token
+forgejo --work-path /path/to/forgejo-work --config /path/to/app.ini \
+  forgejo-cli actions register --name fireactions --scope OWNER \
+  --secret-file /secure/path/runner-token
 ```
 
-### Create Containerd Systemd Service
+Use `OWNER/REPO` for a repository-scoped Runner. The Forgejo command reads the existing 40-character token file and returns a registration UUID. Keep the UUID and token private. Do not print the token. Transfer the token securely to the host that runs Forgejo Runner, then store it in a file owned by the Runner OS user with mode `0600`.
 
-Systemd will manage the Containerd daemon lifecycle:
-
-```bash
-cat > /etc/systemd/system/containerd.service << 'EOF'
-[Unit]
-Description=containerd container runtime
-Documentation=https://containerd.io
-After=network.target local-fs.target
-
-[Service]
-Type=notify
-ExecStartPre=-/sbin/modprobe overlay
-ExecStart=/usr/local/bin/containerd
-Delegate=yes
-KillMode=process
-Restart=always
-RestartSec=5
-LimitNPROC=infinity
-LimitCORE=infinity
-LimitNOFILE=infinity
-TasksMax=infinity
-OOMScoreAdjust=-999
-
-[Install]
-WantedBy=multi-user.target
-EOF
-```
-
-### Configure Containerd with Devmapper Snapshotter
-
-Containerd uses snapshotters to manage container filesystem layers. The `devmapper` snapshotter with LVM thin provisioning provides efficient storage management and better performance for our use case.
-
-Create the configuration directory and file:
-
-```bash
-mkdir -p /etc/containerd
-
-cat > /etc/containerd/config.toml << 'EOF'
-version = 2
-
-root      = "/var/lib/containerd"
-imports   = []
-state     = "/run/containerd"
-oom_score = 0
-
-[grpc]
-  address = "/run/containerd/containerd.sock"
-  uid     = 0
-  gid     = 0
-
-[plugins]
-  [plugins."io.containerd.snapshotter.v1.devmapper"]
-    pool_name       = "containerd-thinpool"
-    root_path       = "/var/lib/containerd/devmapper"
-    base_image_size = "30GB"
-    discard_blocks  = true
-EOF
-```
-
-Adjust `base_image_size` as needed depending on your container image sizes.
-
-### Setup LVM Thin Pool for Containerd
-
-LVM thin provisioning allows efficient storage allocation. Instead of pre-allocating disk space for each container, space is allocated on-demand.
-
-**Important**: This will wipe the specified device. Ensure you're using the correct device and it contains no important data.
-
-```bash
-# Set your dedicated device path
-export CONTAINERD_SNAPSHOTTER_DEVICE=/dev/nvme1n1  # CHANGE THIS
-
-# Verify the device exists and is unmounted
-lsblk ${CONTAINERD_SNAPSHOTTER_DEVICE}
-```
-
-Create the LVM physical volume and volume group:
-
-```bash
-# Create physical volume
-pvcreate -f ${CONTAINERD_SNAPSHOTTER_DEVICE}
-
-# Create volume group named 'containerd'
-vgcreate containerd ${CONTAINERD_SNAPSHOTTER_DEVICE}
-```
-
-Configure thin pool auto-extension (prevents space exhaustion):
-
-```bash
-cat > /etc/lvm/profile/containerd.profile << 'EOF'
-activation {
-  thin_pool_autoextend_threshold=80
-  thin_pool_autoextend_percent=20
-}
-EOF
-```
-
-This configuration enables automatic extension of the thin pool when it reaches 80% capacity, increasing its size by 20% each time.
-
-Create the thin pool:
-
-```bash
-lvcreate --type thin-pool -q -n thinpool \
-  --poolmetadatasize 1G \
-  --profile containerd \
-  --monitor y \
-  -l "95%VG" containerd
-```
-
-This creates the thin pool named `thinpool` in the `containerd` volume group.
-
-### Start Containerd
-
-Enable and start the Containerd service:
-
-```bash
-systemctl daemon-reload
-systemctl enable containerd
-systemctl start containerd
-
-# Verify it's running
-systemctl status containerd
-
-# Test with a simple command
-ctr version
-```
-
-## Step 4: Install CNI Plugins
-
-The [Container Network Interface (CNI)](https://github.com/containernetworking/cni) provides networking for containers and VMs. Fireactions uses several CNI plugins to create isolated network namespaces and connect VMs to the host network.
-
-### Install Standard CNI Plugins
-
-Check for the latest release at https://github.com/containernetworking/plugins/releases:
-
-```bash
-export CNI_VERSION=1.6.1  # Replace with latest version
-
-curl -fsSL -o cni-plugins.tgz \
-  "https://github.com/containernetworking/plugins/releases/download/v${CNI_VERSION}/cni-plugins-linux-${ARCH}-v${CNI_VERSION}.tgz"
-
-mkdir -p /opt/cni/bin
-tar -xzf cni-plugins.tgz -C /opt/cni/bin
-rm cni-plugins.tgz
-
-# Verify installation
-ls -lh /opt/cni/bin/
-```
-
-This installs `bridge`, `host-local`, and `firewall` plugins, which are essential for networking functionality.
-
-### Install tc-redirect-tap Plugin
-
-The [tc-redirect-tap](https://github.com/awslabs/tc-redirect-tap) plugin uses Traffic Control (tc) to redirect packets between the VM's tap device and the host, providing better performance than traditional bridging.
-
-```bash
-curl -fsSL -o /opt/cni/bin/tc-redirect-tap \
-  "https://github.com/hostinger/tc-redirect-tap/releases/download/v0.0.1/tc-redirect-tap-${ARCH}"
-chmod +x /opt/cni/bin/tc-redirect-tap
-
-# Verify
-/opt/cni/bin/tc-redirect-tap --version
-```
-
-### Configure CNI Network
-
-Create the network configuration that Fireactions will use:
-
-```bash
-mkdir -p /etc/cni/net.d
-
-cat > /etc/cni/net.d/10-fireactions.conflist << 'EOF'
-{
-  "cniVersion": "0.4.0",
-  "name": "fireactions",
-  "plugins": [
-    {
-      "bridge": "fireactions-br0",
-      "forceAddress": false,
-      "hairpinMode": true,
-      "ipMasq": true,
-      "ipam": {
-        "dataDir": "/var/run/cni",
-        "resolvConf": "/etc/resolv.conf",
-        "subnet": "192.168.128.0/24",
-        "type": "host-local"
-      },
-      "isDefaultGateway": true,
-      "mtu": 1500,
-      "type": "bridge"
-    },
-    {
-      "type": "firewall"
-    },
-    {
-      "type": "tc-redirect-tap"
-    }
-  ]
-}
-EOF
-```
-
-Adjust the configuration as needed, especially the subnet. We recommend using a big subnet range (e.g., /23) to accommodate future growth.
-
-## Step 5: Download Kernel Image
-
-Firecracker VMs require a Linux kernel. We provide pre-built, optimized kernel images, which you can download as follows:
-
-```bash
-export KERNEL_VERSION=5.10  # or 6.1 for newer kernel
-
-mkdir -p /var/lib/fireactions/kernels/${KERNEL_VERSION}
-curl -fsSL -o /var/lib/fireactions/kernels/${KERNEL_VERSION}/vmlinux \
-  "https://storage.googleapis.com/fireactions/kernels/${ARCH}/${KERNEL_VERSION}/vmlinux"
-
-# Verify download
-ls -lh /var/lib/fireactions/kernels/${KERNEL_VERSION}/vmlinux
-```
-
-The kernel is configured with minimal modules to reduce the attack surface and improve boot times.
-
-## Step 6: Install Fireactions
-
-Now install the Fireactions orchestrator that coordinates all these components.
-
-### Download Fireactions Binary
-
-Check for the latest release at https://github.com/hostinger/fireactions/releases:
-
-```bash
-export FIREACTIONS_VERSION=1.0.0  # Replace with latest version
-
-curl -fsSL -o fireactions.tar.gz \
-  "https://github.com/hostinger/fireactions/releases/download/v${FIREACTIONS_VERSION}/fireactions-v${FIREACTIONS_VERSION}-linux-${ARCH}.tar.gz"
-
-tar -xzf fireactions.tar.gz
-mv fireactions /usr/local/bin/fireactions
-chmod +x /usr/local/bin/fireactions
-rm fireactions.tar.gz
-
-# Verify installation
-fireactions version
-```
-
-### Configure Sysctl for IP Forwarding
-
-Enable IP forwarding to allow VMs to reach external networks:
-
-```bash
-cat > /etc/sysctl.d/99-fireactions.conf << 'EOF'
-net.ipv4.conf.all.forwarding=1
-net.ipv4.ip_forward=1
-EOF
-
-# Apply immediately
-sysctl -p /etc/sysctl.d/99-fireactions.conf
-```
-
-### Create Fireactions Configuration
-
-Create the main configuration file. This tells Fireactions how to connect to GitHub and how to provision runners.
-
-```bash
-mkdir -p /etc/fireactions
-```
-
-Create `/etc/fireactions/config.yaml` with your specific values:
+Configure Runner with the Forgejo server URL, the registration UUID from Forgejo, and the host socket `unix:///run/fireactions/plugin.sock`. Set the token file path in a `file://` `token_url` field. Use the Fireactions label format from [`examples/forgejo-runner.yaml`](../../examples/forgejo-runner.yaml), for example `firecracker:firecracker://ubuntu-24.04`. The example shows the Runner configuration shape:
 
 ```yaml
-# Address where Fireactions will listen (change to 0.0.0.0:8080 for external access)
-bind_address: 127.0.0.1:8080
-
-# Prometheus metrics endpoint
-metrics:
-  enabled: true
-  address: 127.0.0.1:8081
-
-# GitHub App authentication
-github:
-  app_id: YOUR_GITHUB_APP_ID
-  app_private_key: |
-    -----BEGIN RSA PRIVATE KEY-----
-    YOUR_PRIVATE_KEY_CONTENT_HERE
-    -----END RSA PRIVATE KEY-----
-
-# Runner pool configuration
-pools:
-- name: default
-  replicas: 1  # Number of concurrent runners in this pool
-  runner:
-    name: default
-    # Runner image - must be compatible with Fireactions
-    image: ghcr.io/hostinger/fireactions-images/ubuntu22.04:latest
-    image_pull_policy: IfNotPresent  # or Always to pull on every run
-    group_id: 1  # Runner group ID in GitHub (1 = default)
-    organization: YOUR_GITHUB_ORGANIZATION  # or use 'repository: owner/repo'
-    labels:
-    - self-hosted
-    - fireactions
-    # Add more labels to target specific workflows
-    # - gpu
-    # - large-runner
+server:
+  connections:
+    forgejo:
+      url: "https://forgejo.example/"
+      uuid: "RUNNER_REGISTRATION_UUID"
+      token_url: "file:///home/runner/.config/forgejo-runner/token"
+plugins:
   firecracker:
-    binary_path: firecracker
-    kernel_image_path: /var/lib/fireactions/kernels/5.10/vmlinux
-    kernel_args: "console=ttyS0 noapic reboot=k panic=1 pci=off nomodules rw"
-    machine_config:
-      mem_size_mib: 2048  # RAM per VM (adjust based on your workloads)
-      vcpu_count: 2       # vCPUs per VM
-    # Custom metadata passed to VMs (accessible via MMDS)
-    metadata:
-      pool: default
-      environment: production
-
-# Logging level: debug, info, warn, error
-log_level: info
+    address: "unix:///run/fireactions/plugin.sock"
 ```
 
-For all configuration options, see the [configuration guide](../reference/configuration.md).
+Replace the example URL and UUID with your registration values. Create the token file as the Runner OS user and restrict access to that user. Do not copy the token into the plugin, guest image, or job environment.
 
-### Create Fireactions Systemd Service
-
-Set up Fireactions to run as a system service:
+Add the Runner OS user to the `fireactions` socket group. For the example user, run:
 
 ```bash
-cat > /etc/systemd/system/fireactions.service << 'EOF'
-[Unit]
-Description=Fireactions
-Documentation=https://github.com/hostinger/fireactions
-After=network.target containerd.service
-Requires=containerd.service
-
-[Service]
-User=root
-Type=simple
-KillMode=process
-ExecStartPre=/usr/bin/which firecracker
-ExecStartPre=/usr/bin/which containerd
-ExecStart=/usr/local/bin/fireactions server --config /etc/fireactions/config.yaml
-Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
+sudo usermod -aG fireactions runner
 ```
 
-### Start Fireactions
-
-Enable and start the service:
+Log out and back in to apply the new group membership, then restart the service that runs Forgejo Runner. Start Forgejo Runner with the completed host configuration:
 
 ```bash
-systemctl daemon-reload
-systemctl enable fireactions
-systemctl start fireactions
+forgejo-runner daemon --config examples/forgejo-runner.yaml
 ```
 
-## Step 7: Verify Installation
+The host socket grants access to the Fireactions plugin. Do not expose it to guest jobs.
 
-### Check Service Status
+A label selects a configured Fireactions profile. It does not select an arbitrary registry image. Configure a separate label for each profile that Runner can request.
+
+## Optional host setup
+
+The installer keeps host provisioning behind the explicit `--setup-host` option. Use it only when you intend to install or configure missing host dependencies. It can change host packages and services.
+
+Run `install.sh` from the repository tree. It uses the service and timer files under `packaging/systemd/`. Optional setup downloads missing Firecracker `1.17.0`, CNI plugins, and the pinned guest kernel. It does not build or import the guest image.
+
+Storage setup can format and destroy data. Do not pass storage options unless you have selected the correct dedicated device and approved the destructive operation interactively. Storage setup requires both `--containerd-snapshotter-device` and `--format-device`. Never run those storage options on an existing host whose data must remain intact.
+
+## Verify the service
+
+Check the main service and independent reaper timer:
 
 ```bash
-systemctl status fireactions
+sudo systemctl status fireactions.service
+sudo systemctl status fireactions-reaper.timer
+fireactions pools list
 ```
 
-Expected output:
-
-```
-● fireactions.service - Fireactions
-     Loaded: loaded (/etc/systemd/system/fireactions.service; enabled; preset: enabled)
-     Active: active (running) since Mon 2024-12-09 10:30:15 UTC; 5min ago
-       Docs: https://github.com/hostinger/fireactions
-    Process: 3564 ExecStartPre=/usr/bin/which firecracker (code=exited, status=0/SUCCESS)
-    Process: 3566 ExecStartPre=/usr/bin/which containerd (code=exited, status=0/SUCCESS)
-   Main PID: 3571 (fireactions)
-      Tasks: 15
-     Memory: 45.2M
-        CPU: 2.134s
-```
-
-Refer to [Troubleshooting Guide](../help/troubleshooting.md) in case of issues.
+See [First build](first-build.md) to run a workflow after Forgejo Runner connects.

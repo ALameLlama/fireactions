@@ -1,82 +1,58 @@
-# Running Your First Build
+# Run your first build
 
-After installing and configuring Fireactions, verify your setup by running a test workflow.
+After you install Fireactions and register Forgejo Runner on the host, run a workflow that requests a configured profile label. A profile label uses the form `firecracker:firecracker://PROFILE`, where `PROFILE` is a name in the Fireactions host configuration.
 
-## Verify Runners Are Registered
+## Check the host services
 
-Check your GitHub organization's Actions settings to confirm runners are registered:
-
-1. Navigate to your GitHub organization settings
-2. Go to **Actions** → **Runners**
-3. Verify that runners are listed as **Idle** and ready to receive jobs
-
-If runners aren't appearing, check the Fireactions logs:
+Make sure the main host service is running and the independent reaper timer is enabled:
 
 ```bash
-sudo journalctl -u fireactions -f
+sudo systemctl status fireactions.service
+sudo systemctl status fireactions-reaper.timer
+fireactions pools list
 ```
 
-## Create a Test Workflow
+The supplied configuration keeps one clean idle VM for `ubuntu-24.04` and zero for `ubuntu-24.04-large`. If you need another idle VM, change the configured target with:
 
-Create a simple workflow to test your Fireactions setup. In your repository, create `.github/workflows/test-fireactions.yml`:
+```bash
+fireactions pools scale ubuntu-24.04 --replicas 2
+```
+
+A ready idle VM has never run a job. When a job claims it, Fireactions destroys that VM at the end of its lease and creates a clean replacement to restore the idle target. It does not reuse a VM or resume a job after a service restart.
+
+## Create a Forgejo workflow
+
+Create `.forgejo/workflows/fireactions.yml` in a Forgejo repository. Replace `ubuntu-24.04` with the exact pool name configured on your host.
 
 ```yaml
-name: Test Fireactions
-
+name: Fireactions test
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-  pull_request:
-
 jobs:
   test:
-    name: Test Runner
-    runs-on: fireactions-example  # Replace with your pool label
+    runs-on: firecracker:firecracker://ubuntu-24.04
     steps:
-      - name: Check runner environment
+      - name: Check the guest
         run: |
-          echo "Runner is working!"
+          id
           uname -a
-          docker --version
+          test -d /workspace
 ```
 
-**Important:** Replace `fireactions-example` with the label from your [pool configuration](../reference/configuration.md).
+The guest image creates the `ci` user and workspace. Configure the profile to use `default_user: ci` so workflow commands run with that account.
 
-## Run the Workflow
+## Run and observe the job
 
-Trigger the workflow using one of these methods:
+Start the workflow from the Forgejo Actions page. Forgejo Runner must run on the host and connect to `unix:///run/fireactions/plugin.sock`. The guest network must reach Forgejo when the workflow checks out a repository, and it must reach any other services used by the job.
 
-- **Manual trigger:** Go to Actions tab → Select workflow → Click "Run workflow"
-- **Push to main:** Commit and push changes to the main branch
-- **Pull request:** Open a pull request
+Use these commands on the host to inspect Fireactions:
 
-## Verify Execution
+```bash
+fireactions pools list
+fireactions ps
+sudo journalctl -u fireactions.service -f
+```
 
-Watch the workflow run in GitHub Actions:
+Fireactions supports Forgejo Runner protocol 13.2 on Linux. It does not support stdin, PTY, or signal RPC, service containers, or Docker-container actions. Do not use a workflow that depends on those features.
 
-1. Go to the **Actions** tab in your repository
-2. Click on the workflow run
-3. Verify the job completes successfully
-4. Check that it ran on a Fireactions runner
-
-## Expected Behavior
-
-When the workflow runs:
-
-1. Fireactions creates a new Firecracker microVM
-2. The GitHub runner inside the VM picks up the job
-3. Job executes in the isolated environment
-4. VM is destroyed after job completion
-
-You should see the workflow complete in ~20-30 seconds from trigger to finish.
-
-## Troubleshooting
-
-If the workflow doesn't run or fails:
-
-- Verify pool labels match between configuration and workflow
-- Check Fireactions logs for errors
-- Ensure sufficient system resources (CPU, memory, disk)
-- See the [Troubleshooting Guide](../help/troubleshooting.md) for common issues
+A timeout is a hard lease limit. Provisioning time counts toward the lease. At expiry Fireactions stops the VM, and cleanup grace applies only to resource cleanup. The reaper timer handles expired resources after a daemon crash.

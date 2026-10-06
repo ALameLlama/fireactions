@@ -24,6 +24,10 @@
 * Persist version-1 VM ownership before allocation and publication. Replay saved network configuration and verify process identities and resource labels during cleanup.
 * Add independent `reap --config`, startup reconciliation, and systemd reaper units. Destroy abandoned VMs without resuming jobs or deleting unrelated resources.
 * Stop VMs at their hard deadline without adding cleanup grace to execution. Bound cleanup attempts and retain unfinished ownership for retry.
+* Install the supplied fork binary on an existing host after nonmutating KVM, containerd/devmapper, CNI, resolver, VMM and kernel checks. Keep host preparation and destructive storage setup behind explicit options and approval.
+* Package the canonical Unix-socket host service and independent 10-second reaper timer. Preserve existing containerd, LVM and CNI in the default installer.
+* Remove forced container privilege dropping and the obsolete TCP port. Document the host privileges, shared namespaces and mounts required for container execution.
+* Complete Forgejo registration, guest build/import, clean idle profiles and lifecycle documentation. Replace the obsolete GitHub runner architecture diagram.
 
 ## [2.0.8](https://github.com/hostinger/fireactions/compare/v2.0.7...v2.0.8) (2026-09-15)
 
