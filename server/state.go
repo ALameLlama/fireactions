@@ -60,8 +60,8 @@ type stateRecord struct {
 	AllocationReady bool `json:"allocation_ready"`
 }
 
-// StateStore serializes short journal metadata sections with one advisory lock.
-// Allocation, boot, process waits, CNI, containerd and guest IO run outside it.
+// StateStore uses stable advisory locks for short journal metadata sections and
+// serialized resource reclamation. Process isolation never waits for reclamation.
 type StateStore struct {
 	root           string
 	dir            string
@@ -155,23 +155,64 @@ func secureStateDirectory(path string) error {
 }
 
 func (s *StateStore) lock(vmID string) (*os.File, error) {
+	return s.lockMetadata(context.Background(), context.Background(), vmID)
+}
+
+func (s *StateStore) lockMetadata(ctx, caller context.Context, vmID string) (*os.File, error) {
 	if !profileNamePattern.MatchString(vmID) {
 		return nil, fmt.Errorf("invalid journal VM ID")
 	}
 	// Never unlink this lock: waiters must always open the same inode. Legacy
 	// per-VM .lock files can only be retired with every old daemon/reaper stopped;
 	// flock cannot prove there are no old-version waiters on those inodes.
-	const name = ".metadata.lock"
+	return s.lockJournal(ctx, caller, ".metadata.lock")
+}
+
+// These lock files must never be unlinked: independently opened stores and
+// processes must rendezvous on the same inode, regardless of VM churn.
+func (s *StateStore) lockJournal(ctx, caller context.Context, name string) (*os.File, error) {
 	fd, err := unix.Open(filepath.Join(s.dir, name), unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0600)
 	if err != nil {
 		return nil, err
 	}
 	f := os.NewFile(uintptr(fd), name)
-	if err := unix.Flock(fd, unix.LOCK_EX); err != nil {
+	var ticker *time.Ticker
+	for {
+		if err := ctx.Err(); err != nil {
+			f.Close()
+			return nil, err
+		}
+		if ticker != nil {
+			if err := caller.Err(); err != nil {
+				f.Close()
+				return nil, err
+			}
+		}
+		err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			return f, nil
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EINTR) {
+			f.Close()
+			return nil, err
+		}
+		// An already-canceled caller may still isolate and clean up immediately,
+		// but contention must not extend its wait or the cleanup grace.
+		if ticker == nil {
+			ticker = time.NewTicker(10 * time.Millisecond)
+			defer ticker.Stop()
+		}
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+		case <-caller.Done():
+			err = caller.Err()
+		case <-ticker.C:
+			continue
+		}
 		f.Close()
 		return nil, err
 	}
-	return f, nil
 }
 
 func (s *StateStore) recordPath(vmID string) string { return filepath.Join(s.dir, vmID+".json") }
@@ -467,7 +508,9 @@ func (s *StateStore) reconcile(ctx context.Context, startup bool) ([]string, err
 			return removed, errors.Join(append(failures, err)...)
 		}
 		vmID := strings.TrimSuffix(entry.Name(), ".json")
-		lock, err := s.lock(vmID)
+		wait, cancelWait := cleanupContext(ctx, s.cleanupGrace)
+		lock, err := s.lockMetadata(wait, ctx, vmID)
+		cancelWait()
 		if err != nil {
 			failures = append(failures, err)
 			continue
@@ -563,7 +606,12 @@ func cleanupContext(ctx context.Context, grace time.Duration) (context.Context, 
 }
 
 func (s *StateStore) destroyRecord(ctx context.Context, vmID string) error {
-	lock, err := s.lock(vmID)
+	attempt, cancel := cleanupContext(ctx, s.cleanupGrace)
+	defer cancel()
+	if !profileNamePattern.MatchString(vmID) {
+		return fmt.Errorf("invalid journal VM ID")
+	}
+	lock, err := s.lockJournal(attempt, attempt, ".metadata.lock")
 	if err != nil {
 		return err
 	}
@@ -576,43 +624,69 @@ func (s *StateStore) destroyRecord(ctx context.Context, vmID string) error {
 		lock.Close()
 		return err
 	}
+	var persistenceErr error
 	if r.State != "removing" {
 		r.State = "removing"
-		if persistenceErr := s.writeRecord(r); persistenceErr != nil {
-			lock.Close()
-			attempt, cancel := cleanupContext(ctx, s.cleanupGrace)
-			defer cancel()
-			return errors.Join(persistenceErr, stopRecordedProcesses(attempt, r))
-		}
-		if s.profiles[r.Profile] && r.ExpiresAt != nil && !time.Now().Before(*r.ExpiresAt) {
+		persistenceErr = s.writeRecord(r)
+		if persistenceErr == nil && s.profiles[r.Profile] && r.ExpiresAt != nil && !time.Now().Before(*r.ExpiresAt) {
 			metricVMTTLExpirations.WithLabelValues(r.Profile).Inc()
 		}
-	} else if persistenceErr := s.syncDirectory(); persistenceErr != nil {
-		lock.Close()
-		attempt, cancel := cleanupContext(ctx, s.cleanupGrace)
-		defer cancel()
-		return errors.Join(persistenceErr, stopRecordedProcesses(attempt, r))
+	} else {
+		persistenceErr = s.syncDirectory()
 	}
-	alive, err := ownerAlive(r)
+	lock.Close()
+	// Execution isolation precedes the global reclamation queue, even when
+	// revocation persistence failed. No resources may be deleted in that case.
+	if err := errors.Join(persistenceErr, stopRecordedProcesses(attempt, r)); err != nil {
+		return err
+	}
+	reclamation, err := s.lockJournal(attempt, ctx, ".reclamation.lock")
+	if err != nil {
+		return err
+	}
+	defer reclamation.Close()
+	lock, err = s.lockJournal(attempt, attempt, ".metadata.lock")
+	if err != nil {
+		return err
+	}
+	// A previous reclaimer may have retired or replaced the record while this
+	// caller waited. Only the freshly validated authority can permit cleanup.
+	latest, err := s.readRecord(vmID)
+	if alreadyGone(err) {
+		lock.Close()
+		return nil
+	}
+	if err != nil {
+		lock.Close()
+		return err
+	}
+	if latest.InstanceID != r.InstanceID || !latest.CreatedAt.Equal(r.CreatedAt) || latest.State != "removing" {
+		lock.Close()
+		return fmt.Errorf("journal authority changed before cleanup")
+	}
+	if err := s.syncDirectory(); err != nil {
+		lock.Close()
+		return err
+	}
+	alive, err := ownerAlive(latest)
 	lock.Close()
 	if err != nil {
 		return err
 	}
+	r = latest
 	active := alive && r.ProvisioningActive
-	attempt, cancel := cleanupContext(ctx, s.cleanupGrace)
-	defer cancel()
 	if err := s.cleanup(attempt, r, active); err != nil {
 		return err
 	}
 	if active {
 		return fmt.Errorf("retained removing tombstone while live provisioning settles")
 	}
-	lock, err = s.lock(vmID)
+	lock, err = s.lockJournal(attempt, attempt, ".metadata.lock")
 	if err != nil {
 		return err
 	}
 	defer lock.Close()
-	latest, err := s.readRecord(vmID)
+	latest, err = s.readRecord(vmID)
 	if alreadyGone(err) {
 		return nil
 	}
@@ -626,7 +700,7 @@ func (s *StateStore) destroyRecord(ctx context.Context, vmID string) error {
 	if alive && latest.ProvisioningActive {
 		return fmt.Errorf("retained live provisioning tombstone")
 	}
-	if latest.InstanceID != r.InstanceID || latest.State != "removing" {
+	if latest.InstanceID != r.InstanceID || !latest.CreatedAt.Equal(r.CreatedAt) || latest.State != "removing" {
 		return fmt.Errorf("journal authority changed during cleanup")
 	}
 	if err := os.Remove(s.recordPath(vmID)); err != nil && !alreadyGone(err) {

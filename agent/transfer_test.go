@@ -20,11 +20,12 @@ import (
 
 type copyInTestStream struct {
 	agentv1.AgentService_CopyInServer
-	ctx      context.Context
-	chunks   []*agentv1.CopyInChunk
-	response *agentv1.CopyInResponse
-	index    int
-	onEnd    func() error
+	ctx        context.Context
+	chunks     []*agentv1.CopyInChunk
+	response   *agentv1.CopyInResponse
+	index      int
+	beforeRecv func(int) error
+	onEnd      func() error
 }
 
 func (s *copyInTestStream) Context() context.Context { return s.ctx }
@@ -36,6 +37,11 @@ func (s *copyInTestStream) Recv() (*agentv1.CopyInChunk, error) {
 			return nil, onEnd()
 		}
 		return nil, io.EOF
+	}
+	if s.beforeRecv != nil {
+		if err := s.beforeRecv(s.index); err != nil {
+			return nil, err
+		}
 	}
 	chunk := s.chunks[s.index]
 	s.index++
@@ -647,6 +653,111 @@ func TestCopyInDuplicateHardlinksLeaveNoTemporaryNames(t *testing.T) {
 	bInfo, err := os.Stat(filepath.Join(directory, "b"))
 	if err != nil || !os.SameFile(aInfo, bInfo) {
 		t.Fatalf("hardlink inode mismatch: %v", err)
+	}
+}
+
+func TestCopyInHardlinkTargetsMustBelongToCurrentUpload(t *testing.T) {
+	for _, replaceUploaded := range []bool{false, true} {
+		name := "preexisting"
+		if replaceUploaded {
+			name = "replaced uploaded inode"
+		}
+		t.Run(name, func(t *testing.T) {
+			a, workspace := newTransferTestAgent(t, 1<<20, 20)
+			destination := filepath.Join(workspace, "dest")
+			if err := os.Mkdir(destination, 0755); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(t.TempDir(), "marker")
+			stamp := time.Unix(1_700_000_000, 123_456_789)
+			if err := os.WriteFile(marker, []byte("outside-only"), 0640); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(marker, 0640); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(marker, stamp, stamp); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.Stat(marker)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(destination, "target")
+			hardlink := &tar.Header{Name: "hard", Typeflag: tar.TypeLink, Linkname: "target", Mode: 0777, ModTime: stamp.Add(time.Hour), Format: tar.FormatPAX}
+			var stream *copyInTestStream
+			if replaceUploaded {
+				archive := makeTar(t,
+					&tar.Header{Name: "target", Typeflag: tar.TypeReg, Mode: 0600, Size: 2, Linkname: "ok"},
+					hardlink,
+				)
+				// The second request is consumed only after the first regular
+				// file has been extracted and published.
+				stream = copyInChunks(context.Background(), firstChunk("/workspace/dest", archive[:1024]), &agentv1.CopyInChunk{Data: archive[1024:]})
+				stream.beforeRecv = func(index int) error {
+					if index != 1 {
+						return nil
+					}
+					if err := os.Remove(target); err != nil {
+						return err
+					}
+					return os.Link(marker, target)
+				}
+			} else {
+				if err := os.Link(marker, target); err != nil {
+					t.Fatal(err)
+				}
+				stream = copyInChunks(context.Background(), firstChunk("/workspace/dest", makeTar(t, hardlink)))
+			}
+			requireCode(t, a.CopyIn(stream), codes.InvalidArgument)
+			if stream.response != nil {
+				t.Fatal("rejected upload reported success")
+			}
+			after, err := os.Stat(marker)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(marker)
+			if err != nil || string(data) != "outside-only" || !os.SameFile(before, after) || before.Mode() != after.Mode() || !before.ModTime().Equal(after.ModTime()) {
+				t.Fatalf("outside marker changed: before=%v after=%v content=%q err=%v", before, after, data, err)
+			}
+			entries, err := os.ReadDir(destination)
+			if err != nil || len(entries) != 1 || entries[0].Name() != "target" {
+				t.Fatalf("rejected upload left names: %v, %v", entries, err)
+			}
+		})
+	}
+}
+
+func TestCopyInPreservesCurrentUploadHardlinkChains(t *testing.T) {
+	a, workspace := newTransferTestAgent(t, 1<<20, 20)
+	stamp := time.Unix(1_700_000_000, 123_456_789)
+	archive := makeTar(t,
+		&tar.Header{Name: "original", Typeflag: tar.TypeReg, Mode: 0600, Size: 7, Linkname: "payload"},
+		&tar.Header{Name: "nested/first", Typeflag: tar.TypeLink, Linkname: "original", Mode: 0640},
+		&tar.Header{Name: "nested/second", Typeflag: tar.TypeLink, Linkname: "nested/first", Mode: 0751, ModTime: stamp, Format: tar.FormatPAX},
+	)
+	if err := a.CopyIn(copyInChunks(context.Background(), firstChunk("/workspace/dest", archive))); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.Stat(filepath.Join(workspace, "dest", "original"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"original", "nested/first", "nested/second"} {
+		fullName := filepath.Join(workspace, "dest", name)
+		info, err := os.Stat(fullName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(fullName)
+		if err != nil || string(data) != "payload" || !os.SameFile(original, info) || info.Mode().Perm() != 0751 || !info.ModTime().Equal(stamp) {
+			t.Fatalf("hardlink %q: info=%v content=%q err=%v", name, info, data, err)
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(workspace, "dest"))
+	if err != nil || len(entries) != 2 || entries[0].Name() != "nested" || entries[1].Name() != "original" {
+		t.Fatalf("successful upload left unexpected names: %v, %v", entries, err)
 	}
 }
 

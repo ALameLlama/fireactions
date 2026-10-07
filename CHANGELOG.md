@@ -12,6 +12,11 @@
 * Use one journal metadata lock instead of retaining a lock file for every completed VM. Resolve Firecracker executables through PATH.
 * Restart Containerd after explicit storage initialization and use the registered Runner label name in the first-build workflow.
 * Give real-VM integration tests a dedicated socket directory that follows the server permission policy.
+* Reject untrusted Unix socket ancestors and give newly created directories access for the configured socket group.
+* Serialize resource reclamation across daemon and reaper processes without delaying VM isolation behind cleanup waits.
+* Restrict uploaded hard links to files from the same upload and preserve metadata on files outside the transfer destination.
+* Bound directory descriptors during deep archive exports and keep wide uploads within low descriptor limits.
+* Match the documented Docker guest image platform to the agent binary architecture.
 
 ### Changed
 

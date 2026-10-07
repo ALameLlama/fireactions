@@ -22,6 +22,9 @@ At hard expiry, Fireactions cancels active work and stops the VM. `leases.cleanu
 
 At host daemon startup, Fireactions destroys old claimed and idle VMs before it accepts jobs. It does not resume an old job. Protect the journal and host state directory. If a journal record is corrupt, do not delete it without resolving the recorded resources.
 
+The daemon and independent reaper share a lock for resource reclamation. They stop recorded VM processes before waiting for this lock. Cleanup waits remain bounded by the configured cleanup grace.
+Do not remove journal lock files while a daemon or reaper can use the state directory.
+
 ## Host and guest roles
 
 Forgejo Runner runs on the host and connects to `unix:///run/fireactions/plugin.sock`. Its registration token stays in a host-only file with mode `0600`. Do not copy the token into a guest image or plugin configuration.
@@ -30,6 +33,12 @@ The guest runs a systemd unit for the Fireactions agent. The guest image creates
 The host service needs KVM, containerd, CNI, network, and guest-rootfs privileges. Fireactions does not add Firecracker jailer isolation. Do not treat this setup as a security boundary against a malicious job that can exploit a host weakness.
 
 Runner resource cap adjustments are advisory and ignored by Fireactions. Fireactions does not provide service containers, Docker-container actions, SSH login, guest passwords, stdin, PTY, or signal RPC.
+
+## File transfers
+
+Fireactions transfers files as tar archives within the guest workspace. Hard links in an upload must target a regular file created earlier in that upload. Pre-existing destination files cannot be hard-link targets. Hard-link chains within the same upload remain supported.
+
+Archive exports keep directory descriptors bounded, including for deeply nested directory trees. Transfer byte and entry limits still apply.
 
 ## Retained names
 

@@ -49,7 +49,13 @@ pools:
 
 `socket_path` selects the local Unix socket for the Forgejo runner plugin. `socket_group` names the Unix group that can access this socket. `state_dir` stores private VM ownership records and runtime state. Use absolute, clean paths. Do not share this state directory between Fireactions servers.
 
-Use a dedicated directory for `socket_path`, such as `/run/fireactions`. Fireactions rejects sockets directly in `/run`, `/var/run`, `/tmp`, or `/var/tmp`. For a new socket directory, Fireactions sets the owner to `root`, the group to `socket_group`, and the mode to `0750`. An existing directory must already have this owner, group, and mode. Fireactions does not change the permissions of an existing directory. The socket itself uses mode `0660`.
+Use a dedicated, real directory for `socket_path`, such as `/run/fireactions`. Fireactions rejects sockets directly in `/`, `/run`, `/var/run`, `/tmp`, or `/var/tmp`. The socket itself uses mode `0660`.
+
+Every ancestor directory must be owned by `root`. An ancestor must not allow group or other writes unless it has the sticky bit. The sticky bit prevents users from replacing entries that belong to other users. Root-owned sticky directories, such as `/tmp`, can contain root-owned socket directories. User-owned ancestors are not accepted, even with the sticky bit.
+
+Ancestor symlinks must be owned by `root`. Directories that contain these symlinks and directories in their resolved targets must satisfy the same ancestor policy. Fireactions accepts trusted aliases, such as `/var/run` pointing to `/run`. The socket directory itself cannot be a symlink.
+
+For every new directory in the socket path, Fireactions sets the owner to `root`, the group to `socket_group`, and the mode to `0750`. This lets members of `socket_group` traverse newly created nested directories. An existing socket directory must already have this owner, group, and mode, without special mode bits. Fireactions does not change the ownership or permissions of existing directories. Existing ancestors must also allow members of `socket_group` to traverse the path for clients to connect.
 
 `containerd.address` selects the containerd socket. `containerd.namespace` selects the namespace that stores guest images and snapshots. Import each guest image into this namespace. Containerd namespaces separate image names and snapshots.
 

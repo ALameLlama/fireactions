@@ -926,6 +926,7 @@ func TestPreallocationPreservesForeignEmptyDirectory(t *testing.T) {
 
 func TestJournalLocksStayBoundedAcrossDistinctLifecycles(t *testing.T) {
 	s := newTestStateStore(t)
+	var stableLocks map[string]os.FileInfo
 	for i := range 128 {
 		vmID := fmt.Sprintf("ubuntu-lifecycle-%d", i)
 		if err := s.create(testStateRecord(s, "ubuntu", vmID, "idle", nil)); err != nil {
@@ -937,13 +938,34 @@ func TestJournalLocksStayBoundedAcrossDistinctLifecycles(t *testing.T) {
 		if _, err := s.State(vmID); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("destroyed record remained authoritative: %v", err)
 		}
+		if i == 0 {
+			stableLocks = make(map[string]os.FileInfo)
+			entries, err := os.ReadDir(s.dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				info, err := entry.Info()
+				if err != nil {
+					t.Fatal(err)
+				}
+				stableLocks[entry.Name()] = info
+			}
+		}
 	}
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 || !strings.HasSuffix(entries[0].Name(), ".lock") {
-		t.Fatalf("successful lifecycles left unbounded journal artifacts: %v", entries)
+	if len(entries) != len(stableLocks) {
+		t.Fatalf("successful lifecycles grew journal artifacts: %v", entries)
+	}
+	for _, entry := range entries {
+		info, err := entry.Info()
+		before, ok := stableLocks[entry.Name()]
+		if err != nil || !ok || !strings.HasSuffix(entry.Name(), ".lock") || !os.SameFile(before, info) {
+			t.Fatalf("journal lock was removed/replaced across lifecycles: %s %v", entry.Name(), err)
+		}
 	}
 }
 
@@ -990,6 +1012,24 @@ func TestJournalMetadataProcessHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	fmt.Println("attempting")
+	if mode == "reclamation" {
+		s.cleanupGrace = 5 * time.Second
+		s.cleanup = cleanupSavedJournalNetwork
+		signaled := false
+		s.syncDir = func(file *os.File) error {
+			err := file.Sync()
+			if !signaled {
+				fmt.Println("revoked")
+				signaled = true
+			}
+			return err
+		}
+		if err := s.destroyRecord(context.Background(), "ubuntu-reclamation"); err != nil {
+			t.Fatal(err)
+		}
+		fmt.Println("finished")
+		return
+	}
 	expiry := time.Now().Add(time.Minute)
 	if mode == "cleanup-race" {
 		if err := s.publish("ubuntu-first", "claimed", &expiry); err == nil {
@@ -1151,5 +1191,288 @@ func TestJournalCleanupAllowsCollidingProcessUpdateWithoutLosingAuthority(t *tes
 		if _, err := s.State(vmID); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("reaper retained colliding record %s: %v", vmID, err)
 		}
+	}
+}
+
+func cleanupSavedJournalNetwork(ctx context.Context, r *stateRecord, _ bool) error {
+	return deleteOwnedNetwork(ctx, &ownedResources{cniConfig: r.CNIConfig, cniBinPaths: r.CNIBinPaths, cniCacheDir: r.CNICacheDir, netnsPath: r.NetNSPath, cniIfName: r.CNIIfName, cniArgs: r.CNIArgs}, r.VMID)
+}
+
+func waitJournalFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", path)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestJournalReclamationSerializesIndependentStoresAndProcesses(t *testing.T) {
+	for _, acrossProcess := range []bool{false, true} {
+		name := "independent-stores"
+		if acrossProcess {
+			name = "independent-processes"
+		}
+		t.Run(name, func(t *testing.T) {
+			s := newTestStateStore(t)
+			s.cleanupGrace = 5 * time.Second
+			dir := t.TempDir()
+			entered := filepath.Join(dir, "entered")
+			release := filepath.Join(dir, "release")
+			calls := filepath.Join(dir, "calls")
+			overlap := filepath.Join(dir, "overlap")
+			resource := filepath.Join(dir, "owned-resource")
+			active := filepath.Join(dir, "active")
+			if err := os.WriteFile(resource, []byte("owned"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := unix.Mkfifo(release, 0600); err != nil {
+				t.Fatal(err)
+			}
+			// The real DEL executable detects concurrent entry and mutates an
+			// owned resource. A replay after retirement also leaves another call.
+			script := "#!/bin/sh\nprintf 'DEL\\n' >> '" + calls + "'\n" +
+				"mkdir '" + active + "' || { printf overlap > '" + overlap + "'; exit 1; }\n" +
+				"printf entered > '" + entered + "'\nIFS= read -r release < '" + release + "'\n" +
+				"rm -f '" + resource + "'\nrmdir '" + active + "'\n"
+			if err := os.WriteFile(filepath.Join(dir, "serialized-network"), []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			r := testStateRecord(s, "ubuntu", "ubuntu-reclamation", "idle", nil)
+			r.CNIConfig = []byte(`{"cniVersion":"1.0.0","name":"serialized-network","plugins":[{"type":"serialized-network"}]}`)
+			r.CNIBinPaths = []string{dir}
+			if err := s.create(r); err != nil {
+				t.Fatal(err)
+			}
+			s.cleanup = cleanupSavedJournalNetwork
+			firstDone := make(chan error, 1)
+			go func() { firstDone <- s.destroyRecord(context.Background(), r.VMID) }()
+			waitJournalFile(t, entered)
+			var cmd *exec.Cmd
+			var lines <-chan string
+			secondDone := make(chan error, 1)
+			if acrossProcess {
+				var input io.WriteCloser
+				cmd, lines, input = startJournalMetadataHelper(t, s, "reclamation")
+				if _, err := io.WriteString(input, "go\n"); err != nil {
+					t.Fatal(err)
+				}
+				expectJournalHelperLine(t, lines, "attempting")
+				expectJournalHelperLine(t, lines, "revoked")
+			} else {
+				second := *s
+				revoked := make(chan struct{}, 1)
+				second.syncDir = func(file *os.File) error {
+					err := file.Sync()
+					select {
+					case revoked <- struct{}{}:
+					default:
+					}
+					return err
+				}
+				go func() { secondDone <- second.destroyRecord(context.Background(), r.VMID) }()
+				select {
+				case <-revoked:
+				case <-time.After(5 * time.Second):
+					t.Fatal("second store did not revoke before waiting")
+				}
+			}
+			select {
+			case err := <-secondDone:
+				t.Fatalf("pending cleanup returned before first finished: %v", err)
+			case line := <-lines:
+				t.Fatalf("pending process returned before first finished: %s", line)
+			case <-time.After(100 * time.Millisecond):
+			}
+			if data, err := os.ReadFile(calls); err != nil || string(data) != "DEL\n" {
+				t.Fatalf("same-VM reclamation overlapped: %q %v", data, err)
+			}
+			if _, err := os.Stat(overlap); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("network cleanup entered concurrently: %v", err)
+			}
+			fd, err := unix.Open(release, unix.O_WRONLY|unix.O_NONBLOCK, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = unix.Write(fd, []byte("release\n"))
+			unix.Close(fd)
+			if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-firstDone:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("first reclamation did not finish")
+			}
+			if acrossProcess {
+				expectJournalHelperLine(t, lines, "finished")
+				if err := cmd.Wait(); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				select {
+				case err := <-secondDone:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("pending store replayed cleanup after retirement")
+				}
+			}
+			if data, err := os.ReadFile(calls); err != nil || string(data) != "DEL\n" {
+				t.Fatalf("retired authority replayed network cleanup: %q %v", data, err)
+			}
+			if _, err := os.Stat(resource); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("owned resource was not reclaimed: %v", err)
+			}
+			if _, err := s.State(r.VMID); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("completed reclamation retained authority: %v", err)
+			}
+		})
+	}
+}
+
+func TestJournalReclamationWaitIsBoundedAndIsolatesBeforeWaiting(t *testing.T) {
+	for _, mode := range []string{"cancellation", "deadline", "cleanup-grace"} {
+		t.Run(mode, func(t *testing.T) {
+			s := newTestStateStore(t)
+			s.cleanupGrace = 2 * time.Second
+			lock, err := s.lockJournal(context.Background(), context.Background(), ".reclamation.lock")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lock.Close()
+			expiry := time.Now().Add(-time.Second)
+			r := testStateRecord(s, "ubuntu", "ubuntu-expired", "claimed", &expiry)
+			process := startJournalProcess(t, r)
+			resource := filepath.Join(t.TempDir(), "owned-resource")
+			if err := os.WriteFile(resource, []byte("owned"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.create(r); err != nil {
+				t.Fatal(err)
+			}
+			s.cleanup = func(context.Context, *stateRecord, bool) error { return os.Remove(resource) }
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			want := context.Canceled
+			if mode == "deadline" {
+				ctx, cancel = context.WithTimeout(context.Background(), 500*time.Millisecond)
+				defer cancel()
+				want = context.DeadlineExceeded
+			} else if mode == "cleanup-grace" {
+				s.cleanupGrace = 500 * time.Millisecond
+				want = context.DeadlineExceeded
+			}
+			done := make(chan error, 1)
+			started := time.Now()
+			go func() { done <- s.destroyRecord(ctx, r.VMID) }()
+			if !journalProcessExited(t, process, 300) {
+				t.Fatal("expired VMM execution survived blocked reclamation")
+			}
+			if mode == "cancellation" {
+				cancel()
+			}
+			select {
+			case err := <-done:
+				if !errors.Is(err, want) {
+					t.Fatalf("lock wait returned %v, want %v", err, want)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("reclamation lock exceeded cancellation/cleanup budget")
+			}
+			if time.Since(started) > time.Second {
+				t.Fatal("reclamation lock wait exceeded bounded cleanup budget")
+			}
+			if _, err := os.Stat(resource); err != nil {
+				t.Fatalf("waiting caller deleted resources before lock: %v", err)
+			}
+			if state, err := s.State(r.VMID); err != nil || state != "removing" {
+				t.Fatalf("interrupted reclamation lost retry authority: %s %v", state, err)
+			}
+			if err := lock.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.destroyRecord(context.Background(), r.VMID); err != nil {
+				t.Fatalf("interrupted lock wait could not retry: %v", err)
+			}
+			if _, err := os.Stat(resource); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("retry failed to reclaim resource: %v", err)
+			}
+		})
+	}
+}
+
+func TestJournalReclamationRejectsReplacedAuthorityAfterWaiting(t *testing.T) {
+	s := newTestStateStore(t)
+	s.cleanupGrace = 5 * time.Second
+	r := testStateRecord(s, "ubuntu", "ubuntu-replaced", "idle", nil)
+	if err := s.create(r); err != nil {
+		t.Fatal(err)
+	}
+	resource := filepath.Join(t.TempDir(), "owned-resource")
+	if err := os.WriteFile(resource, []byte("owned"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s.cleanup = func(context.Context, *stateRecord, bool) error { return os.Remove(resource) }
+	lock, err := s.lockJournal(context.Background(), context.Background(), ".reclamation.lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	revoked := make(chan struct{}, 1)
+	s.syncDir = func(file *os.File) error {
+		err := file.Sync()
+		select {
+		case revoked <- struct{}{}:
+		default:
+		}
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.destroyRecord(context.Background(), r.VMID) }()
+	select {
+	case <-revoked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cleanup did not revoke before waiting")
+	}
+	// Model a completed prior lifecycle and a new record with the same VM and
+	// instance IDs. Creation time distinguishes the new allocation authority.
+	if err := s.update(r.VMID, func(latest *stateRecord) error {
+		latest.CreatedAt = r.CreatedAt.Add(time.Second)
+		latest.State = "idle"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("waiting reclaimer accepted replaced allocation authority")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiting reclaimer did not settle")
+	}
+	if _, err := os.Stat(resource); err != nil {
+		t.Fatalf("old reclaimer deleted new allocation resources: %v", err)
+	}
+	if state, err := s.State(r.VMID); err != nil || state != "idle" {
+		t.Fatalf("old reclaimer revoked/retired new allocation: %s %v", state, err)
+	}
+	if err := s.destroyRecord(context.Background(), r.VMID); err != nil {
+		t.Fatalf("new allocation was not independently reclaimable: %v", err)
 	}
 }

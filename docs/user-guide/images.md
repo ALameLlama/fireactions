@@ -12,6 +12,8 @@ Fireactions does not support SSH login or a default guest password. Do not add e
 
 ## Build and export the supplied image
 
+The guest image, kernel, and agent binary must match the host architecture. The examples below use amd64. For a native arm64 host and guest, use `GOARCH=arm64` and Docker's `--platform linux/arm64` instead.
+
 From the repository root, build the static Linux amd64 `fireactions` binary. The guest image build copies this fork-built binary into the guest:
 
 ```bash
@@ -21,7 +23,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o fireactions ./cmd/fireactions
 Build from the repository root. The Docker build uses the `fireactions` binary at the repository root.
 
 ```bash
-docker build -f images/ubuntu-24.04/Dockerfile \
+docker build --platform linux/amd64 -f images/ubuntu-24.04/Dockerfile \
   -t localhost/fireactions-guest:ubuntu-24.04 .
 docker save -o fireactions-guest.tar \
   localhost/fireactions-guest:ubuntu-24.04
