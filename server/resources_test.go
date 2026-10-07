@@ -330,3 +330,78 @@ func TestNetworkNamespaceConflictDoesNotAdoptUnownedPath(t *testing.T) {
 		t.Fatalf("already absent namespace is not idempotent: %v", err)
 	}
 }
+
+func TestResolveVMMBinaryUsesHostPATHSelectionAndCanonicalIdentity(t *testing.T) {
+	root := t.TempDir()
+	binDir := filepath.Join(root, "bin")
+	if err := os.Mkdir(binDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "firecracker-real")
+	if err := os.WriteFile(target, []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(binDir, "firecracker")
+	if err := os.Symlink("../firecracker-real", link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+	selected, err := executablePath("firecracker")
+	if err != nil || selected != link {
+		t.Fatalf("host PATH selection: %q %v", selected, err)
+	}
+	canonical, err := resolveVMMBinary("firecracker")
+	if err != nil || canonical != target {
+		t.Fatalf("PATH-only provisioning canonicalization: %q %v", canonical, err)
+	}
+	var actual, expected unix.Stat_t
+	if err := unix.Stat(canonical, &actual); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Stat(target, &expected); err != nil {
+		t.Fatal(err)
+	}
+	if actual.Dev != expected.Dev || actual.Ino != expected.Ino {
+		t.Fatal("canonical PATH binary has the wrong executable identity")
+	}
+}
+
+func TestResolveVMMBinaryPreservesExplicitPaths(t *testing.T) {
+	root := t.TempDir()
+	explicit := filepath.Join(root, "configured-firecracker")
+	if err := os.WriteFile(explicit, []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	pathBinary := filepath.Join(root, "firecracker")
+	if err := os.WriteFile(pathBinary, []byte("#!/bin/sh\nexit 1\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", root)
+	link := filepath.Join(root, "explicit-link")
+	if err := os.Symlink(explicit, link); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{explicit, link} {
+		canonical, err := resolveVMMBinary(path)
+		if err != nil || canonical != explicit {
+			t.Fatalf("configured path was replaced by PATH selection: %q %v", canonical, err)
+		}
+	}
+}
+
+func TestResolveVMMBinaryRejectsNonExecutablesAndRelativePaths(t *testing.T) {
+	root := t.TempDir()
+	notExecutable := filepath.Join(root, "firecracker")
+	if err := os.WriteFile(notExecutable, []byte("not executable"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{notExecutable, root, filepath.Join(root, "missing"), "./firecracker"} {
+		if _, err := resolveVMMBinary(path); err == nil {
+			t.Fatalf("invalid configured executable accepted: %q", path)
+		}
+	}
+	t.Setenv("PATH", root)
+	if _, err := resolveVMMBinary("firecracker"); err == nil {
+		t.Fatal("nonexecutable PATH binary accepted")
+	}
+}

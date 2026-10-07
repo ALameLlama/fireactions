@@ -558,9 +558,24 @@ func pidfdExited(fd, timeoutMillis int) (bool, error) {
 }
 
 func resolveVMMBinary(path string) (string, error) {
-	absolute, err := filepath.Abs(path)
+	selected, err := executablePath(path)
 	if err != nil {
 		return "", err
 	}
-	return filepath.EvalSymlinks(absolute)
+	absolute, err := filepath.Abs(selected)
+	if err != nil {
+		return "", err
+	}
+	canonical, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(canonical)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
+		return "", fmt.Errorf("Firecracker binary %q is not an executable regular file", canonical)
+	}
+	return canonical, nil
 }
