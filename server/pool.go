@@ -145,15 +145,9 @@ func (p *Pool) Run() {
 		}
 
 		p.retryRemovals()
-		desiredReplicas := p.GetReplicas()
 
-		if !p.IsActive() {
-			p.logger.Debug().Msgf("Pool %s is paused, skipping scaling", p.config.Name)
-			continue
-		}
-
-		// Scale to desired replicas
-		if err := p.Scale(p.ctx, desiredReplicas); err != nil {
+		// Reconcile the current target without changing it.
+		if err := p.reconcileScale(p.ctx); err != nil {
 			// Don't log errors if context was cancelled (pool is stopping)
 			if p.ctx.Err() == nil {
 				p.logger.Error().Err(err).Msg("Failed to scale pool")
@@ -206,7 +200,7 @@ func (p *Pool) GetDir() string {
 	return filepath.Join(p.stateDir, "pools", p.config.Name)
 }
 
-// Scale reconciles the number of ready clean-idle VMs to desiredReplicas.
+// Scale changes the desired replica count and reconciles ready clean-idle VMs.
 func (p *Pool) Scale(ctx context.Context, desiredReplicas int) error {
 	if desiredReplicas < 0 || desiredReplicas > math.MaxInt32 {
 		return fmt.Errorf("replica count must fit a nonnegative int32")
@@ -226,6 +220,25 @@ func (p *Pool) Scale(ctx context.Context, desiredReplicas int) error {
 		return nil
 	}
 	p.reconcileScaleLocked(ctx, desiredReplicas)
+	return nil
+}
+
+// reconcileScale reads the desired count under the same lock as target changes,
+// so a reconciliation can never restore a superseded target.
+func (p *Pool) reconcileScale(ctx context.Context) error {
+	p.l.Lock()
+	defer p.l.Unlock()
+	if err := p.ctx.Err(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !p.isActive {
+		p.cancelIdleProvisioningLocked()
+		return nil
+	}
+	p.reconcileScaleLocked(ctx, p.GetReplicas())
 	return nil
 }
 
@@ -388,6 +401,10 @@ func (p *Pool) Pause() {
 
 func (p *Pool) Resume() {
 	p.l.Lock()
+	if p.isActive {
+		p.l.Unlock()
+		return
+	}
 	p.isActive = true
 	p.scaleGeneration++
 	p.l.Unlock()
@@ -611,14 +628,18 @@ func (p *Pool) createIdleMachine(ctx context.Context, id uint64, provision *idle
 	if err := startupCtx.Err(); err != nil {
 		return errors.Join(err, p.destroyUnpublishedMachine(machine))
 	}
+	return p.publishIdleMachine(startupCtx, machine, id, provision)
+}
 
+// publishIdleMachine admits a ready VM only while its provisioning is desired.
+func (p *Pool) publishIdleMachine(ctx context.Context, machine *Machine, id uint64, provision *idleProvision) error {
 	p.l.Lock()
 	currentProvision := p.idleProvisioning[id]
-	if p.ctx.Err() != nil || !p.isActive || startupCtx.Err() != nil ||
+	if p.ctx.Err() != nil || !p.isActive || ctx.Err() != nil ||
 		provision.cancelled || currentProvision != provision ||
 		provision.generation != p.scaleGeneration {
 		p.l.Unlock()
-		cause := startupCtx.Err()
+		cause := ctx.Err()
 		if cause == nil {
 			cause = fmt.Errorf("idle provisioning is no longer desired")
 		}
@@ -644,7 +665,7 @@ func (p *Pool) createIdleMachine(ctx context.Context, id uint64, provision *idle
 	}
 	delete(p.idleProvisioning, id)
 	p.machines[machine.Name] = machine
-	if err := startupCtx.Err(); err != nil || p.ctx.Err() != nil {
+	if err := ctx.Err(); err != nil || p.ctx.Err() != nil {
 		delete(p.machines, machine.Name)
 		machine.SetState("removing", "")
 		p.machinesMu.Unlock()

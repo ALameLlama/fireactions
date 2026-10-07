@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/firecracker-microvm/firecracker-go-sdk"
 	"github.com/hostinger/fireactions/internal/executor"
 	"github.com/rs/zerolog"
 	"golang.org/x/sys/unix"
@@ -227,6 +228,124 @@ func TestPoolPauseStateIsSynchronized(t *testing.T) {
 	}
 	if err := pool.Scale(context.Background(), -1); err == nil {
 		t.Fatal("negative replica count accepted")
+	}
+}
+
+func TestScheduledReconciliationPreservesConcurrentDownscale(t *testing.T) {
+	machine := &Machine{Name: "idle", State: "idle", resources: &ownedResources{}}
+	pool := ownershipTestPool(t, machine)
+	pool.SetReplicas(1)
+	scheduled := make(chan int, 1)
+	reconcile := make(chan struct{})
+	finished := make(chan error, 1)
+	go func() {
+		// A reconciliation scheduled for the old inventory must not restore
+		// that target after a control-plane update.
+		scheduled <- pool.GetReplicas()
+		<-reconcile
+		finished <- pool.reconcileScale(context.Background())
+	}()
+	if got := <-scheduled; got != 1 {
+		t.Fatalf("initial target = %d, want 1", got)
+	}
+	pool.SetReplicas(0)
+	close(reconcile)
+	if err := <-finished; err != nil {
+		t.Fatal(err)
+	}
+	pool.workWg.Wait()
+	if got := pool.GetReplicas(); got != 0 {
+		t.Fatalf("reconciliation overwrote downscale: target=%d", got)
+	}
+	if _, err := pool.GetMachine(machine.Name); err == nil {
+		t.Fatal("reconciliation did not remove the superseded idle VM")
+	}
+}
+
+func TestScaleChangesDesiredTargetWhilePaused(t *testing.T) {
+	pool := ownershipTestPool(t)
+	pool.Pause()
+	if err := pool.Scale(context.Background(), 2); err != nil {
+		t.Fatal(err)
+	}
+	if got := pool.GetReplicas(); got != 2 {
+		t.Fatalf("explicit scale did not update paused target: %d", got)
+	}
+	if pool.IsActive() || len(pool.idleProvisioning) != 0 {
+		t.Fatal("explicit scale resumed provisioning in a paused pool")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := pool.Scale(ctx, 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled explicit scale returned %v", err)
+	}
+	if got := pool.GetReplicas(); got != 2 {
+		t.Fatalf("canceled explicit scale changed target: %d", got)
+	}
+}
+
+func TestPendingIdlePublicationHonorsPoolControls(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		control func(*testing.T, *Pool)
+		publish bool
+	}{
+		{name: "repeated active resume", control: func(_ *testing.T, p *Pool) { p.Resume(); p.Resume() }, publish: true},
+		{name: "larger target", control: func(_ *testing.T, p *Pool) { p.SetReplicas(2) }, publish: true},
+		{name: "pause", control: func(_ *testing.T, p *Pool) { p.Pause() }},
+		{name: "pause then resume", control: func(_ *testing.T, p *Pool) { p.Pause(); p.Resume() }},
+		{name: "downscale", control: func(_ *testing.T, p *Pool) { p.SetReplicas(0) }},
+		{name: "explicit downscale", control: func(t *testing.T, p *Pool) {
+			if err := p.Scale(context.Background(), 0); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "stop", control: func(_ *testing.T, p *Pool) { p.Stop() }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pool := ownershipTestPool(t)
+			t.Cleanup(pool.Stop)
+			pool.Pause()
+			pool.Resume()
+			pool.SetReplicas(1)
+			ctx, cancel := context.WithCancel(pool.ctx)
+			defer cancel()
+			provision := &idleProvision{cancel: cancel, generation: pool.scaleGeneration}
+			pool.idleProvisioning[1] = provision
+
+			// Readiness has completed, but publication has not. The SDK
+			// watcher needs no running VMM and waits for pool cancellation.
+			vmm, err := firecracker.NewMachine(pool.ctx, firecracker.Config{VMID: "pending-idle"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			machine := &Machine{Machine: vmm, Name: "pending-idle", State: "provisioning", resources: &ownedResources{}}
+			test.control(t, pool)
+			err = pool.publishIdleMachine(ctx, machine, 1, provision)
+			pool.finishIdleProvision(1, provision)
+			if test.publish {
+				if err != nil {
+					t.Fatalf("desired ready VM was discarded: %v", err)
+				}
+				if pool.GetCurrentSize() != 1 {
+					t.Fatal("desired ready VM was not added to idle inventory")
+				}
+				vm, err := pool.acquire(context.Background(), time.Now().Add(time.Hour))
+				if err != nil || vm != machine {
+					t.Fatalf("published VM was not claimable: vm=%v err=%v", vm, err)
+				}
+			} else {
+				if err == nil {
+					t.Fatal("revoked provisioning was admitted")
+				}
+				if _, err := pool.GetMachine(machine.Name); err == nil || pool.GetCurrentSize() != 0 {
+					t.Fatal("revoked VM remained available in the pool")
+				}
+				if state := machine.Metadata().State; state != "removing" {
+					t.Fatalf("revoked ready VM was not destroyed: state=%q", state)
+				}
+			}
+		})
 	}
 }
 
