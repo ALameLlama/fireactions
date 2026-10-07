@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -920,5 +921,235 @@ func TestPreallocationPreservesForeignEmptyDirectory(t *testing.T) {
 				t.Fatalf("foreign empty directory deleted or replaced: %v", err)
 			}
 		})
+	}
+}
+
+func TestJournalLocksStayBoundedAcrossDistinctLifecycles(t *testing.T) {
+	s := newTestStateStore(t)
+	for i := range 128 {
+		vmID := fmt.Sprintf("ubuntu-lifecycle-%d", i)
+		if err := s.create(testStateRecord(s, "ubuntu", vmID, "idle", nil)); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.destroyRecord(context.Background(), vmID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.State(vmID); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("destroyed record remained authoritative: %v", err)
+		}
+	}
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || !strings.HasSuffix(entries[0].Name(), ".lock") {
+		t.Fatalf("successful lifecycles left unbounded journal artifacts: %v", entries)
+	}
+}
+
+func TestJournalLeavesLegacyLockInodesUntouched(t *testing.T) {
+	s := newTestStateStore(t)
+	vmID := "ubuntu-legacy"
+	path := filepath.Join(s.dir, vmID+".lock")
+	legacy, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacy.Close()
+	before, err := legacy.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An old daemon/reaper may hold this inode or have a waiter on it.
+	if err := unix.Flock(int(legacy.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.create(testStateRecord(s, "ubuntu", vmID, "idle", nil)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.destroyRecord(context.Background(), vmID); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(path)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("legacy lock inode was removed/replaced while in use: %v", err)
+	}
+}
+
+func TestJournalMetadataProcessHelper(t *testing.T) {
+	mode := os.Getenv("FIREACTIONS_JOURNAL_HELPER")
+	if mode == "" {
+		return
+	}
+	root := os.Getenv("FIREACTIONS_JOURNAL_ROOT")
+	s := &StateStore{root: root, dir: filepath.Join(root, "journal"), instanceID: "test-instance"}
+	s.syncFile = func(file *os.File) error { return file.Sync() }
+	s.syncDir = func(file *os.File) error { return file.Sync() }
+	fmt.Println("ready")
+	if _, err := bufio.NewReader(os.Stdin).ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println("attempting")
+	expiry := time.Now().Add(time.Minute)
+	if mode == "cleanup-race" {
+		if err := s.publish("ubuntu-first", "claimed", &expiry); err == nil {
+			t.Fatal("cleanup revocation was overwritten")
+		}
+		if state, err := s.State("ubuntu-first"); err != nil || state != "removing" {
+			t.Fatalf("cleanup authority was lost: %s %v", state, err)
+		}
+		fmt.Println("revoked")
+	}
+	if err := s.publish("ubuntu-second", "claimed", &expiry); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println("claimed")
+}
+
+func startJournalMetadataHelper(t *testing.T, s *StateStore, mode string) (*exec.Cmd, <-chan string, io.WriteCloser) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestJournalMetadataProcessHelper$")
+	cmd.Env = append(os.Environ(), "FIREACTIONS_JOURNAL_HELPER="+mode, "FIREACTIONS_JOURNAL_ROOT="+s.root)
+	cmd.Stderr = os.Stderr
+	input, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = input.Close() })
+	output, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	lines := make(chan string, 16)
+	go func() {
+		defer close(lines)
+		scanner := bufio.NewScanner(output)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+	}()
+	expectJournalHelperLine(t, lines, "ready")
+	return cmd, lines, input
+}
+
+func expectJournalHelperLine(t *testing.T, lines <-chan string, want string) {
+	t.Helper()
+	select {
+	case got := <-lines:
+		if got != want {
+			t.Fatalf("journal helper: got %q, want %q", got, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("journal helper timed out waiting for %q", want)
+	}
+}
+
+func TestJournalMetadataLockSerializesCollidingVMsAcrossProcesses(t *testing.T) {
+	s := newTestStateStore(t)
+	if err := s.create(testStateRecord(s, "ubuntu", "ubuntu-second", "idle", nil)); err != nil {
+		t.Fatal(err)
+	}
+	// All VM IDs intentionally share a metadata lock. A different process's
+	// read/modify/write must wait even when its VM ID differs from the holder.
+	lock, err := s.lock("ubuntu-first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	cmd, lines, input := startJournalMetadataHelper(t, s, "update")
+	if _, err := io.WriteString(input, "go\n"); err != nil {
+		t.Fatal(err)
+	}
+	expectJournalHelperLine(t, lines, "attempting")
+	select {
+	case got := <-lines:
+		t.Fatalf("colliding metadata update bypassed held lock: %q", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	expectJournalHelperLine(t, lines, "claimed")
+	if err := cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if state, err := s.State("ubuntu-second"); err != nil || state != "claimed" {
+		t.Fatalf("cross-process claim was not durable: %q %v", state, err)
+	}
+}
+
+func TestJournalCleanupAllowsCollidingProcessUpdateWithoutLosingAuthority(t *testing.T) {
+	s := newTestStateStore(t)
+	for _, vmID := range []string{"ubuntu-first", "ubuntu-second"} {
+		if err := s.create(testStateRecord(s, "ubuntu", vmID, "idle", nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	s.cleanup = func(_ context.Context, r *stateRecord, _ bool) error {
+		if r.VMID == "ubuntu-first" {
+			close(entered)
+			<-release
+		}
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.destroyRecord(context.Background(), "ubuntu-first") }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cleanup did not leave the metadata lock")
+	}
+	cmd, lines, input := startJournalMetadataHelper(t, s, "cleanup-race")
+	if _, err := io.WriteString(input, "go\n"); err != nil {
+		t.Fatal(err)
+	}
+	expectJournalHelperLine(t, lines, "attempting")
+	expectJournalHelperLine(t, lines, "revoked")
+	expectJournalHelperLine(t, lines, "claimed")
+	if err := cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	// Successful metadata work while cleanup is still blocked proves no
+	// colliding VM can deadlock by retaining the lock across external cleanup.
+	release <- struct{}{}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cleanup failed to reacquire its colliding metadata lock")
+	}
+	if _, err := s.State("ubuntu-first"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("removed VM journal remained: %v", err)
+	}
+	if state, err := s.State("ubuntu-second"); err != nil || state != "claimed" {
+		t.Fatalf("cleanup lost another VM's cross-process claim: %q %v", state, err)
+	}
+	expired := time.Now().Add(-time.Second)
+	if err := s.update("ubuntu-second", func(r *stateRecord) error {
+		r.ExpiresAt = &expired
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.create(testStateRecord(s, "ubuntu", "ubuntu-third", "claimed", &expired)); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := s.Reap(context.Background())
+	if err != nil || len(removed) != 2 {
+		t.Fatalf("reaping colliding records lost authority: %v %v", removed, err)
+	}
+	for _, vmID := range []string{"ubuntu-second", "ubuntu-third"} {
+		if _, err := s.State(vmID); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("reaper retained colliding record %s: %v", vmID, err)
+		}
 	}
 }

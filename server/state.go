@@ -60,8 +60,8 @@ type stateRecord struct {
 	AllocationReady bool `json:"allocation_ready"`
 }
 
-// StateStore uses short per-record advisory locks. Allocation, boot, process
-// waits, CNI, containerd and guest IO never execute under these locks.
+// StateStore serializes short journal metadata sections with one advisory lock.
+// Allocation, boot, process waits, CNI, containerd and guest IO run outside it.
 type StateStore struct {
 	root           string
 	dir            string
@@ -158,11 +158,15 @@ func (s *StateStore) lock(vmID string) (*os.File, error) {
 	if !profileNamePattern.MatchString(vmID) {
 		return nil, fmt.Errorf("invalid journal VM ID")
 	}
-	fd, err := unix.Open(filepath.Join(s.dir, vmID+".lock"), unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0600)
+	// Never unlink this lock: waiters must always open the same inode. Legacy
+	// per-VM .lock files can only be retired with every old daemon/reaper stopped;
+	// flock cannot prove there are no old-version waiters on those inodes.
+	const name = ".metadata.lock"
+	fd, err := unix.Open(filepath.Join(s.dir, name), unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0600)
 	if err != nil {
 		return nil, err
 	}
-	f := os.NewFile(uintptr(fd), vmID+".lock")
+	f := os.NewFile(uintptr(fd), name)
 	if err := unix.Flock(fd, unix.LOCK_EX); err != nil {
 		f.Close()
 		return nil, err

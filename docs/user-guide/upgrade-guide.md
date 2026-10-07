@@ -8,10 +8,10 @@ A host service restart destroys old claimed and idle VMs before Fireactions acce
 
 Copy the new binary to the host. Make sure it is executable and keep a backup of the current binary outside the active install path.
 
-Stop the host service before replacing the binary:
+Stop the host service, reaper timer, and reaper service before replacing the binary:
 
 ```bash
-sudo systemctl stop fireactions.service
+sudo systemctl stop fireactions-reaper.timer fireactions.service fireactions-reaper.service
 ```
 
 Install the new binary at the existing Fireactions binary path. The default installer uses `/usr/local/bin/fireactions`:
@@ -29,6 +29,16 @@ sudo /usr/local/bin/fireactions validate --host /etc/fireactions/config.yaml
 
 Review release notes and update the configuration when the new version requires a schema change. Do not replace the host state directory or delete journal records as part of an upgrade.
 
+Journal locks now use one `.metadata.lock` file. Do not run old and new Fireactions binaries against the same state directory together.
+
+Stop every daemon and reaper that uses this state directory, including manually started processes. After they stop, you can remove old per-VM lock files:
+
+```bash
+sudo find /var/lib/fireactions/journal -maxdepth 1 -type f -name '*.lock' ! -name '.metadata.lock' -delete
+```
+
+If you use a custom `state_dir`, change the path in this command. Keep `.metadata.lock` and all JSON journal records.
+
 Start the service and confirm that the independent reaper timer remains enabled:
 
 ```bash
@@ -39,7 +49,7 @@ sudo systemctl status fireactions.service
 sudo systemctl status fireactions-reaper.timer
 ```
 
-The reaper timer must stay enabled even when the main service is stopped or crashes. It cleans expired or abandoned resources independently.
+Keep the reaper timer enabled during normal operation, including main-service stops and crashes. Stop it temporarily when replacing the binary.
 
 ## Verify the upgrade
 
