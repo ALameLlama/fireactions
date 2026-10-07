@@ -114,8 +114,11 @@ EOF
     pvcreate -f "$SNAPSHOTTER_DEVICE"
     vgcreate containerd "$SNAPSHOTTER_DEVICE"
     lvcreate --type thin-pool -n thinpool --poolmetadatasize 1G -l 95%VG containerd
+    systemctl enable containerd
+    systemctl restart containerd
+  else
+    systemctl enable --now containerd
   fi
-  systemctl enable --now containerd
 }
 
 main() {

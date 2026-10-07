@@ -1,6 +1,6 @@
 # Run your first build
 
-After you install Fireactions and register Forgejo Runner on the host, run a workflow that requests a configured profile label. A profile label uses the form `firecracker:firecracker://PROFILE`, where `PROFILE` is a name in the Fireactions host configuration.
+After you install Fireactions and register Forgejo Runner on the host, run a workflow that requests the registered label name. The supplied Runner configuration registers `firecracker` with the backend specification `firecracker:firecracker://ubuntu-24.04`. Put this specification in the Runner configuration, not in the workflow's `runs-on` field.
 
 ## Check the host services
 
@@ -22,7 +22,7 @@ A ready idle VM has never run a job. When a job claims it, Fireactions destroys 
 
 ## Create a Forgejo workflow
 
-Create `.forgejo/workflows/fireactions.yml` in a Forgejo repository. Replace `ubuntu-24.04` with the exact pool name configured on your host.
+Create `.forgejo/workflows/fireactions.yml` in a Forgejo repository. Use `runs-on: firecracker` to request the registered label name.
 
 ```yaml
 name: Fireactions test
@@ -30,7 +30,7 @@ on:
   workflow_dispatch:
 jobs:
   test:
-    runs-on: firecracker:firecracker://ubuntu-24.04
+    runs-on: firecracker
     steps:
       - name: Check the guest
         run: |
@@ -38,6 +38,16 @@ jobs:
           uname -a
           test -d /workspace
 ```
+
+To select another configured profile, add `container.image` to the job:
+
+```yaml
+    runs-on: firecracker
+    container:
+      image: ubuntu-24.04-large
+```
+
+Replace `ubuntu-24.04-large` with a profile name from the Fireactions host configuration. This selects a configured profile, not an arbitrary container image.
 
 The guest image creates the `ci` user and workspace. Configure the profile to use `default_user: ci` so workflow commands run with that account.
 

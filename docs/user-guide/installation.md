@@ -108,6 +108,8 @@ Run `install.sh` from the repository tree. It uses the service and timer files u
 
 Storage setup can format and destroy data. Do not pass storage options unless you have selected the correct dedicated device and approved the destructive operation interactively. Storage setup requires both `--containerd-snapshotter-device` and `--format-device`. Never run those storage options on an existing host whose data must remain intact.
 
+After explicit storage setup creates the new pool, the installer restarts Containerd to load its new configuration before host validation. Without storage options, `--setup-host` enables and starts Containerd but does not restart a running daemon.
+
 ## Verify the service
 
 Check the main service and independent reaper timer:
