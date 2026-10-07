@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -373,5 +374,95 @@ func TestGuestCancellationKillsSetsidIntegration(t *testing.T) {
 	}
 	if remaining := processScopesForRoot(t, a); remaining != 0 {
 		t.Fatalf("%d scopes survived cancellation", remaining)
+	}
+}
+
+type pausedExecStream struct {
+	grpc.ServerStream
+	ctx      context.Context
+	entered  chan struct{}
+	release  chan struct{}
+	once     sync.Once
+	stdout   bytes.Buffer
+	stderr   bytes.Buffer
+	complete *agentv1.ExecComplete
+}
+
+func (s *pausedExecStream) Context() context.Context { return s.ctx }
+
+func (s *pausedExecStream) Send(out *agentv1.ExecOutput) error {
+	if data := out.GetData(); data != nil {
+		s.once.Do(func() {
+			close(s.entered)
+			select {
+			case <-s.release:
+			case <-s.ctx.Done():
+			}
+		})
+		if err := s.ctx.Err(); err != nil {
+			return err
+		}
+		if data.Stream == agentv1.ExecStream_STDOUT {
+			s.stdout.Write(data.Data)
+		} else {
+			s.stderr.Write(data.Data)
+		}
+	} else if complete := out.GetComplete(); complete != nil {
+		s.complete = complete
+	} else if failed := out.GetFailed(); failed != nil {
+		return errors.New(failed.ErrorMessage)
+	}
+	return nil
+}
+
+func TestGuestFinalBurstSurvivesPausedSendIntegration(t *testing.T) {
+	_, a, _ := integrationGuest(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	stream := &pausedExecStream{ctx: ctx, entered: make(chan struct{}), release: make(chan struct{})}
+	done := make(chan error, 1)
+	const id = "12345678901234567890123456789012"
+	const bursts = processQueueDepth + 3 // Send, queue, blocked reader, final pipe bytes.
+	go func() {
+		done <- a.processes.exec(stream, &agentv1.ExecRequest{
+			ProcessId: id,
+			Command: []string{"/bin/sh", "-c",
+				"i=0; while [ \"$i\" -lt " + strconv.Itoa(bursts) + " ]; do dd if=/dev/zero bs=4096 count=1 2>/dev/null; i=$((i+1)); sleep 0.05; done"},
+			Env: map[string]string{"PATH": "/usr/bin:/bin"},
+		})
+	}()
+	select {
+	case <-stream.entered:
+	case <-ctx.Done():
+		t.Fatal("execution did not reach blocked output Send")
+	}
+	a.processes.mu.Lock()
+	scope := a.processes.scopes[id]
+	a.processes.mu.Unlock()
+	if scope == nil {
+		t.Fatal("output-producing process did not publish its scope")
+	}
+	select {
+	case <-scope.exited:
+	case <-ctx.Done():
+		t.Fatal("foreground could not finish its final burst with Send paused")
+	}
+	// The original post-Wait timer expired while Send was blocked and then
+	// cancelled readers with one chunk pending and one still in the pipe.
+	time.Sleep(processPipeDrain + 250*time.Millisecond)
+	close(stream.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("execution did not finish after output Send resumed")
+	}
+	if stream.complete == nil || stream.complete.ExitCode != 0 {
+		t.Fatalf("successful final burst did not complete: %#v", stream.complete)
+	}
+	if want := bursts * 4096; stream.stdout.Len() != want || stream.stderr.Len() != 0 {
+		t.Fatalf("final burst output = %d stdout/%d stderr bytes, want %d/0", stream.stdout.Len(), stream.stderr.Len(), want)
 	}
 }

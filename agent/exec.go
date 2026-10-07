@@ -129,20 +129,15 @@ func (m *execManager) exec(stream agentv1.AgentService_ExecServer, req *agentv1.
 	if !hasPath {
 		pathValue = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 	}
-	executable, err := resolveExecutable(req.Command[0], pathValue, cwdPath)
-	if err != nil {
-		return sendFailed(stream, &executor.LaunchError{Message: err.Error()})
-	}
+	argv := append([]string(nil), req.Command...)
+	env := buildEnv(req.Env, identity)
 	id := req.ProcessId
 	if !validProcessID(id) {
 		return status.Error(codes.InvalidArgument, "invalid process id")
 	}
-	cmd := exec.Command(executable, req.Command[1:]...)
 	// Go changes cwd before remapping ExtraFiles. Pin the original descriptor;
 	// CLOEXEC prevents the workspace handle leaking into the workflow process.
-	cmd.Dir = "/proc/self/fd/" + strconv.Itoa(int(cwdFD.Fd()))
-	cmd.Env = buildEnv(req.Env, identity)
-	cmd.Stdin = nil
+	cmdDir := "/proc/self/fd/" + strconv.Itoa(int(cwdFD.Fd()))
 	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		return sendFailed(stream, err)
@@ -153,8 +148,8 @@ func (m *execManager) exec(stream agentv1.AgentService_ExecServer, req *agentv1.
 		_ = stdoutW.Close()
 		return sendFailed(stream, err)
 	}
-	cmd.Stdout = stdoutW
-	cmd.Stderr = stderrW
+	stdout := &processPipe{File: stdoutR}
+	stderr := &processPipe{File: stderrR}
 	cg := m.cgroups
 	if m.closing {
 		_ = stdoutR.Close()
@@ -178,8 +173,20 @@ func (m *execManager) exec(stream agentv1.AgentService_ExecServer, req *agentv1.
 		_ = stderrW.Close()
 		return status.Errorf(codes.FailedPrecondition, "create process scope: %v", err)
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Credential: &syscall.Credential{Uid: identity.UID, Gid: identity.GID, Groups: identity.Groups}, UseCgroupFD: true, CgroupFD: int(cgFD.Fd())}
-	if err = cmd.Start(); err != nil {
+	credentials := &syscall.Credential{Uid: identity.UID, Gid: identity.GID, Groups: identity.Groups}
+	var cmd *exec.Cmd
+	_, err = resolveExecutable(req.Command[0], pathValue, cwdPath, func(path string) error {
+		argv[0] = path
+		// Start failures leave private state in exec.Cmd. Each attempt gets a
+		// fresh command, but shares the still-open pipes and cgroup descriptor.
+		cmd = &exec.Cmd{
+			Path: path, Args: argv, Dir: cmdDir, Env: env,
+			Stdout: stdoutW, Stderr: stderrW,
+			SysProcAttr: &syscall.SysProcAttr{Setpgid: true, Credential: credentials, UseCgroupFD: true, CgroupFD: int(cgFD.Fd())},
+		}
+		return cmd.Start()
+	})
+	if err != nil {
 		_ = cgFD.Close()
 		_ = cg.remove(id)
 		_ = stdoutR.Close()
@@ -196,10 +203,16 @@ func (m *execManager) exec(stream agentv1.AgentService_ExecServer, req *agentv1.
 	outputs := make(chan processOutput, processQueueDepth)
 	readDone := make(chan struct{}, 2)
 	readCtx, stopReaders := context.WithCancel(ctx)
-	go readProcessPipe(readCtx, stdoutR, agentv1.ExecStream_STDOUT, outputs, readDone)
-	go readProcessPipe(readCtx, stderrR, agentv1.ExecStream_STDERR, outputs, readDone)
+	go readProcessPipe(readCtx, stdout, agentv1.ExecStream_STDOUT, outputs, readDone)
+	go readProcessPipe(readCtx, stderr, agentv1.ExecStream_STDERR, outputs, readDone)
 	wait := make(chan error, 1)
-	go func() { e := cmd.Wait(); close(scope.exited); wait <- e }()
+	go func() {
+		e := cmd.Wait()
+		stdout.beginDrain()
+		stderr.beginDrain()
+		close(scope.exited)
+		wait <- e
+	}()
 	m.mu.Unlock()
 	managerLocked = false
 	defer func() { stopReaders(); _ = stdoutR.Close(); _ = stderrR.Close() }()
@@ -207,8 +220,6 @@ func (m *execManager) exec(stream agentv1.AgentService_ExecServer, req *agentv1.
 	readers := 2
 	var waitErr, pipeErr error
 	childDone := false
-	var drainTimer *time.Timer
-	var drainC <-chan time.Time
 	for !childDone || readers > 0 || len(outputs) > 0 {
 		select {
 		case <-ctx.Done():
@@ -217,15 +228,6 @@ func (m *execManager) exec(stream agentv1.AgentService_ExecServer, req *agentv1.
 		case e := <-wait:
 			waitErr = e
 			childDone = true
-			if readers > 0 {
-				drainTimer = time.NewTimer(processPipeDrain)
-				drainC = drainTimer.C
-			}
-		case <-drainC:
-			drainC = nil
-			stopReaders()
-			closePipe(stdoutR)
-			closePipe(stderrR)
 		case item := <-outputs:
 			if item.err != nil {
 				if pipeErr == nil {
@@ -239,15 +241,6 @@ func (m *execManager) exec(stream agentv1.AgentService_ExecServer, req *agentv1.
 			}
 		case <-readDone:
 			readers--
-			if readers == 0 && drainTimer != nil {
-				if !drainTimer.Stop() {
-					select {
-					case <-drainTimer.C:
-					default:
-					}
-				}
-				drainC = nil
-			}
 		}
 	}
 	if ctx.Err() != nil {
@@ -282,6 +275,37 @@ func reapProcess(scope *processScope, cg *cgroupScopes, wait <-chan error, waitE
 	closePipe(stdout)
 	closePipe(stderr)
 	drainReaders(readDone, readers, processPipeDrain)
+}
+
+// processPipe bounds idle reads after the foreground process exits, not time
+// spent delivering output. A blocked consumer must never discard queued bytes
+// or prevent the remaining pipe contents from being read when it resumes.
+type processPipe struct {
+	*os.File
+	mu       sync.Mutex
+	draining bool
+}
+
+func (p *processPipe) beginDrain() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.draining = true
+	_ = p.SetReadDeadline(time.Now().Add(processPipeDrain))
+}
+
+func (p *processPipe) Read(buf []byte) (int, error) {
+	p.mu.Lock()
+	if p.draining {
+		_ = p.SetReadDeadline(time.Now().Add(processPipeDrain))
+	}
+	p.mu.Unlock()
+	n, err := p.File.Read(buf)
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		// Only an idle Read expires. Data already read is still delivered by
+		// readProcessPipe, and its next Read receives a fresh idle deadline.
+		err = io.EOF
+	}
+	return n, err
 }
 
 func readProcessPipe(ctx context.Context, r io.ReadCloser, which agentv1.ExecStream, out chan<- processOutput, done chan<- struct{}) {
@@ -355,7 +379,11 @@ func validProcessID(id string) bool {
 	}
 	return true
 }
-func resolveExecutable(name, pathValue, dir string) (string, error) {
+
+// resolveExecutable starts candidates under the execution identity. Stat only
+// filters obviously unusable PATH entries; the kernel decides access, including
+// ACLs, supplementary groups, mount flags and search permission on directories.
+func resolveExecutable(name, pathValue, dir string, start func(string) error) (string, error) {
 	if strings.IndexByte(name, 0) >= 0 {
 		return "", errors.New("executable contains NUL")
 	}
@@ -364,8 +392,9 @@ func resolveExecutable(name, pathValue, dir string) (string, error) {
 		if !filepath.IsAbs(p) {
 			p = filepath.Join(dir, p)
 		}
-		return p, nil
+		return p, start(p)
 	}
+	var accessErr error
 	for _, d := range strings.Split(pathValue, string(os.PathListSeparator)) {
 		if d == "" {
 			d = "."
@@ -375,9 +404,20 @@ func resolveExecutable(name, pathValue, dir string) (string, error) {
 		}
 		candidate := filepath.Join(d, name)
 		st, err := os.Stat(candidate)
-		if err == nil && st.Mode().IsRegular() && st.Mode().Perm()&0111 != 0 {
-			return candidate, nil
+		if err != nil || !st.Mode().IsRegular() || st.Mode().Perm()&0111 == 0 {
+			continue
 		}
+		if err := start(candidate); err != nil {
+			if errors.Is(err, unix.EACCES) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENOTDIR) {
+				accessErr = err
+				continue
+			}
+			return "", err
+		}
+		return candidate, nil
+	}
+	if accessErr != nil {
+		return "", accessErr
 	}
 	return "", errors.New("executable not found")
 }
