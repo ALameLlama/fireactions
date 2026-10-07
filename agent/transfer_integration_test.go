@@ -9,9 +9,11 @@ import (
 	"net"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/hostinger/fireactions/internal/executor"
 	"github.com/hostinger/fireactions/internal/guest"
 	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
 	"google.golang.org/grpc"
@@ -102,4 +104,66 @@ func TestGuestTransferStreamingRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("private gRPC transfer: bytes=%d sha256=%x mode=%o mtime=%s", n, actual.Sum(nil), header.Mode, header.ModTime.UTC().Format(time.RFC3339))
+}
+
+func TestGuestCopyInPreservesMidUploadRejection(t *testing.T) {
+	const size = 8 << 20
+	archive := makeTar(t, &tar.Header{
+		Name:     "payload",
+		Mode:     0600,
+		Size:     size,
+		Linkname: strings.Repeat("x", size),
+	})
+	for _, test := range []struct {
+		name        string
+		destination string
+		maxBytes    int64
+		wantKind    executor.Kind
+		detail      string
+	}{
+		{
+			name:        "invalid destination",
+			destination: "/outside",
+			maxBytes:    16 << 20,
+			wantKind:    executor.InvalidArgument,
+			detail:      "destination",
+		},
+		{
+			name:        "oversized archive",
+			destination: "/workspace/payload",
+			maxBytes:    1 << 20,
+			wantKind:    executor.ResourceExhausted,
+			detail:      "limit",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			a, _ := newTransferTestAgent(t, test.maxBytes, 20)
+			listener := bufconn.Listen(64 * 1024)
+			server := grpc.NewServer()
+			agentv1.RegisterAgentServiceServer(server, a)
+			go server.Serve(listener)
+			defer server.Stop()
+			conn, err := grpc.NewClient("passthrough:transfer-rejection", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+				return listener.DialContext(ctx)
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := guest.New(conn)
+			defer client.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			source := bytes.NewReader(archive)
+			err = client.CopyIn(ctx, test.destination, source)
+			if err == nil || executor.KindOf(err) != test.wantKind {
+				t.Fatalf("CopyIn() error = %v (kind %v), want kind %v", err, executor.KindOf(err), test.wantKind)
+			}
+			if !strings.Contains(err.Error(), test.detail) {
+				t.Fatalf("CopyIn() lost guest rejection diagnostic: %v", err)
+			}
+			if source.Len() == 0 {
+				t.Fatal("upload consumed the whole archive before rejection; mid-upload rejection was not exercised")
+			}
+		})
+	}
 }

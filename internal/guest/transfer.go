@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 
+	"github.com/hostinger/fireactions/internal/executor"
 	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
 )
 
@@ -24,7 +25,7 @@ func (c *Client) CopyIn(ctx context.Context, destination string, source io.Reade
 		return translateError(err)
 	}
 	if err := stream.Send(&agentv1.CopyInChunk{DestPath: &destination}); err != nil {
-		return translateError(err)
+		return copyInSendError(stream, err)
 	}
 
 	buffer := make([]byte, transferChunkSize)
@@ -35,7 +36,7 @@ func (c *Client) CopyIn(ctx context.Context, destination string, source io.Reade
 		n, readErr := source.Read(buffer)
 		if n > 0 {
 			if err := stream.Send(&agentv1.CopyInChunk{Data: buffer[:n]}); err != nil {
-				return translateError(err)
+				return copyInSendError(stream, err)
 			}
 		}
 		if readErr != nil {
@@ -54,6 +55,18 @@ func (c *Client) CopyIn(ctx context.Context, destination string, source io.Reade
 		return translateError(err)
 	}
 	return nil
+}
+
+// Send reports EOF when the server closes its receive side; the final receive
+// carries the status explaining why the upload was rejected.
+func copyInSendError(stream agentv1.AgentService_CopyInClient, err error) error {
+	if err == io.EOF {
+		if _, recvErr := stream.CloseAndRecv(); recvErr != nil {
+			return translateError(recvErr)
+		}
+		return executor.NewError(executor.Internal, "guest closed copy-in before upload completed", io.ErrUnexpectedEOF)
+	}
+	return translateError(err)
 }
 
 // CopyOut receives an archive incrementally and writes every chunk before
