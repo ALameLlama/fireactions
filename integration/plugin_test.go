@@ -93,7 +93,7 @@ func newPluginHarness(t *testing.T, configure ...func(*server.Config)) *pluginHa
 	}
 	config.Containerd.Namespace = "fireactions-it-" + hex.EncodeToString(random[:])
 	config.StateDir = filepath.Join(root, "s")
-	config.SocketPath = filepath.Join(root, "plugin.sock")
+	config.SocketPath = filepath.Join(root, "run", "plugin.sock")
 	config.Metrics.Enabled = false
 	for _, pool := range config.Pools {
 		pool.Replicas = 0

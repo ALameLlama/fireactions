@@ -32,6 +32,10 @@ func TestConfigRejectsUnsafePathsAndDurations(t *testing.T) {
 		mutate func(*Config)
 	}{
 		{"relative socket", func(c *Config) { c.SocketPath = "plugin.sock" }},
+		{"shared runtime socket directory", func(c *Config) { c.SocketPath = "/run/plugin.sock" }},
+		{"shared legacy runtime socket directory", func(c *Config) { c.SocketPath = "/var/run/plugin.sock" }},
+		{"shared temporary socket directory", func(c *Config) { c.SocketPath = "/tmp/plugin.sock" }},
+		{"shared persistent temporary socket directory", func(c *Config) { c.SocketPath = "/var/tmp/plugin.sock" }},
 		{"unclean state path", func(c *Config) { c.StateDir = "/var/lib/../fireactions" }},
 		{"relative resolver", func(c *Config) { c.Network.ResolverPath = "resolv.conf" }},
 		{"invalid socket group", func(c *Config) { c.SocketGroup = "bad group" }},

@@ -210,6 +210,9 @@ func (c *Config) Validate() error {
 	if len(c.SocketPath) > 107 || filepath.Dir(c.SocketPath) == "/" {
 		return fmt.Errorf("socket_path is not a usable Unix socket path")
 	}
+	if sharedSocketDirectory(filepath.Dir(c.SocketPath)) {
+		return fmt.Errorf("socket_path must use a dedicated directory")
+	}
 	if !socketGroupPattern.MatchString(c.SocketGroup) {
 		return fmt.Errorf("socket_group must be a valid Unix group name")
 	}

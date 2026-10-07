@@ -3,18 +3,22 @@ package server
 import (
 	"context"
 	"errors"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/containerd/containerd"
 	"github.com/hostinger/fireactions/internal/executor"
 	"github.com/hostinger/fireactions/internal/guest"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/health"
 )
 
 func journalRuntimeTestServer(t *testing.T, profile string) (*Server, *Pool, *Machine, *stateRecord, string) {
@@ -239,4 +243,75 @@ func TestExternalRemovingRecordRevokesIdleAvailability(t *testing.T) {
 	pool.Stop()
 	metricCleanIdleVMs.DeleteLabelValues(profile)
 	metricClaimedVMs.DeleteLabelValues(profile)
+}
+
+func TestServerListenerFailureReturnsPromptlyAndPreservesError(t *testing.T) {
+	for _, failure := range []string{"grpc only", "grpc with metrics", "metrics with grpc"} {
+		t.Run(failure, func(t *testing.T) {
+			listener, err := net.Listen("unix", filepath.Join(socketTestDir(t), "plugin.sock"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = listener.Close() })
+			containerdPath := filepath.Join(socketTestDir(t), "containerd.sock")
+			containerdListener, err := net.Listen("unix", containerdPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = containerdListener.Close() })
+			// Client construction needs a real gRPC transport, but this test
+			// only closes the client and never calls a containerd API.
+			containerdServer := grpc.NewServer()
+			containerdDone := make(chan error, 1)
+			go func() { containerdDone <- containerdServer.Serve(containerdListener) }()
+			t.Cleanup(func() {
+				containerdServer.Stop()
+				if err := <-containerdDone; err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+					t.Error(err)
+				}
+			})
+			client, err := containerd.New(containerdPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = client.Close() })
+			config := DefaultConfig()
+			config.Leases.ReapInterval = time.Hour
+			logger := zerolog.Nop()
+			s := &Server{
+				config: config, grpcServer: grpc.NewServer(), containerd: client,
+				health: health.NewServer(), logger: &logger,
+			}
+			t.Cleanup(s.grpcServer.Stop)
+			var metricsListener net.Listener
+			if failure != "grpc only" {
+				metricsListener, err = net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = metricsListener.Close() })
+				s.metricsServer = &http.Server{Handler: http.NewServeMux()}
+				t.Cleanup(func() { _ = s.metricsServer.Close() })
+			}
+			failedListener := listener
+			if failure == "metrics with grpc" {
+				failedListener = metricsListener
+			}
+			if err := failedListener.Close(); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			result := make(chan error, 1)
+			go func() { result <- s.serve(ctx, listener, metricsListener, nil) }()
+			select {
+			case err := <-result:
+				if !errors.Is(err, net.ErrClosed) {
+					t.Fatalf("listener failure was lost or replaced: %v", err)
+				}
+			case <-ctx.Done():
+				t.Fatal("listener failure did not shut down promptly")
+			}
+		})
+	}
 }

@@ -211,6 +211,12 @@ func (s *Server) Run(ctx context.Context) error {
 			return fmt.Errorf("failed to start metrics server: %w", err)
 		}
 	}
+	runErr := s.serve(ctx, listener, metricsListener, startedPools)
+	shutdownComplete = true
+	return runErr
+}
+
+func (s *Server) serve(ctx context.Context, listener, metricsListener net.Listener, startedPools []*Pool) error {
 	s.health.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 	s.health.SetServingStatus("plugin.v1alpha.BackendPlugin", healthpb.HealthCheckResponse_SERVING)
 	s.logger.Info().Str("socket_path", s.config.SocketPath).Msg("Serving Forgejo execution plugin")
@@ -247,6 +253,7 @@ func (s *Server) Run(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 	case runErr = <-serveErrors:
+		serveCount--
 		if runErr == nil {
 			runErr = fmt.Errorf("gRPC server stopped unexpectedly")
 		}
@@ -255,7 +262,6 @@ func (s *Server) Run(ctx context.Context) error {
 	s.health.SetServingStatus("plugin.v1alpha.BackendPlugin", healthpb.HealthCheckResponse_NOT_SERVING)
 	cancelRun()
 	s.shutdown(startedPools)
-	shutdownComplete = true
 	<-reconcileDone
 	if s.metricsServer != nil {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -280,7 +286,9 @@ func (s *Server) Run(ctx context.Context) error {
 				runErr = serveErr
 			}
 		case <-time.After(10 * time.Second):
-			runErr = fmt.Errorf("server listener did not stop")
+			if runErr == nil {
+				runErr = fmt.Errorf("server listener did not stop")
+			}
 			_ = listener.Close()
 			if metricsListener != nil {
 				_ = s.metricsServer.Close()

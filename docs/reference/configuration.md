@@ -49,6 +49,8 @@ pools:
 
 `socket_path` selects the local Unix socket for the Forgejo runner plugin. `socket_group` names the Unix group that can access this socket. `state_dir` stores private VM ownership records and runtime state. Use absolute, clean paths. Do not share this state directory between Fireactions servers.
 
+Use a dedicated directory for `socket_path`, such as `/run/fireactions`. Fireactions rejects sockets directly in `/run`, `/var/run`, `/tmp`, or `/var/tmp`. For a new socket directory, Fireactions sets the owner to `root`, the group to `socket_group`, and the mode to `0750`. An existing directory must already have this owner, group, and mode. Fireactions does not change the permissions of an existing directory. The socket itself uses mode `0660`.
+
 `containerd.address` selects the containerd socket. `containerd.namespace` selects the namespace that stores guest images and snapshots. Import each guest image into this namespace. Containerd namespaces separate image names and snapshots.
 
 `network.resolver_path` selects the host resolver file used to set nameservers for host-local IPAM and the Firecracker guest network. Fireactions does not copy the whole resolver file into the guest. The path must be absolute and clean, and the file must provide usable IPv4 nameservers.
