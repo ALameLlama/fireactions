@@ -3,6 +3,8 @@ package guest
 import (
 	"context"
 	"io"
+	"sync"
+	"sync/atomic"
 
 	"github.com/hostinger/fireactions/internal/executor"
 	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
@@ -14,18 +16,51 @@ const transferChunkSize = 32 << 10
 // chunks and backpressure from the guest service.
 func (c *Client) CopyIn(ctx context.Context, destination string, source io.Reader) error {
 	streamCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	stopReaderClose := func() bool { return false }
+	closeSource := func() {}
 	if closer, ok := source.(io.Closer); ok {
-		stopReaderClose = context.AfterFunc(streamCtx, func() { _ = closer.Close() })
+		var once sync.Once
+		closeSource = func() { once.Do(func() { _ = closer.Close() }) }
 	}
-	defer stopReaderClose()
+	stopReaderClose := context.AfterFunc(streamCtx, closeSource)
+	var receiverDone chan struct{}
+	defer func() {
+		stopReaderClose()
+		cancel()
+		if receiverDone != nil {
+			<-receiverDone
+		}
+	}()
 	stream, err := c.rpc.CopyIn(streamCtx)
 	if err != nil {
 		return translateError(err)
 	}
+	// RecvMsg observes the terminal status without closing the send side, unlike
+	// CloseAndRecv. An early response must interrupt a blocked upstream reader.
+	var uploadEOF atomic.Bool
+	var recvErr error
+	received := make(chan struct{})
+	receiverDone = make(chan struct{})
+	go func() {
+		defer close(receiverDone)
+		recvErr = translateError(stream.RecvMsg(&agentv1.CopyInResponse{}))
+		early := !uploadEOF.Load()
+		if early && recvErr == nil {
+			recvErr = executor.NewError(executor.Internal, "guest closed copy-in before upload completed", io.ErrUnexpectedEOF)
+		}
+		close(received)
+		if early {
+			closeSource()
+		}
+	}()
+	sendError := func(err error) error {
+		if err == io.EOF {
+			<-received
+			return recvErr
+		}
+		return translateError(err)
+	}
 	if err := stream.Send(&agentv1.CopyInChunk{DestPath: &destination}); err != nil {
-		return copyInSendError(stream, err)
+		return sendError(err)
 	}
 
 	buffer := make([]byte, transferChunkSize)
@@ -33,14 +68,31 @@ func (c *Client) CopyIn(ctx context.Context, destination string, source io.Reade
 		if err := streamCtx.Err(); err != nil {
 			return err
 		}
+		select {
+		case <-received:
+			return recvErr
+		default:
+		}
 		n, readErr := source.Read(buffer)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		select {
+		case <-received:
+			return recvErr
+		default:
+		}
 		if n > 0 {
 			if err := stream.Send(&agentv1.CopyInChunk{Data: buffer[:n]}); err != nil {
-				return copyInSendError(stream, err)
+				return sendError(err)
 			}
 		}
 		if readErr != nil {
 			if readErr == io.EOF {
+				uploadEOF.Store(true)
+				if err := stream.CloseSend(); err != nil {
+					return sendError(err)
+				}
 				break
 			}
 			if err := streamCtx.Err(); err != nil {
@@ -51,22 +103,8 @@ func (c *Client) CopyIn(ctx context.Context, destination string, source io.Reade
 		}
 	}
 
-	if _, err := stream.CloseAndRecv(); err != nil {
-		return translateError(err)
-	}
-	return nil
-}
-
-// Send reports EOF when the server closes its receive side; the final receive
-// carries the status explaining why the upload was rejected.
-func copyInSendError(stream agentv1.AgentService_CopyInClient, err error) error {
-	if err == io.EOF {
-		if _, recvErr := stream.CloseAndRecv(); recvErr != nil {
-			return translateError(recvErr)
-		}
-		return executor.NewError(executor.Internal, "guest closed copy-in before upload completed", io.ErrUnexpectedEOF)
-	}
-	return translateError(err)
+	<-received
+	return recvErr
 }
 
 // CopyOut receives an archive incrementally and writes every chunk before

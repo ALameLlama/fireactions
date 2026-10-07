@@ -631,6 +631,29 @@ func TestRealPluginColdLifecycle(t *testing.T) {
 	if len(owned) != 1 || len(machines) != 1 {
 		t.Fatalf("cold environment did not own exactly one VMM: %v %#v", owned, machines)
 	}
+	// Leave the Runner send side open after metadata. A guest rejection must
+	// arrive without another archive frame and release the environment gate.
+	uploadCtx, cancelUpload := context.WithTimeout(ctx, 5*time.Second)
+	rejectedUpload, err := h.plugin.CopyIn(uploadCtx)
+	if err != nil {
+		cancelUpload()
+		t.Fatal(err)
+	}
+	destination := "/workspace/../etc"
+	err = rejectedUpload.Send(&pluginv1alpha.CopyInChunk{EnvironmentId: &environment.EnvironmentId, DestPath: &destination})
+	if err == nil {
+		err = rejectedUpload.RecvMsg(&pluginv1alpha.CopyInResponse{})
+	}
+	cancelUpload()
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("paused upload did not receive the guest rejection: %v", err)
+	}
+	execCtx, cancelExec := context.WithTimeout(ctx, 5*time.Second)
+	output, diagnostics, code, execErr := h.exec(execCtx, environment.EnvironmentId, []string{"/bin/printf", "after-rejection"})
+	cancelExec()
+	if execErr != nil || code != 0 || output != "after-rejection" || diagnostics != "" {
+		t.Fatalf("guest rejection retained the operation gate or invalidated the environment: %q %q %d %v", output, diagnostics, code, execErr)
+	}
 	input, writer := io.Pipe()
 	defer input.Close()
 	script := []byte("#!/bin/sh\nprintf 'vm-stdout\\n'\nprintf 'vm-stderr\\n' >&2\nprintf '\\000\\377\\200\\n' > generated.bin\nchmod 0751 generated.bin\nid -u > uid\ntouch job-only-marker\nexit 42\n")
