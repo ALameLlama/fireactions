@@ -4,6 +4,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -55,6 +56,32 @@ func TestConfigRejectsUnsafePathsAndDurations(t *testing.T) {
 			require.NoError(t, err)
 			tc.mutate(config)
 			assert.Error(t, config.Validate())
+		})
+	}
+}
+
+func TestConfigArchiveEntryWireRange(t *testing.T) {
+	data, err := os.ReadFile("testdata/config1.yaml")
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name    string
+		entries int64
+		wantErr bool
+	}{
+		{"int32 maximum", math.MaxInt32, false},
+		{"above int32 maximum", int64(math.MaxInt32) + 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			content := string(data) + "\nguest:\n  max_archive_entries: " + strconv.FormatInt(tc.entries, 10) + "\n"
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			require.NoError(t, os.WriteFile(path, []byte(content), 0600))
+			config, err := NewConfig(path)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.entries, int64(config.Guest.MaxArchiveEntries))
 		})
 	}
 }

@@ -30,9 +30,11 @@ func listenUnixSocket(path, group string) (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	path = filepath.Join(dir, filepath.Base(path))
+	// Bind and probe through the validated alias: its canonical path may exceed
+	// the Unix socket address limit. Keep filesystem operations canonical.
+	canonicalPath := filepath.Join(dir, filepath.Base(path))
 
-	if info, err := os.Lstat(path); err == nil {
+	if info, err := os.Lstat(canonicalPath); err == nil {
 		if info.Mode()&os.ModeSocket == 0 || info.Mode()&os.ModeSymlink != 0 {
 			return nil, fmt.Errorf("socket path exists and is not a Unix socket")
 		}
@@ -44,7 +46,7 @@ func listenUnixSocket(path, group string) (net.Listener, error) {
 		if !errors.Is(dialErr, syscall.ECONNREFUSED) && !errors.Is(dialErr, syscall.ENOENT) {
 			return nil, fmt.Errorf("cannot determine whether existing socket is stale: %w", dialErr)
 		}
-		if err := removeOwnedUnixSocket(path, info); err != nil {
+		if err := removeOwnedUnixSocket(canonicalPath, info); err != nil {
 			return nil, fmt.Errorf("remove stale Unix socket: %w", err)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -56,17 +58,17 @@ func listenUnixSocket(path, group string) (net.Listener, error) {
 		return nil, fmt.Errorf("listen on Unix socket: %w", err)
 	}
 	listener.(*net.UnixListener).SetUnlinkOnClose(false)
-	info, err := os.Lstat(path)
+	info, err := os.Lstat(canonicalPath)
 	if err != nil {
 		_ = listener.Close()
 		return nil, fmt.Errorf("inspect new Unix socket: %w", err)
 	}
-	owned := &ownedUnixListener{Listener: listener, path: path, info: info}
-	if err := os.Chown(path, 0, gid); err != nil {
+	owned := &ownedUnixListener{Listener: listener, path: canonicalPath, info: info}
+	if err := os.Chown(canonicalPath, 0, gid); err != nil {
 		_ = owned.Close()
 		return nil, fmt.Errorf("set socket ownership: %w", err)
 	}
-	if err := os.Chmod(path, 0660); err != nil {
+	if err := os.Chmod(canonicalPath, 0660); err != nil {
 		_ = owned.Close()
 		return nil, fmt.Errorf("set socket mode: %w", err)
 	}

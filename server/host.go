@@ -51,11 +51,9 @@ func CheckHost(ctx context.Context, config *Config) error {
 			return fmt.Errorf("profile %q Firecracker binary %q is not an executable regular file", pool.Name, vmm)
 		}
 		kernel := pool.Firecracker.KernelImagePath
-		kernelFile, err := os.Open(kernel)
-		if err != nil {
-			return fmt.Errorf("profile %q kernel image %q is not readable: %w", pool.Name, kernel, err)
+		if err := checkKernelImage(kernel); err != nil {
+			return fmt.Errorf("profile %q kernel image %q: %w", pool.Name, kernel, err)
 		}
-		_ = kernelFile.Close()
 	}
 
 	resolver, err := os.Open(config.Network.ResolverPath)
@@ -104,6 +102,22 @@ func CheckHost(ctx context.Context, config *Config) error {
 	}
 	if !found {
 		return fmt.Errorf("configured containerd has no ready devmapper snapshotter")
+	}
+	return nil
+}
+
+func checkKernelImage(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("is not readable: %w", err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("inspect opened kernel image: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("is not a regular file")
 	}
 	return nil
 }

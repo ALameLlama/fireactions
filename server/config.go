@@ -229,6 +229,9 @@ func (c *Config) Validate() error {
 	if c.Guest.StartupTimeout <= 0 || c.Guest.MaxTransferBytes <= 0 || c.Guest.MaxArchiveEntries <= 0 {
 		return fmt.Errorf("guest limits and startup_timeout must be positive")
 	}
+	if c.Guest.MaxArchiveEntries > math.MaxInt32 {
+		return fmt.Errorf("guest.max_archive_entries must not exceed %d", math.MaxInt32)
+	}
 	if c.Leases.MaxLifetime <= 0 || c.Leases.CleanupGrace <= 0 || c.Leases.ReapInterval <= 0 {
 		return fmt.Errorf("lease durations must be positive")
 	}

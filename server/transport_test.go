@@ -9,6 +9,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -338,14 +339,19 @@ func TestUnixTransportAcceptsTrustedAncestorAlias(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, absolute := range []bool{false, true} {
-		name := "relative"
-		if absolute {
-			name = "absolute"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		target   string
+		absolute bool
+	}{
+		{"relative", "real", false},
+		{"absolute", "real", true},
+		{"long relative", strings.Repeat("r", 108), false},
+		{"long absolute", strings.Repeat("r", 108), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			root := socketTestDir(t)
-			real := filepath.Join(root, "real")
+			real := filepath.Join(root, tc.target)
 			if err := os.Mkdir(real, 0755); err != nil {
 				t.Fatal(err)
 			}
@@ -353,8 +359,8 @@ func TestUnixTransportAcceptsTrustedAncestorAlias(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			target := "real"
-			if absolute {
+			target := tc.target
+			if tc.absolute {
 				target = real
 			}
 			alias := filepath.Join(root, "alias")
@@ -362,6 +368,13 @@ func TestUnixTransportAcceptsTrustedAncestorAlias(t *testing.T) {
 				t.Fatal(err)
 			}
 			path := filepath.Join(alias, "run", "plugin.sock")
+			canonicalPath := filepath.Join(real, "run", "plugin.sock")
+			if len(path) > 107 {
+				t.Fatalf("alias socket path has %d bytes, want at most 107", len(path))
+			}
+			if len(tc.target) > 107 && len(canonicalPath) <= 107 {
+				t.Fatalf("canonical socket path has %d bytes, want over 107", len(canonicalPath))
+			}
 			listener, err := listenUnixSocket(path, group.Name)
 			if err != nil {
 				t.Fatal(err)
@@ -372,6 +385,19 @@ func TestUnixTransportAcceptsTrustedAncestorAlias(t *testing.T) {
 				t.Fatal(err)
 			}
 			_ = conn.Close()
+			if _, err := listenUnixSocket(path, group.Name); err == nil {
+				t.Fatal("expected a live socket conflict through the alias")
+			}
+			// Closing must still remove the canonical socket if the alias moves.
+			if err := os.Rename(alias, filepath.Join(root, "moved-alias")); err != nil {
+				t.Fatal(err)
+			}
+			if err := listener.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Lstat(canonicalPath); !os.IsNotExist(err) {
+				t.Fatalf("canonical socket remains after close: %v", err)
+			}
 			assertSocketDirectoryUnchanged(t, real, before)
 		})
 	}

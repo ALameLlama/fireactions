@@ -69,7 +69,7 @@ Set `metrics.enabled` to `true` to serve Prometheus metrics. The default is enab
 
 ## Guest and lease limits
 
-`guest.startup_timeout` limits guest startup and readiness time. `guest.max_transfer_bytes` limits the total bytes in a file transfer. `guest.max_archive_entries` limits entries in one archive. Defaults are `2m`, `10737418240`, and `100000`.
+`guest.startup_timeout` limits guest startup and readiness time. `guest.max_transfer_bytes` limits the total bytes in a file transfer and must be positive. `guest.max_archive_entries` limits entries in one archive and must be between `1` and `2147483647`, inclusive, to fit the guest protocol's int32 field. Defaults are `2m`, `10737418240`, and `100000`.
 
 `leases.max_lifetime` limits each environment lifetime, including VM provisioning. A missing or zero requested lifetime uses this limit. The default is `3h2m`. At expiry, Fireactions cancels work and stops the VM. `leases.cleanup_grace` limits cleanup attempts after execution ends. It does not extend the job lifetime. `leases.reap_interval` sets how often the live daemon reconciles stale resources. Its default is `10s`. The independent systemd timer runs the one-shot reaper every `10s`; this timer interval is not set by `reap_interval`. `cleanup_grace` defaults to `2m`. All three durations must be positive. The reap interval cannot exceed cleanup grace, and startup timeout cannot exceed maximum lifetime.
 
