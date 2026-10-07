@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed
+
+* Validate archive symlink chains against the final transfer tree and remove temporary names after same-inode hardlink replacement.
+* Preserve process output during slow consumption and select PATH executables with the requested user's permissions.
+* Preserve guest upload rejection status when the guest closes the stream early.
+* Keep replica targets during concurrent reconciliation and preserve active provisioning on repeated resume calls.
+* Preserve existing socket directory permissions and replacement sockets. Return listener failures without an extra shutdown timeout.
+* Use one journal metadata lock instead of retaining a lock file for every completed VM. Resolve Firecracker executables through PATH.
+* Restart Containerd after explicit storage initialization and use the registered Runner label name in the first-build workflow.
+* Give real-VM integration tests a dedicated socket directory that follows the server permission policy.
+
 ### Changed
 
 * Remove GitHub App/JIT registration, runner processes and MMDS bootstrap. Pools now select bootable OCI image profiles while retaining Firecracker, devmapper, CNI and rate limits.
