@@ -2,6 +2,7 @@ package guestfs
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -49,24 +50,27 @@ func TestArchivePathAndSymlinkBoundaries(t *testing.T) {
 	for _, test := range []struct {
 		entry  string
 		target string
-		want   string
 		bad    bool
 	}{
-		{entry: "nested/link", target: "../sibling", want: "sibling"},
-		{entry: "link", target: "child", want: "child"},
+		{entry: "nested/link", target: "../sibling"},
+		{entry: "link", target: "child"},
 		{entry: "link", target: "../escape", bad: true},
 		{entry: "link", target: "/etc/passwd", bad: true},
 		{entry: "link", target: "\x00", bad: true},
+		{entry: "link", target: "missing/../child", bad: true},
 	} {
-		got, err := CleanLinkTarget(test.entry, test.target)
+		err := ValidateLinkTargets(map[string]string{test.entry: test.target}, func(name string) (fs.FileMode, string, error) {
+			if name == "nested" {
+				return fs.ModeDir, "", nil
+			}
+			return 0, "", os.ErrNotExist
+		})
 		if test.bad {
 			if !errors.Is(err, ErrInvalidPath) {
-				t.Errorf("CleanLinkTarget(%q, %q) error = %v, want ErrInvalidPath", test.entry, test.target, err)
+				t.Errorf("ValidateLinkTargets(%q, %q) error = %v, want ErrInvalidPath", test.entry, test.target, err)
 			}
-			continue
-		}
-		if err != nil || got != test.want {
-			t.Errorf("CleanLinkTarget(%q, %q) = %q, %v; want %q", test.entry, test.target, got, err, test.want)
+		} else if err != nil {
+			t.Errorf("ValidateLinkTargets(%q, %q) error = %v", test.entry, test.target, err)
 		}
 	}
 }
@@ -98,5 +102,32 @@ func TestOpenRootRejectsProcFilesystem(t *testing.T) {
 	}
 	if !errors.Is(err, ErrUnsafeFilesystem) {
 		t.Fatalf("OpenRoot(/proc) error = %v, want ErrUnsafeFilesystem", err)
+	}
+}
+
+func TestRootedLinkTargetsFollowComponentsBeforeParentTraversal(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.Mkdir(filepath.Join(workspace, "nested"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(".", filepath.Join(workspace, "pivot")); err != nil {
+		t.Fatal(err)
+	}
+	root, err := OpenRoot(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	for _, links := range []map[string]string{
+		{"escape": "pivot/../outside"},
+		{"a": "b", "b": "a"},
+		{"escape": "missing/../outside"},
+	} {
+		if err := root.ValidateLinkTargets(links); !errors.Is(err, ErrInvalidPath) {
+			t.Fatalf("ValidateLinkTargets(%v) = %v, want ErrInvalidPath", links, err)
+		}
+	}
+	if err := root.ValidateLinkTargets(map[string]string{"nested/safe": "../missing", "dangling": "missing/child"}); err != nil {
+		t.Fatalf("safe relative and dangling links rejected: %v", err)
 	}
 }

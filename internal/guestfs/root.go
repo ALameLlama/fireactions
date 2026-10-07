@@ -277,21 +277,83 @@ func CleanArchiveName(name string) (string, error) {
 	return clean, nil
 }
 
-// CleanLinkTarget checks that a relative symlink stays in an archive root.
-func CleanLinkTarget(entry, target string) (string, error) {
-	entry, err := CleanArchiveName(entry)
-	if err != nil {
-		return "", err
+// ValidateLinkTargets resolves each relative link component by component. In
+// particular, ".." is applied after expanding any preceding symlink, rather
+// than cleaning the target lexically. Lookup must describe the final rooted
+// tree. Missing tails containing only names remain safely dangling, but ".."
+// after a missing component cannot establish containment.
+func ValidateLinkTargets(links map[string]string, lookup func(string) (fs.FileMode, string, error)) error {
+	for entry, target := range links {
+		clean, err := CleanArchiveName(entry)
+		if err != nil || clean == "." || target == "" || strings.IndexByte(target, 0) >= 0 || path.IsAbs(target) {
+			return ErrInvalidPath
+		}
+		components := strings.Split(path.Dir(clean)+"/"+target, "/")
+		resolved := make([]string, 0, len(components))
+		mode := fs.ModeDir
+		followed := 0
+		missing := false
+		for len(components) != 0 {
+			component := components[0]
+			components = components[1:]
+			if !mode.IsDir() {
+				return ErrInvalidPath
+			}
+			switch component {
+			case "", ".":
+				continue
+			case "..":
+				if len(resolved) == 0 || missing {
+					return ErrInvalidPath
+				}
+				resolved = resolved[:len(resolved)-1]
+				continue
+			}
+			name := strings.Join(append(resolved, component), "/")
+			if link, ok := links[name]; ok {
+				mode = fs.ModeSymlink
+				target = link
+			} else {
+				mode, link, err = lookup(name)
+				if errors.Is(err, os.ErrNotExist) {
+					missing = true
+					mode = fs.ModeDir
+				} else if err != nil {
+					return err
+				}
+				target = link
+			}
+			if mode&fs.ModeSymlink != 0 {
+				followed++
+				if followed > 40 || target == "" || strings.IndexByte(target, 0) >= 0 || path.IsAbs(target) {
+					return ErrInvalidPath
+				}
+				components = append(strings.Split(target, "/"), components...)
+				mode = fs.ModeDir
+				continue
+			}
+			resolved = append(resolved, component)
+		}
 	}
-	if target == "" || strings.IndexByte(target, 0) >= 0 || path.IsAbs(target) {
-		return "", ErrInvalidPath
-	}
-	resolved := path.Clean(path.Join(path.Dir(entry), target))
-	if resolved == ".." || strings.HasPrefix(resolved, "../") || path.IsAbs(resolved) {
-		return "", ErrInvalidPath
-	}
-	return resolved, nil
+	return nil
 }
+
+// ValidateLinkTargets checks the final workspace tree with proposed links
+// overlaid on it. All filesystem inspection remains beneath the open root.
+func (r *RootFS) ValidateLinkTargets(links map[string]string) error {
+	return ValidateLinkTargets(links, func(name string) (fs.FileMode, string, error) {
+		info, err := r.Lstat(name)
+		if err != nil {
+			return 0, "", err
+		}
+		if info.Mode()&fs.ModeSymlink != 0 {
+			target, err := r.Readlink(name)
+			return info.Mode(), target, err
+		}
+		return info.Mode(), "", nil
+	})
+}
+
 func (r *RootFS) CheckRegular(file *os.File) error {
 	var stat unix.Stat_t
 	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {

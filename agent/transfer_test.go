@@ -534,3 +534,192 @@ func TestCopyInCancellationStopsBeforeSuccess(t *testing.T) {
 	}
 	requireCode(t, a.CopyIn(stream), codes.Canceled)
 }
+
+func TestCopyInRejectsSymlinkGraphEscapesInEveryOrder(t *testing.T) {
+	pivot := &tar.Header{Name: "pivot", Typeflag: tar.TypeSymlink, Linkname: "."}
+	escape := &tar.Header{Name: "escape", Typeflag: tar.TypeSymlink, Linkname: "pivot/../outside"}
+	cases := []struct {
+		name    string
+		headers []*tar.Header
+	}{
+		{"pivot first", []*tar.Header{pivot, escape}},
+		{"pivot last", []*tar.Header{escape, pivot}},
+		{"pivot mutation", []*tar.Header{
+			{Name: "nested", Typeflag: tar.TypeDir, Mode: 0755},
+			{Name: "pivot", Typeflag: tar.TypeSymlink, Linkname: "nested"},
+			escape, pivot,
+		}},
+		{"cycle", []*tar.Header{
+			{Name: "a", Typeflag: tar.TypeSymlink, Linkname: "b"},
+			{Name: "b", Typeflag: tar.TypeSymlink, Linkname: "a"},
+		}},
+		{"unprovable dangling traversal", []*tar.Header{
+			{Name: "escape", Typeflag: tar.TypeSymlink, Linkname: "missing/../outside"},
+		}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			a, workspace := newTransferTestAgent(t, 1<<20, 20)
+			outside := filepath.Join(workspace, "outside")
+			if err := os.WriteFile(outside, []byte("untouched"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			stream := copyInChunks(context.Background(), firstChunk("/workspace/dest", makeTar(t, test.headers...)))
+			requireCode(t, a.CopyIn(stream), codes.InvalidArgument)
+			if stream.response != nil {
+				t.Fatal("unsafe archive succeeded")
+			}
+			for _, name := range []string{"escape", "pivot", "a", "b"} {
+				if _, err := os.Lstat(filepath.Join(workspace, "dest", name)); !os.IsNotExist(err) {
+					t.Fatalf("rejected archive installed link %q: %v", name, err)
+				}
+			}
+			data, err := os.ReadFile(outside)
+			if err != nil || string(data) != "untouched" {
+				t.Fatalf("outside marker changed: %q, %v", data, err)
+			}
+		})
+	}
+}
+
+func TestCopyInSafeRelativeForwardAndDanglingLinksRoundTrip(t *testing.T) {
+	a, workspace := newTransferTestAgent(t, 1<<20, 20)
+	archive := makeTar(t,
+		&tar.Header{Name: "nested/relative", Typeflag: tar.TypeSymlink, Linkname: "../value"},
+		&tar.Header{Name: "nested/dangling", Typeflag: tar.TypeSymlink, Linkname: "../missing/child"},
+		&tar.Header{Name: "chain", Typeflag: tar.TypeSymlink, Linkname: "nested/relative"},
+		&tar.Header{Name: "value", Typeflag: tar.TypeReg, Mode: 0600, Size: 2, Linkname: "ok"},
+	)
+	if err := a.CopyIn(copyInChunks(context.Background(), firstChunk("/workspace/dest", archive))); err != nil {
+		t.Fatalf("CopyIn safe links: %v", err)
+	}
+	for _, name := range []string{"nested/relative", "chain"} {
+		data, err := os.ReadFile(filepath.Join(workspace, "dest", name))
+		if err != nil || string(data) != "ok" {
+			t.Fatalf("safe link %q unusable: %q, %v", name, data, err)
+		}
+	}
+	stream := &copyOutTestStream{ctx: context.Background()}
+	if err := a.CopyOut(&agentv1.CopyOutRequest{SrcPath: "/workspace/dest"}, stream); err != nil {
+		t.Fatalf("CopyOut safe links: %v", err)
+	}
+	reader := tar.NewReader(bytes.NewReader(bytes.Join(stream.chunks, nil)))
+	links := make(map[string]string)
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if header.Typeflag == tar.TypeSymlink {
+			links[header.Name] = header.Linkname
+		}
+	}
+	if links["nested/relative"] != "../value" || links["nested/dangling"] != "../missing/child" || links["chain"] != "nested/relative" {
+		t.Fatalf("link targets changed during round trip: %v", links)
+	}
+}
+
+func TestCopyInDuplicateHardlinksLeaveNoTemporaryNames(t *testing.T) {
+	a, workspace := newTransferTestAgent(t, 1<<20, 20)
+	archive := makeTar(t,
+		&tar.Header{Name: "a", Typeflag: tar.TypeReg, Mode: 0600, Size: 2, Linkname: "ok"},
+		&tar.Header{Name: "b", Typeflag: tar.TypeLink, Linkname: "a", Mode: 0600},
+		&tar.Header{Name: "b", Typeflag: tar.TypeLink, Linkname: "a", Mode: 0600},
+	)
+	if err := a.CopyIn(copyInChunks(context.Background(), firstChunk("/workspace/dest", archive))); err != nil {
+		t.Fatalf("CopyIn duplicate hardlinks: %v", err)
+	}
+	directory := filepath.Join(workspace, "dest")
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].Name() != "a" || entries[1].Name() != "b" {
+		t.Fatalf("duplicate hardlinks left unexpected names: %v", entries)
+	}
+	aInfo, err := os.Stat(filepath.Join(directory, "a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bInfo, err := os.Stat(filepath.Join(directory, "b"))
+	if err != nil || !os.SameFile(aInfo, bInfo) {
+		t.Fatalf("hardlink inode mismatch: %v", err)
+	}
+}
+
+func TestCopyOutRejectsUnsafeLinkGraphsBeforeSending(t *testing.T) {
+	for _, links := range []map[string]string{
+		{"pivot": ".", "escape": "pivot/../outside"},
+		{"a": "b", "b": "a"},
+		{"escape": "missing/../outside"},
+	} {
+		a, workspace := newTransferTestAgent(t, 1<<20, 20)
+		tree := filepath.Join(workspace, "tree")
+		if err := os.Mkdir(tree, 0755); err != nil {
+			t.Fatal(err)
+		}
+		for name, target := range links {
+			if err := os.Symlink(target, filepath.Join(tree, name)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		stream := &copyOutTestStream{ctx: context.Background()}
+		requireCode(t, a.CopyOut(&agentv1.CopyOutRequest{SrcPath: "/workspace/tree"}, stream), codes.InvalidArgument)
+		if len(stream.chunks) != 0 {
+			t.Fatal("unsafe graph reached the streaming consumer")
+		}
+	}
+}
+
+func TestCopyOutUsesValidatedLinkSnapshotAfterPivotMutation(t *testing.T) {
+	a, workspace := newTransferTestAgent(t, 1<<20, 20)
+	tree := filepath.Join(workspace, "tree")
+	if err := os.MkdirAll(filepath.Join(tree, "nested"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tree, "a-large"), bytes.Repeat([]byte{'a'}, 64<<10), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tree, "outside"), []byte("safe"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for name, target := range map[string]string{"pivot": "nested", "escape": "pivot/../outside"} {
+		if err := os.Symlink(target, filepath.Join(tree, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stream := &copyOutTestStream{ctx: context.Background(), onFirstSend: func() {
+		if err := os.Remove(filepath.Join(tree, "pivot")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(".", filepath.Join(tree, "pivot")); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	if err := a.CopyOut(&agentv1.CopyOutRequest{SrcPath: "/workspace/tree"}, stream); err != nil {
+		t.Fatalf("CopyOut mutated pivot: %v", err)
+	}
+	reader := tar.NewReader(bytes.NewReader(bytes.Join(stream.chunks, nil)))
+	found := false
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if header.Name == "pivot" {
+			found = true
+			if header.Linkname != "nested" {
+				t.Fatalf("archive reread mutated pivot: %q", header.Linkname)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("pivot missing from archive")
+	}
+}

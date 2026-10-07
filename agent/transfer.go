@@ -57,6 +57,8 @@ func (a *Agent) CopyIn(stream agentv1.AgentService_CopyInServer) error {
 	fileBuffer := make([]byte, transferBufferSize)
 	var extractedBytes int64
 	metadata := make(map[string]directoryMetadata)
+	links := make(map[string]string)
+	linkMetadata := make(map[string]time.Time)
 	entries := 0
 	for {
 		if err := stream.Context().Err(); err != nil {
@@ -111,12 +113,16 @@ func (a *Agent) CopyIn(stream agentv1.AgentService_CopyInServer) error {
 			if header.Size != 0 || name == "." {
 				return status.Error(codes.InvalidArgument, "invalid symbolic link entry")
 			}
-			if _, err := guestfs.CleanLinkTarget(name, header.Linkname); err != nil {
+			// Install links only after the final tree has been validated, so a
+			// later pivot cannot change the meaning of an earlier target.
+			if header.Linkname == "" || strings.IndexByte(header.Linkname, 0) >= 0 || path.IsAbs(header.Linkname) {
 				return status.Error(codes.InvalidArgument, "unsafe symbolic link target")
 			}
-			if err := extractSymlink(destRoot, name, header.Linkname, header.ModTime, identity); err != nil {
+			if err := ensureParent(destRoot, name, identity); err != nil {
 				return filesystemError(err)
 			}
+			links[name] = header.Linkname
+			linkMetadata[name] = header.ModTime
 		case tar.TypeLink:
 			if header.Size != 0 || name == "." {
 				return status.Error(codes.InvalidArgument, "invalid hard link entry")
@@ -130,6 +136,17 @@ func (a *Agent) CopyIn(stream agentv1.AgentService_CopyInServer) error {
 			}
 		default:
 			return status.Error(codes.InvalidArgument, "unsupported tar entry type")
+		}
+	}
+	if err := destRoot.ValidateLinkTargets(links); err != nil {
+		return status.Error(codes.InvalidArgument, "unsafe symbolic link target")
+	}
+	for name, target := range links {
+		if err := stream.Context().Err(); err != nil {
+			return transferError(err)
+		}
+		if err := extractSymlink(destRoot, name, target, linkMetadata[name], identity); err != nil {
+			return filesystemError(err)
 		}
 	}
 
@@ -161,6 +178,17 @@ func (a *Agent) CopyOut(req *agentv1.CopyOutRequest, stream agentv1.AgentService
 		}
 		return filesystemError(err)
 	}
+	// Pin the transfer root before taking the archive snapshot. The snapshot's
+	// link graph is validated before any header reaches the streaming consumer.
+	transferRoot := a.fs
+	if info.IsDir() || source == "." {
+		transferRoot, err = a.fs.OpenRoot(source)
+		if err != nil {
+			return filesystemError(err)
+		}
+		defer transferRoot.Close()
+		source = "."
+	}
 	maxBytes, maxEntries := a.transferLimits()
 	output := &copyOutWriter{ctx: stream.Context(), stream: stream, maxBytes: maxBytes, buffer: make([]byte, transferBufferSize)}
 	archive := tar.NewWriter(output)
@@ -169,12 +197,26 @@ func (a *Agent) CopyOut(req *agentv1.CopyOutRequest, stream agentv1.AgentService
 		maxBytes:   maxBytes,
 		maxEntries: maxEntries,
 		buffer:     make([]byte, transferBufferSize),
+		snapshot:   make(map[string]archiveSnapshot),
+		links:      make(map[string]string),
 	}
 	archiveName := path.Base(source)
 	if info.IsDir() || source == "." {
 		archiveName = "."
 	}
-	if err := writeArchiveEntry(a.fs, archive, source, archiveName, info, state, false); err != nil {
+	if err := captureArchiveEntry(transferRoot, source, archiveName, info, state); err != nil {
+		return transferError(err)
+	}
+	if err := guestfs.ValidateLinkTargets(state.links, func(name string) (fs.FileMode, string, error) {
+		entry, ok := state.snapshot[name]
+		if !ok {
+			return 0, "", os.ErrNotExist
+		}
+		return entry.info.Mode(), entry.target, nil
+	}); err != nil {
+		return status.Error(codes.InvalidArgument, "workspace symbolic link escapes the transfer root")
+	}
+	if err := writeArchiveEntry(transferRoot, archive, source, archiveName, info, state); err != nil {
 		return transferError(err)
 	}
 	if err := archive.Close(); err != nil {
@@ -463,13 +505,8 @@ func extractSymlink(root *guestfs.RootFS, name, target string, mtime time.Time, 
 		if info.Mode()&fs.ModeSymlink == 0 {
 			return guestfs.ErrInvalidPath
 		}
-		existingTarget, err := parent.Readlink(base)
-		if err != nil {
-			return err
-		}
-		if _, err := guestfs.CleanLinkTarget(name, existingTarget); err != nil {
-			return guestfs.ErrInvalidPath
-		}
+		// Replacing a symlink does not follow its old target. The new target
+		// has already been checked against the final transfer graph.
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -593,6 +630,10 @@ func extractHardlink(root *guestfs.RootFS, source, name string, header *tar.Head
 			_ = destinationParent.Remove(temporary)
 			return err
 		}
+		// rename is a no-op when both names already refer to the same inode.
+		if err := destinationParent.Remove(temporary); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 		return nil
 	}
 	return fmt.Errorf("could not create a temporary hard link")
@@ -662,17 +703,99 @@ type copyOutState struct {
 	entries    int
 	maxEntries int
 	buffer     []byte
+	snapshot   map[string]archiveSnapshot
+	links      map[string]string
 }
 
-func writeArchiveEntry(root *guestfs.RootFS, archive *tar.Writer, source, archiveName string, info fs.FileInfo, state *copyOutState, reserved bool) error {
+type archiveSnapshot struct {
+	info     fs.FileInfo
+	target   string
+	children []string
+}
+
+// Capture names and link targets before writing. Export always uses this exact
+// graph, not targets reread from a workspace that can change while streaming.
+func captureArchiveEntry(root *guestfs.RootFS, source, name string, info fs.FileInfo, state *copyOutState) error {
 	if err := state.ctx.Err(); err != nil {
 		return err
 	}
-	if !reserved {
-		state.entries++
-		if state.entries > state.maxEntries {
-			return status.Error(codes.ResourceExhausted, "archive entry limit exceeded")
+	state.entries++
+	if state.entries > state.maxEntries {
+		return status.Error(codes.ResourceExhausted, "archive entry limit exceeded")
+	}
+	entry := archiveSnapshot{info: info}
+	switch {
+	case info.IsDir():
+		directoryRoot, err := root.OpenRoot(source)
+		if err != nil {
+			return err
 		}
+		defer directoryRoot.Close()
+		directory, err := directoryRoot.OpenFile(".", os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+		if err != nil {
+			return err
+		}
+		defer directory.Close()
+		if err := directoryRoot.CheckDirectory(directory); err != nil {
+			return err
+		}
+		current, err := directory.Stat()
+		if err != nil {
+			return err
+		}
+		if !os.SameFile(info, current) {
+			return status.Error(codes.InvalidArgument, "workspace directory changed during archive")
+		}
+		entry.info = current
+		for {
+			if err := state.ctx.Err(); err != nil {
+				return err
+			}
+			batch, readErr := directory.ReadDir(128)
+			for _, child := range batch {
+				childName := child.Name()
+				if childName == "." || childName == ".." || strings.ContainsAny(childName, "/\x00") {
+					return status.Error(codes.InvalidArgument, "unsafe workspace entry name")
+				}
+				if len(entry.children) >= state.maxEntries-state.entries {
+					return status.Error(codes.ResourceExhausted, "archive entry limit exceeded")
+				}
+				entry.children = append(entry.children, childName)
+			}
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				return readErr
+			}
+		}
+		sort.Strings(entry.children)
+		for _, child := range entry.children {
+			childInfo, err := directoryRoot.Lstat(child)
+			if err != nil {
+				return err
+			}
+			if err := captureArchiveEntry(directoryRoot, child, path.Join(name, child), childInfo, state); err != nil {
+				return err
+			}
+		}
+	case info.Mode()&fs.ModeSymlink != 0:
+		target, err := root.Readlink(source)
+		if err != nil {
+			return err
+		}
+		entry.target = target
+		state.links[name] = target
+	case !info.Mode().IsRegular():
+		return status.Error(codes.InvalidArgument, "unsupported workspace filesystem object")
+	}
+	state.snapshot[name] = entry
+	return nil
+}
+
+func writeArchiveEntry(root *guestfs.RootFS, archive *tar.Writer, source, archiveName string, info fs.FileInfo, state *copyOutState) error {
+	if err := state.ctx.Err(); err != nil {
+		return err
 	}
 	cleanName, err := guestfs.CleanArchiveName(archiveName)
 	if err != nil {
@@ -711,28 +834,7 @@ func writeArchiveEntry(root *guestfs.RootFS, archive *tar.Writer, source, archiv
 		if err := archive.WriteHeader(header); err != nil {
 			return err
 		}
-		children := make([]string, 0)
-		for {
-			batch, readErr := directory.ReadDir(128)
-			for _, child := range batch {
-				childName := child.Name()
-				if strings.IndexByte(childName, 0) >= 0 || childName == "." || childName == ".." || strings.Contains(childName, "/") {
-					return status.Error(codes.InvalidArgument, "unsafe workspace entry name")
-				}
-				state.entries++
-				if state.entries > state.maxEntries {
-					return status.Error(codes.ResourceExhausted, "archive entry limit exceeded")
-				}
-				children = append(children, childName)
-			}
-			if readErr == io.EOF {
-				break
-			}
-			if readErr != nil {
-				return readErr
-			}
-		}
-		sort.Strings(children)
+		children := state.snapshot[cleanName].children
 		for _, childName := range children {
 			if err := state.ctx.Err(); err != nil {
 				return err
@@ -741,28 +843,14 @@ func writeArchiveEntry(root *guestfs.RootFS, archive *tar.Writer, source, archiv
 			if cleanName != "." {
 				childArchive = path.Join(cleanName, childName)
 			}
-			childInfo, err := directoryRoot.Lstat(childName)
-			if err != nil {
-				return err
-			}
-			if err := writeArchiveEntry(directoryRoot, archive, childName, childArchive, childInfo, state, true); err != nil {
+			childInfo := state.snapshot[childArchive].info
+			if err := writeArchiveEntry(directoryRoot, archive, childName, childArchive, childInfo, state); err != nil {
 				return err
 			}
 		}
 		return nil
 	case mode&fs.ModeSymlink != 0:
-		parent, base, err := root.OpenParent(source)
-		if err != nil {
-			return err
-		}
-		target, err := parent.Readlink(base)
-		_ = parent.Close()
-		if err != nil {
-			return err
-		}
-		if _, err := guestfs.CleanLinkTarget(cleanName, target); err != nil {
-			return status.Error(codes.InvalidArgument, "workspace symbolic link escapes the transfer root")
-		}
+		target := state.snapshot[cleanName].target
 		return archive.WriteHeader(&tar.Header{Name: cleanName, Typeflag: tar.TypeSymlink, Linkname: target, Mode: 0777, ModTime: info.ModTime(), Format: tar.FormatPAX})
 	case mode.IsRegular():
 		parent, base, err := root.OpenParent(source)
