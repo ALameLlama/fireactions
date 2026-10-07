@@ -633,7 +633,7 @@ func journalProcessExited(t *testing.T, cmd *exec.Cmd, timeout int) bool {
 }
 
 func TestStartupRecoversInterruptedDirectoryOwnership(t *testing.T) {
-	for _, window := range []string{"before-marker", "partial-marker", "foreign-content", "after-publication", "partial-reservation"} {
+	for _, window := range []string{"before-marker", "partial-marker", "unpublished-marker", "foreign-marker-temp", "foreign-content", "after-publication", "partial-reservation"} {
 		t.Run(window, func(t *testing.T) {
 			s := newTestStateStore(t)
 			expiry := time.Now().Add(-time.Second)
@@ -667,6 +667,15 @@ func TestStartupRecoversInterruptedDirectoryOwnership(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if window == "unpublished-marker" || window == "foreign-marker-temp" {
+				data := ownershipMarker(r)
+				if window == "foreign-marker-temp" {
+					data = "foreign"
+				}
+				if err := os.WriteFile(filepath.Join(stage, ".ownership-interrupted"), []byte(data), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
 			foreign := filepath.Join(stage, "unrelated-content")
 			if window == "foreign-content" {
 				if err := os.WriteFile(foreign, []byte("preserve"), 0600); err != nil {
@@ -684,12 +693,16 @@ func TestStartupRecoversInterruptedDirectoryOwnership(t *testing.T) {
 			}
 			s.cleanup = s.cleanupRecord
 			err := s.ReconcileStartup(context.Background())
-			if window == "foreign-content" {
+			if window == "foreign-content" || window == "foreign-marker-temp" {
 				if err == nil {
 					t.Fatal("foreign staging contents were accepted as owned")
 				}
-				if data, err := os.ReadFile(foreign); err != nil || string(data) != "preserve" {
-					t.Fatal("foreign staging path was removed")
+				preserved := foreign
+				if window == "foreign-marker-temp" {
+					preserved = filepath.Join(stage, ".ownership-interrupted")
+				}
+				if _, err := os.Lstat(preserved); err != nil {
+					t.Fatalf("foreign staging path was removed: %v", err)
 				}
 				return
 			}
@@ -1474,5 +1487,319 @@ func TestJournalReclamationRejectsReplacedAuthorityAfterWaiting(t *testing.T) {
 	}
 	if err := s.destroyRecord(context.Background(), r.VMID); err != nil {
 		t.Fatalf("new allocation was not independently reclaimable: %v", err)
+	}
+}
+
+func TestInterruptedResourceDirectoryCleanupConverges(t *testing.T) {
+	for _, window := range []string{"owner-unlinked", "directory-removed", "removal-sync-failed", "marker-removal-sync-failed"} {
+		t.Run(window, func(t *testing.T) {
+			s := newTestStateStore(t)
+			r := testStateRecord(s, "ubuntu", "ubuntu-cleanup", "removing", nil)
+			r.InstanceID = "prior-instance"
+			if err := s.create(r); err != nil {
+				t.Fatal(err)
+			}
+			dir := filepath.Dir(r.APISocketPath)
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := writeOwnershipMarker(filepath.Join(dir, ".owner"), r); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "disk"), []byte("owned data"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			failure := errors.New("interrupted cleanup")
+			s.cleanup = func(_ context.Context, record *stateRecord, _ bool) error {
+				return s.removeOwnedResourceDirectory(filepath.Dir(record.APISocketPath), record)
+			}
+			if window == "owner-unlinked" || window == "directory-removed" {
+				s.removeResourceDir = func(path string) error {
+					if owned, err := ownedMarker(deletionMarkerPath(path, r), r); err != nil || !owned {
+						t.Fatalf("recursive removal started without external authority: %v", err)
+					}
+					if err := os.Remove(filepath.Join(path, ".owner")); err != nil {
+						t.Fatal(err)
+					}
+					if window == "directory-removed" {
+						if err := os.RemoveAll(path); err != nil {
+							t.Fatal(err)
+						}
+					}
+					return failure
+				}
+			} else {
+				calls := 0
+				s.syncDir = func(file *os.File) error {
+					if file.Name() == filepath.Dir(dir) {
+						calls++
+						failAt := 2
+						if window == "marker-removal-sync-failed" {
+							failAt = 3
+						}
+						if calls == failAt {
+							if _, err := os.Lstat(dir); !alreadyGone(err) {
+								t.Fatalf("directory still present at retirement boundary: %v", err)
+							}
+							if window == "removal-sync-failed" {
+								if owned, err := ownedMarker(deletionMarkerPath(dir, r), r); err != nil || !owned {
+									t.Fatalf("authority retired before directory removal was durable: %v", err)
+								}
+							}
+							return failure
+						}
+					}
+					return file.Sync()
+				}
+			}
+			if err := s.ReconcileStartup(context.Background()); !errors.Is(err, failure) {
+				t.Fatalf("interruption was hidden: %v", err)
+			}
+			if state, err := s.State(r.VMID); err != nil || state != "removing" {
+				t.Fatalf("interruption lost retry record: %q %v", state, err)
+			}
+			if window != "marker-removal-sync-failed" {
+				if owned, err := ownedMarker(deletionMarkerPath(dir, r), r); err != nil || !owned {
+					t.Fatalf("interruption lost deletion authority: %v", err)
+				}
+			}
+			if window == "owner-unlinked" {
+				if _, err := ownedDirectory(dir, r); err == nil {
+					t.Fatal("ordinary ownership accepted a markerless directory")
+				}
+			}
+			s.removeResourceDir = nil
+			s.syncDir = (*os.File).Sync
+			if err := s.ReconcileStartup(context.Background()); err != nil {
+				t.Fatalf("interrupted cleanup cannot recover: %v", err)
+			}
+			for _, path := range []string{dir, deletionMarkerPath(dir, r), s.recordPath(r.VMID)} {
+				if _, err := os.Lstat(path); !alreadyGone(err) {
+					t.Fatalf("cleanup did not converge: %s: %v", path, err)
+				}
+			}
+		})
+	}
+}
+
+func TestResourceDirectoryCleanupRejectsForeignEvidence(t *testing.T) {
+	for _, conflict := range []string{"missing-authority", "foreign-sidecar", "partial-sidecar", "symlink-sidecar", "foreign-owner"} {
+		t.Run(conflict, func(t *testing.T) {
+			s := newTestStateStore(t)
+			r := testStateRecord(s, "ubuntu", "ubuntu-conflict", "removing", nil)
+			dir := filepath.Dir(r.APISocketPath)
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			sentinel := filepath.Join(dir, "sentinel")
+			if err := os.WriteFile(sentinel, []byte("preserve"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			marker := deletionMarkerPath(dir, r)
+			switch conflict {
+			case "foreign-sidecar", "partial-sidecar":
+				data := "foreign"
+				if conflict == "partial-sidecar" {
+					data = r.InstanceID
+				}
+				if err := os.WriteFile(marker, []byte(data), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink-sidecar":
+				if err := os.Symlink(sentinel, marker); err != nil {
+					t.Fatal(err)
+				}
+			case "foreign-owner":
+				if err := writeOwnershipMarker(marker, r); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, ".owner"), []byte("foreign"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := os.ReadDir(filepath.Dir(dir))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.removeOwnedResourceDirectory(dir, r); err == nil {
+				t.Fatal("foreign evidence authorized directory deletion")
+			}
+			after, err := os.ReadDir(filepath.Dir(dir))
+			if err != nil || !reflect.DeepEqual(before, after) {
+				t.Fatalf("foreign paths changed: %v %v", after, err)
+			}
+			if data, err := os.ReadFile(sentinel); err != nil || string(data) != "preserve" {
+				t.Fatalf("foreign resource changed: %q %v", data, err)
+			}
+			if conflict == "foreign-sidecar" || conflict == "partial-sidecar" {
+				expected := "foreign"
+				if conflict == "partial-sidecar" {
+					expected = r.InstanceID
+				}
+				if data, err := os.ReadFile(marker); err != nil || string(data) != expected {
+					t.Fatalf("foreign sidecar changed: %q %v", data, err)
+				}
+			}
+		})
+	}
+}
+
+func TestOwnershipMarkerAtomicPublicationBoundaries(t *testing.T) {
+	for _, boundary := range []string{"file-sync", "file-close", "parent-sync", "ancestor-sync", "rename-collision"} {
+		t.Run(boundary, func(t *testing.T) {
+			s := newTestStateStore(t)
+			r := testStateRecord(s, "ubuntu", "ubuntu-marker", "removing", nil)
+			path := filepath.Join(t.TempDir(), ".owner")
+			failure := errors.New("marker persistence failed")
+			syncFile := func(file *os.File) error {
+				if _, err := os.Lstat(path); !alreadyGone(err) {
+					t.Fatalf("incomplete marker became visible before publication: %v", err)
+				}
+				if data, err := os.ReadFile(file.Name()); err != nil || string(data) != ownershipMarker(r) {
+					t.Fatalf("temporary marker incomplete: %q %v", data, err)
+				}
+				if boundary == "file-sync" {
+					return failure
+				}
+				if err := file.Sync(); err != nil {
+					return err
+				}
+				if boundary == "file-close" {
+					return file.Close()
+				}
+				if boundary == "rename-collision" {
+					return os.WriteFile(path, []byte("foreign"), 0600)
+				}
+				return nil
+			}
+			syncDir := func(file *os.File) error {
+				if owned, err := ownedMarker(path, r); err != nil || !owned {
+					t.Fatalf("postpublication sync saw incomplete marker: %v", err)
+				}
+				if boundary == "parent-sync" && file.Name() == filepath.Dir(path) {
+					return failure
+				}
+				if boundary == "ancestor-sync" && file.Name() == filepath.Dir(filepath.Dir(path)) {
+					return failure
+				}
+				return file.Sync()
+			}
+			err := writeOwnershipMarkerWithSync(path, r, syncFile, syncDir)
+			if err == nil {
+				t.Fatal("publication boundary failure was hidden")
+			}
+			switch boundary {
+			case "file-sync", "file-close":
+				if _, err := os.Lstat(path); !alreadyGone(err) {
+					t.Fatalf("prepublication failure left final marker: %v", err)
+				}
+			case "rename-collision":
+				if !errors.Is(err, unix.EEXIST) {
+					t.Fatalf("no-replace collision not reported: %v", err)
+				}
+				if data, err := os.ReadFile(path); err != nil || string(data) != "foreign" {
+					t.Fatalf("foreign destination changed: %q %v", data, err)
+				}
+			default:
+				if !errors.Is(err, failure) {
+					t.Fatalf("directory sync error lost: %v", err)
+				}
+				if owned, err := ownedMarker(path, r); err != nil || !owned {
+					t.Fatalf("postpublication failure left invalid marker: %v", err)
+				}
+			}
+			entries, err := os.ReadDir(filepath.Dir(path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), ".ownership-") {
+					t.Fatalf("failed publication leaked its temporary marker: %s", entry.Name())
+				}
+			}
+		})
+	}
+}
+
+func TestOwnershipMarkerNeverReplacesDestination(t *testing.T) {
+	for _, destination := range []string{"empty", "foreign", "matching", "symlink", "directory"} {
+		t.Run(destination, func(t *testing.T) {
+			s := newTestStateStore(t)
+			r := testStateRecord(s, "ubuntu", "ubuntu-marker", "removing", nil)
+			path := filepath.Join(t.TempDir(), ".owner")
+			var err error
+			switch destination {
+			case "directory":
+				err = os.Mkdir(path, 0700)
+			case "symlink":
+				err = os.Symlink("untouched", path)
+			default:
+				data := ""
+				if destination == "foreign" {
+					data = "foreign"
+				} else if destination == "matching" {
+					data = ownershipMarker(r)
+				}
+				err = os.WriteFile(path, []byte(data), 0600)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.Lstat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := writeOwnershipMarker(path, r); !errors.Is(err, unix.EEXIST) {
+				t.Fatalf("existing destination was not rejected: %v", err)
+			}
+			after, err := os.Lstat(path)
+			if err != nil || !os.SameFile(before, after) || before.Mode() != after.Mode() || before.Size() != after.Size() {
+				t.Fatalf("destination replaced: %v %v", after, err)
+			}
+		})
+	}
+}
+
+func TestPreallocationDirectoryCleanupRetainsExternalAuthority(t *testing.T) {
+	s := newTestStateStore(t)
+	expiry := time.Now().Add(-time.Second)
+	r := testStateRecord(s, "ubuntu", "ubuntu-preallocation-cleanup", "provisioning", &expiry)
+	r.InstanceID, r.OwnerStartTime = "prior-instance", "0"
+	r.AllocationReady = false
+	if err := s.create(r); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Dir(r.APISocketPath)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeOwnershipMarker(filepath.Join(dir, ".owner"), r); err != nil {
+		t.Fatal(err)
+	}
+	failure := errors.New("interrupted final allocation cleanup")
+	s.removeResourceDir = func(path string) error {
+		if err := os.Remove(filepath.Join(path, ".owner")); err != nil {
+			t.Fatal(err)
+		}
+		return failure
+	}
+	s.cleanup = s.cleanupRecord
+	if err := s.ReconcileStartup(context.Background()); !errors.Is(err, failure) {
+		t.Fatalf("preallocation cleanup interruption hidden: %v", err)
+	}
+	if owned, err := ownedMarker(deletionMarkerPath(dir, r), r); err != nil || !owned {
+		t.Fatalf("preallocation cleanup lost external authority: %v", err)
+	}
+	if state, err := s.State(r.VMID); err != nil || state != "removing" {
+		t.Fatalf("preallocation interruption lost record: %q %v", state, err)
+	}
+	s.removeResourceDir = nil
+	if err := s.ReconcileStartup(context.Background()); err != nil {
+		t.Fatalf("preallocation cleanup cannot recover: %v", err)
+	}
+	for _, path := range []string{dir, deletionMarkerPath(dir, r), s.recordPath(r.VMID)} {
+		if _, err := os.Lstat(path); !alreadyGone(err) {
+			t.Fatalf("preallocation cleanup did not converge: %s: %v", path, err)
+		}
 	}
 }

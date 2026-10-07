@@ -72,9 +72,10 @@ type StateStore struct {
 	cleanupGrace   time.Duration
 	profiles       map[string]bool
 	// Fault seams exercise real filesystem persistence and ordered retries.
-	syncFile func(*os.File) error
-	syncDir  func(*os.File) error
-	cleanup  func(context.Context, *stateRecord, bool) error
+	syncFile          func(*os.File) error
+	syncDir           func(*os.File) error
+	cleanup           func(context.Context, *stateRecord, bool) error
+	removeResourceDir func(string) error
 }
 
 func NewStateStore(config *Config, client *containerd.Client) (*StateStore, error) {
@@ -722,7 +723,7 @@ func (s *StateStore) cleanupRecord(ctx context.Context, r *stateRecord, active b
 		return err
 	}
 	resourceDir := filepath.Dir(r.APISocketPath)
-	owned, err := ownedDirectory(resourceDir, r)
+	_, err := ownedDirectoryForCleanup(resourceDir, r)
 	if err != nil {
 		return err
 	}
@@ -782,10 +783,8 @@ func (s *StateStore) cleanupRecord(ctx context.Context, r *stateRecord, active b
 			return err
 		}
 	}
-	if owned {
-		if err := os.RemoveAll(resourceDir); err != nil {
-			return err
-		}
+	if err := s.removeOwnedResourceDirectory(resourceDir, r); err != nil {
+		return err
 	}
 	return ctx.Err()
 }
@@ -795,15 +794,81 @@ func ownedLabels(labels map[string]string, r *stateRecord) bool {
 }
 func ownershipMarker(r *stateRecord) string { return r.InstanceID + "\n" + r.VMID + "\n" }
 
-func ownedDirectory(path string, r *stateRecord) (bool, error) {
-	info, err := os.Lstat(path)
-	if alreadyGone(err) {
-		return false, nil
-	}
+// The sibling marker survives recursive removal of .owner. Only this exact
+// record's complete deletion authority permits a markerless directory retry.
+func deletionMarkerPath(path string, r *stateRecord) string {
+	return filepath.Join(filepath.Dir(path), ".deleting-"+r.InstanceID+"-"+r.VMID)
+}
+
+func ownedDirectoryForCleanup(path string, r *stateRecord) (bool, error) {
+	deleting, err := ownedMarker(deletionMarkerPath(path, r), r)
 	if err != nil {
 		return false, err
 	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+	return checkOwnedDirectory(path, r, deleting)
+}
+
+func (s *StateStore) removeOwnedResourceDirectory(path string, r *stateRecord) error {
+	owned, err := ownedDirectoryForCleanup(path, r)
+	if err != nil {
+		return err
+	}
+	marker := deletionMarkerPath(path, r)
+	deleting, err := ownedMarker(marker, r)
+	if err != nil {
+		return err
+	}
+	if !owned && !deleting {
+		return nil
+	}
+	if !deleting {
+		if err := writeOwnershipMarker(marker, r); err != nil {
+			return err
+		}
+	}
+	// A preceding publication may have returned after rename but before fsync.
+	// Re-establish durable external authority before touching the directory.
+	parent, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer parent.Close()
+	if err := s.syncDir(parent); err != nil {
+		return err
+	}
+	if owned {
+		remove := s.removeResourceDir
+		if remove == nil {
+			remove = os.RemoveAll
+		}
+		if err := remove(path); err != nil {
+			return err
+		}
+	}
+	// Commit disappearance before retiring the authority needed after a crash.
+	if err := s.syncDir(parent); err != nil {
+		return err
+	}
+	if err := os.Remove(marker); err != nil && !alreadyGone(err) {
+		return err
+	}
+	return s.syncDir(parent)
+}
+
+func ownedDirectory(path string, r *stateRecord) (bool, error) {
+	return checkOwnedDirectory(path, r, false)
+}
+
+func checkOwnedDirectory(path string, r *stateRecord, deleting bool) (bool, error) {
+	info, err := os.Lstat(path)
+	absent := alreadyGone(err)
+	if absent && !deleting {
+		return false, nil
+	}
+	if err != nil && !absent {
+		return false, err
+	}
+	if !absent && (!info.IsDir() || info.Mode()&os.ModeSymlink != 0) {
 		return false, fmt.Errorf("VM directory ownership conflict")
 	}
 	for parent := filepath.Dir(path); parent != "/"; parent = filepath.Dir(parent) {
@@ -815,11 +880,14 @@ func ownedDirectory(path string, r *stateRecord) (bool, error) {
 			return false, fmt.Errorf("VM directory traverses unsafe ancestor")
 		}
 	}
+	if absent {
+		return false, nil
+	}
 	owned, err := ownedMarker(filepath.Join(path, ".owner"), r)
 	if err != nil {
 		return false, err
 	}
-	if !owned {
+	if !owned && !deleting {
 		return false, fmt.Errorf("VM directory has no ownership marker")
 	}
 	return true, nil
@@ -845,23 +913,42 @@ func Reap(ctx context.Context, config *Config) error {
 }
 
 func writeOwnershipMarker(path string, r *stateRecord) error {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	return writeOwnershipMarkerWithSync(path, r, (*os.File).Sync, (*os.File).Sync)
+}
+
+// Fault seams cover the prepublication and postpublication durability boundary.
+func writeOwnershipMarkerWithSync(path string, r *stateRecord, syncFile, syncDir func(*os.File) error) error {
+	file, err := os.CreateTemp(filepath.Dir(path), ".ownership-*")
 	if err != nil {
 		return err
 	}
+	temp := file.Name()
+	unpublished := true
+	defer func() {
+		if unpublished {
+			_ = os.Remove(temp)
+		}
+	}()
 	defer file.Close()
 	if _, err := file.WriteString(ownershipMarker(r)); err != nil {
 		return err
 	}
-	if err := file.Sync(); err != nil {
+	if err := syncFile(file); err != nil {
 		return err
 	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := unix.Renameat2(unix.AT_FDCWD, temp, unix.AT_FDCWD, path, unix.RENAME_NOREPLACE); err != nil {
+		return err
+	}
+	unpublished = false
 	parent, err := os.Open(filepath.Dir(path))
 	if err != nil {
 		return err
 	}
 	defer parent.Close()
-	if err := parent.Sync(); err != nil {
+	if err := syncDir(parent); err != nil {
 		return err
 	}
 	ancestor, err := os.Open(filepath.Dir(filepath.Dir(path)))
@@ -869,7 +956,7 @@ func writeOwnershipMarker(path string, r *stateRecord) error {
 		return err
 	}
 	defer ancestor.Close()
-	return ancestor.Sync()
+	return syncDir(ancestor)
 }
 
 func ownedMarker(path string, r *stateRecord) (bool, error) {

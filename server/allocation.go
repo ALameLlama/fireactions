@@ -130,22 +130,30 @@ func (s *StateStore) removeAllocationDirectory(path string, r *stateRecord, stag
 	if stat.Uid != root.Uid || stat.Mode&0077 != 0 {
 		return fmt.Errorf("allocation directory ownership conflict")
 	}
-	entries, err := directory.ReadDir(2)
-	if err != nil && err != io.EOF {
-		return err
-	}
-	if len(entries) > 1 || (len(entries) == 1 && entries[0].Name() != ".owner") {
-		return fmt.Errorf("allocation directory contains foreign paths")
-	}
-	present, complete, err := s.markerPrefix(filepath.Join(path, ".owner"), r)
+	entries, err := directory.ReadDir(-1)
 	if err != nil {
 		return err
 	}
-	if !staging && !complete {
-		return fmt.Errorf("final allocation directory lacks ownership")
+	for _, entry := range entries {
+		if entry.Name() != ".owner" && (!staging || !strings.HasPrefix(entry.Name(), ".ownership-")) {
+			return fmt.Errorf("allocation directory contains foreign paths")
+		}
+		if _, _, err := s.markerPrefix(filepath.Join(path, entry.Name()), r); err != nil {
+			return err
+		}
 	}
-	if present {
-		if err := unix.Unlinkat(fd, ".owner", 0); err != nil && !alreadyGone(err) {
+	_, complete, err := s.markerPrefix(filepath.Join(path, ".owner"), r)
+	if err != nil {
+		return err
+	}
+	if !staging {
+		if !complete {
+			return fmt.Errorf("final allocation directory lacks ownership")
+		}
+		return s.removeOwnedResourceDirectory(path, r)
+	}
+	for _, entry := range entries {
+		if err := unix.Unlinkat(fd, entry.Name(), 0); err != nil && !alreadyGone(err) {
 			return err
 		}
 	}
@@ -203,6 +211,13 @@ func (s *StateStore) recoverPreallocation(r *stateRecord) (bool, error) {
 		}
 	}
 	final := filepath.Dir(r.APISocketPath)
+	deleting, err := ownedMarker(deletionMarkerPath(final, r), r)
+	if err != nil {
+		return false, err
+	}
+	if deleting {
+		return true, s.removeOwnedResourceDirectory(final, r)
+	}
 	owned, err := ownedMarker(filepath.Join(final, ".owner"), r)
 	if err != nil || !owned {
 		// No allocation preceded the durable barrier. A foreign final path is
