@@ -141,7 +141,8 @@ main() {
   [[ -f "$BINARY" && -x "$BINARY" ]] || fail "binary must be an executable file: $BINARY"
   [[ -f "$CONFIG" && -r "$CONFIG" ]] || fail "config must be a readable file: $CONFIG"
   [[ "$(uname -s)" == Linux ]] || fail "installation is supported only on Linux"
-  "$BINARY" validate "$CONFIG"
+  local socket_group
+  socket_group=$("$BINARY" validate --print-socket-group "$CONFIG") || fail "configuration validation failed"
   if [[ -n "$SNAPSHOTTER_DEVICE" ]]; then
     [[ "$SETUP_HOST" == 1 ]] || fail "storage setup options require --setup-host"
     [[ "$FORMAT_DEVICE" == 1 ]] || fail "storage initialization requires --format-device"
@@ -176,7 +177,10 @@ EOF
   [[ ! -e "$config_dest" ]] || fail "$config_dest already exists; refusing to replace it"
   [[ ! -e "$unit_dir/fireactions.service" ]] || fail "fireactions.service already exists; refusing to replace it"
   [[ ! -e "$unit_dir/fireactions-reaper.service" && ! -e "$unit_dir/fireactions-reaper.timer" ]] || fail "Fireactions reaper unit already exists; refusing to replace it"
-  getent group fireactions >/dev/null || groupadd --system fireactions
+  getent group "$socket_group" >/dev/null || groupadd --system "$socket_group" || fail "cannot create configured socket group: $socket_group"
+  if [[ "$socket_group" != fireactions ]]; then
+    getent group fireactions >/dev/null || groupadd --system fireactions || fail "cannot create configuration ownership group: fireactions"
+  fi
   install -D -m 0755 "$BINARY" "$binary_dest"
   install -D -m 0640 -o root -g fireactions "$CONFIG" "$config_dest"
   if [[ ! -e /etc/sysctl.d/99-fireactions.conf ]]; then

@@ -33,7 +33,9 @@ Build the static Linux amd64 `fireactions` binary from the repository root as de
 sudo ./install.sh --binary ./fireactions --config examples/fireactions.yaml
 ```
 
-The installer installs the Fireactions binary and configuration, creates the socket group and systemd units, writes the documented IP-forwarding sysctl setting, reloads systemd, and enables the main service and independent reaper timer. It does not download an upstream Fireactions binary.
+The installer reads `socket_group` through the binary's validated YAML parser. It creates that group if it is missing. It also keeps the `fireactions` group for ownership of `/etc/fireactions/config.yaml`. If group creation fails, the installer stops before it installs the binary, configuration, or systemd units.
+
+The installer installs the Fireactions binary and configuration, creates systemd units, writes the documented IP-forwarding sysctl setting, and reloads systemd. It enables the main service and independent reaper timer. It does not download an upstream Fireactions binary.
 
 Check host prerequisites with the same binary and configuration. Host validation needs root access to inspect the configured host resources:
 
@@ -52,6 +54,27 @@ sudo systemctl enable --now fireactions.service fireactions-reaper.timer
 ```
 
 The installer enables the main service and independent reaper timer. Keep `fireactions-reaper.timer` enabled when the main service stops or crashes. The timer performs independent cleanup of expired or abandoned VM resources.
+
+## Run the host daemon in a container
+
+The top-level `Dockerfile` builds the host daemon image, not a guest image. Build the Linux `fireactions` binary at the repository root first. The image creates `SOCKET_GROUP=fireactions` with numeric `SOCKET_GID=1000` by default.
+
+The container and host must use the same numeric group ID for the shared socket directory. The group name in the image must match `socket_group` in your configuration. Read that name with the binary, then read its numeric ID from the host group database:
+
+```bash
+socket_group=$(./fireactions validate --print-socket-group examples/fireactions.yaml)
+socket_gid=$(getent group "$socket_group" | cut -d: -f3)
+test -n "$socket_gid" || { echo "Create the configured socket group on the host first" >&2; exit 1; }
+docker build --build-arg SOCKET_GROUP="$socket_group" \
+  --build-arg SOCKET_GID="$socket_gid" -t fireactions-host .
+docker run --rm --entrypoint getent fireactions-host group "$socket_group"
+```
+
+Do not assume that the default GID matches your host. The build fails if the selected group name or GID is already in use in the base image.
+
+Run this image as root with host networking, the host PID namespace, and host privileges, for example `--privileged`. Share `/dev`, `/run/containerd/containerd.sock`, `/etc/cni/net.d`, `/opt/cni/bin`, and `/var/run/netns` with an `rshared` mount. Also share the configured IPAM data directory, Firecracker executable, kernel directory, state directory, and socket directory. Mount the configuration at the path passed to `fireactions server --config`.
+
+The daemon and independent reaper must share these paths and namespaces. Keep the host Runner in the configured socket group. These mounts and privileges do not add jailer isolation.
 
 ## Register Forgejo Runner on the host
 
@@ -84,7 +107,7 @@ plugins:
 
 Replace the example URL and UUID with your registration values. Create the token file as the Runner OS user and restrict access to that user. Do not copy the token into the plugin, guest image, or job environment.
 
-Add the Runner OS user to the `fireactions` socket group. For the example user, run:
+Add the Runner OS user to the configured `socket_group`. The example uses `fireactions`. For the example user, run:
 
 ```bash
 sudo usermod -aG fireactions runner

@@ -1,11 +1,15 @@
 FROM --platform=$TARGETPLATFORM debian:stable-slim
 
+ARG SOCKET_GROUP=fireactions
+ARG SOCKET_GID=1000
+
 COPY fireactions /usr/bin/fireactions
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates                                              \
     iproute2                                                     \
     iptables                                                     \
+    && groupadd --gid "$SOCKET_GID" "$SOCKET_GROUP"                 \
     && apt-get autoremove -y                                     \
     && apt-get clean                                             \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*

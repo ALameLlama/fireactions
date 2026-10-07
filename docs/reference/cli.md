@@ -26,6 +26,14 @@ The host form also checks configured Firecracker and kernel paths, KVM, containe
 sudo fireactions validate --host /etc/fireactions/config.yaml
 ```
 
+To read the configured socket group, validate the file and print only the group name:
+
+```sh
+fireactions validate --print-socket-group /etc/fireactions/config.yaml
+```
+
+This form uses the YAML parser and validates the whole configuration. On success, standard output contains one group name and a newline. On failure, it returns a nonzero exit status without printing a group. It does not require the group to exist. If you also pass `--host`, host validation must succeed before it prints the group.
+
 ## Reap expired or abandoned VMs
 
 `reap` is a standalone cleanup command. It does not require a running plugin. Use `--config` to select its configuration file. The default is `/etc/fireactions/config.yaml`.

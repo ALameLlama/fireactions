@@ -6,7 +6,7 @@
 
 * Validate archive symlink chains against the final transfer tree and remove temporary names after same-inode hardlink replacement.
 * Preserve process output during slow consumption and select PATH executables with the requested user's permissions.
-* Preserve guest upload rejection status when the guest closes the stream early.
+* Return guest upload rejection while Runner input is paused, close the upstream reader, and release the environment operation gate.
 * Keep replica targets during concurrent reconciliation and preserve active provisioning on repeated resume calls.
 * Preserve existing socket directory permissions and replacement sockets. Return listener failures without an extra shutdown timeout.
 * Use one journal metadata lock instead of retaining a lock file for every completed VM. Resolve Firecracker executables through PATH.
@@ -17,6 +17,12 @@
 * Restrict uploaded hard links to files from the same upload and preserve metadata on files outside the transfer destination.
 * Bound directory descriptors during deep archive exports and keep wide uploads within low descriptor limits.
 * Match the documented Docker guest image platform to the agent binary architecture.
+* Preserve external directory-deletion authority across interrupted cleanup and publish complete ownership markers atomically without replacing existing markers.
+* Validate state ancestors before owner-lock setup can change files or permissions.
+* Provision the configured installer socket group and make host-image socket group names and GIDs configurable.
+* Reject archive-entry limits outside the int32 wire range and non-regular kernel image paths.
+* Bind Unix sockets through trusted short aliases while retaining canonical ownership checks and cleanup.
+* Document explicit mirror-qualified image pulls/imports with `Never` and the guest kernel's `cgroup.kill` requirement.
 
 ### Changed
 
