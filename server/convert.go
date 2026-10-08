@@ -2,70 +2,50 @@ package server
 
 import (
 	"context"
-	"time"
 
+	"github.com/ALameLlama/fireactions/internal/executor"
+	serverv1 "github.com/ALameLlama/fireactions/proto/server/v1"
 	"github.com/containerd/containerd"
-	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
-	serverv1 "github.com/hostinger/fireactions/proto/server/v1"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // convertPoolToProto converts a Pool to its protobuf representation.
 func convertPoolToProto(ctx context.Context, pool *Pool) *serverv1.Pool {
 	state := serverv1.PoolState_POOL_STATE_ACTIVE
-	if !pool.isActive {
+	if !pool.IsActive() {
 		state = serverv1.PoolState_POOL_STATE_PAUSED
 	}
 
+	replicas := int32(pool.GetReplicas())
 	return &serverv1.Pool{
 		Name:            pool.config.Name,
-		Organization:    pool.config.Runner.Organization,
-		Replicas:        int32(pool.GetReplicas()),
+		Replicas:        replicas,
 		CurrentReplicas: int32(pool.GetCurrentSize()),
-		DesiredReplicas: int32(pool.GetReplicas()),
-		GroupId:         pool.config.Runner.GroupID,
-		Labels:          pool.config.Runner.Labels,
-		Image:           pool.config.Runner.Image,
+		DesiredReplicas: replicas,
+		Image:           pool.config.Image,
 		State:           state,
 	}
 }
 
-func convertMachineToProto(ctx context.Context, machine *Machine) *serverv1.Machine {
-	m := &serverv1.Machine{
-		ID:        machine.Name,
-		Pool:      machine.Pool,
-		Addr:      machine.GetAddr(),
-		CreatedAt: timestamppb.New(machine.CreatedAt),
+func convertMachineToProto(ctx context.Context, machine *Machine, managers ...*executor.Manager) *serverv1.Machine {
+	metadata := machine.Metadata()
+	if len(managers) != 0 && managers[0] != nil {
+		if id, removing := managers[0].EnvironmentForVM(machine.Name); id != "" {
+			metadata.EnvironmentID = id
+			if removing {
+				metadata.State = "removing"
+			}
+		}
 	}
-
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	conn, client, err := machine.ConnectToGuestAgent(ctx)
-	if err != nil {
-		m.RunnerState = "Unknown"
-		m.RunnerVersion = "Unknown"
-		return m
+	return &serverv1.Machine{
+		ID:            machine.Name,
+		Pool:          machine.Pool,
+		Addr:          machine.GetAddr(),
+		CreatedAt:     timestamppb.New(machine.CreatedAt),
+		State:         metadata.State,
+		AgentVersion:  metadata.AgentVersion,
+		EnvironmentId: metadata.EnvironmentID,
 	}
-	defer conn.Close()
-
-	runnerStateResp, err := client.GetRunnerState(
-		ctx, &agentv1.GetRunnerStateRequest{})
-	if err != nil {
-		m.RunnerState = "Unknown"
-	} else {
-		m.RunnerState = runnerStateResp.GetState()
-	}
-
-	runnerVersionResp, err := client.GetRunnerVersion(
-		ctx, &agentv1.GetRunnerVersionRequest{})
-	if err != nil {
-		m.RunnerVersion = "Unknown"
-	} else {
-		m.RunnerVersion = runnerVersionResp.GetVersion()
-	}
-
-	return m
 }
 
 // convertImageToProto converts a containerd Image to its protobuf representation.

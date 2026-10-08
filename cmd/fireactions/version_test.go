@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/hostinger/fireactions"
+	"github.com/ALameLlama/fireactions"
 	"github.com/stretchr/testify/assert"
 )
 

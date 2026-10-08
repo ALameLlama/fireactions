@@ -1,28 +1,55 @@
 syntax = "proto3";
 package fireactions.agent.v1;
 
-import "google/protobuf/timestamp.proto";
+option go_package = "github.com/ALameLlama/fireactions/proto/agent/v1;agentv1";
 
-option go_package = "github.com/hostinger/fireactions/proto/agent/v1;agentv1";
-
-// AgentService provides status reporting for the GitHub Actions agent running in a VM.
+// AgentService provides readiness and diagnostics for the generic guest agent.
 service AgentService {
-  // GetRunnerState retrieves the current state of the GitHub Actions runner.
-  rpc GetRunnerState(GetRunnerStateRequest) returns (GetRunnerStateResponse);
+  // Ready validates the guest workspace and applies trusted transfer settings.
+  rpc Ready(ReadyRequest) returns (ReadyResponse);
 
-  // GetRunnerVersion retrieves the agent version.
-  rpc GetRunnerVersion(GetRunnerVersionRequest) returns (GetRunnerVersionResponse);
+  // CopyIn extracts a streaming tar archive under a workspace destination.
+  rpc CopyIn(stream CopyInChunk) returns (CopyInResponse);
+
+  // CopyOut streams a tar archive of a workspace path.
+  rpc CopyOut(CopyOutRequest) returns (stream CopyOutChunk);
 
   // GetLogs streams logs from the agent service (server-side streaming).
   rpc GetLogs(GetLogsRequest) returns (stream GetLogsResponse);
+
+  // Exec runs a process and streams output and a terminal result.
+  rpc Exec(ExecRequest) returns (stream ExecOutput);
+
+  // Kill terminates one process scope or all tracked scopes when process_id is empty.
+  rpc Kill(KillRequest) returns (KillResponse);
 }
 
-// GetRunnerStateRequest is the request for GetRunnerState.
-message GetRunnerStateRequest {}
+message ReadyRequest {
+  repeated string directories = 1;
+  string default_user = 2;
+  int64 max_transfer_bytes = 3;
+  int32 max_archive_entries = 4;
+}
 
-// GetRunnerStateResponse is the response for GetRunnerState.
-message GetRunnerStateResponse {
-  string state = 1;
+// ReadyResponse reports the guest agent version.
+message ReadyResponse {
+  string version = 1;
+}
+
+// CopyInChunk carries the destination only on its first message.
+message CopyInChunk {
+  optional string dest_path = 1;
+  bytes data = 2;
+}
+
+message CopyInResponse {}
+
+message CopyOutRequest {
+  string src_path = 1;
+}
+
+message CopyOutChunk {
+  bytes data = 1;
 }
 
 // GetLogsRequest is the request for GetLogs.
@@ -31,24 +58,40 @@ message GetLogsRequest {
   int32 tail_lines = 2; // Number of recent lines to send first (0 = all)
 }
 
+enum ExecStream {
+  STDOUT = 0;
+  STDERR = 1;
+}
+
+message ExecRequest {
+  repeated string command = 1;
+  map<string, string> env = 2;
+  string user = 3;
+  string workdir = 4;
+  string process_id = 5;
+}
+
+message ExecData {
+  ExecStream stream = 1;
+  bytes data = 2;
+}
+
+message ExecComplete { int32 exit_code = 1; }
+message ExecFailed { string error_message = 1; }
+
+message ExecOutput {
+  oneof result {
+    ExecData data = 1;
+    ExecComplete complete = 2;
+    ExecFailed failed = 3;
+  }
+}
+
+message KillRequest { string process_id = 1; }
+message KillResponse {}
+
 // GetLogsResponse is the response for GetLogs.
 message GetLogsResponse {
   string line = 1;
 }
 
-// GetRunnerVersionRequest is the request for GetRunnerVersion.
-message GetRunnerVersionRequest {}
-
-// GetRunnerVersionResponse is the response for GetRunnerVersion.
-message GetRunnerVersionResponse {
-  string version = 1;
-}
-
-// AgentStatus represents the current state of the agent.
-enum AgentStatus {
-  AGENT_STATUS_UNKNOWN = 0;
-  AGENT_STATUS_STARTING = 1;
-  AGENT_STATUS_IDLE = 2;
-  AGENT_STATUS_RUNNING = 3;
-  AGENT_STATUS_COMPLETED = 4;
-}

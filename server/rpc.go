@@ -2,11 +2,9 @@ package server
 
 import (
 	"context"
-	"io"
 	"sort"
 
-	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
-	serverv1 "github.com/hostinger/fireactions/proto/server/v1"
+	serverv1 "github.com/ALameLlama/fireactions/proto/server/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -46,17 +44,17 @@ func (s *Server) ListPools(ctx context.Context, req *serverv1.ListPoolsRequest) 
 
 // ScalePool implements ServerService.ScalePool.
 func (s *Server) ScalePool(ctx context.Context, req *serverv1.ScalePoolRequest) (*serverv1.ScalePoolResponse, error) {
+	if req.Replicas < 0 {
+		return nil, status.Error(codes.InvalidArgument, "replicas must not be negative")
+	}
 	pool, err := s.findPool(req.Name)
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "pool not found: %v", err)
 	}
 
-	metricPoolScaleRequests.WithLabelValues(req.Name, pool.config.Runner.Organization).Inc()
-
 	// Update the pool config with the new replicas value
 	// The Run() loop will handle the actual scaling
 	pool.SetReplicas(int(req.Replicas))
-
 	return &serverv1.ScalePoolResponse{Message: "Pool replicas updated successfully"}, nil
 }
 
@@ -68,7 +66,6 @@ func (s *Server) PausePool(ctx context.Context, req *serverv1.PausePoolRequest) 
 	}
 
 	pool.Pause()
-	metricPoolStatus.WithLabelValues(req.Name).Set(0)
 
 	return &serverv1.PausePoolResponse{Message: "Pool paused successfully"}, nil
 }
@@ -81,7 +78,6 @@ func (s *Server) ResumePool(ctx context.Context, req *serverv1.ResumePoolRequest
 	}
 
 	pool.Resume()
-	metricPoolStatus.WithLabelValues(req.Name).Set(1)
 
 	return &serverv1.ResumePoolResponse{Message: "Pool resumed successfully"}, nil
 }
@@ -135,24 +131,9 @@ func (s *Server) ListMachines(ctx context.Context, req *serverv1.ListMachinesReq
 		return machines[i].Name < machines[j].Name
 	})
 
-	// Convert machines to proto in parallel for better performance
 	protoMachines := make([]*serverv1.Machine, len(machines))
-	type result struct {
-		index int
-		proto *serverv1.Machine
-	}
-	results := make(chan result, len(machines))
-
 	for i, machine := range machines {
-		go func(idx int, m *Machine) {
-			results <- result{index: idx, proto: convertMachineToProto(ctx, m)}
-		}(i, machine)
-	}
-
-	// Collect results
-	for range machines {
-		r := <-results
-		protoMachines[r.index] = r.proto
+		protoMachines[i] = convertMachineToProto(ctx, machine, s.executor)
 	}
 
 	return &serverv1.ListMachinesResponse{Machines: protoMachines}, nil
@@ -165,7 +146,7 @@ func (s *Server) GetMachine(ctx context.Context, req *serverv1.GetMachineRequest
 		return nil, status.Errorf(codes.NotFound, "machine not found: %v", err)
 	}
 
-	return &serverv1.GetMachineResponse{Machine: convertMachineToProto(ctx, machine)}, nil
+	return &serverv1.GetMachineResponse{Machine: convertMachineToProto(ctx, machine, s.executor)}, nil
 }
 
 // GetHealth implements ServerService.GetHealth.
@@ -187,35 +168,12 @@ func (s *Server) GetMachineLogs(req *serverv1.GetMachineLogsRequest, stream serv
 		return status.Errorf(codes.NotFound, "machine not found: %v", err)
 	}
 
-	conn, client, err := machine.ConnectToGuestAgent(ctx)
-	if err != nil {
-		return status.Errorf(codes.Internal, "connect to agent: %v", err)
+	if err := machine.GuestLogs(ctx, req.Follow, req.TailLines, func(line string) error {
+		return stream.Send(&serverv1.GetMachineLogsResponse{Line: line})
+	}); err != nil {
+		return status.Errorf(codes.Internal, "guest logs: %v", err)
 	}
-	defer conn.Close()
-
-	agentStream, err := client.GetLogs(ctx, &agentv1.GetLogsRequest{
-		Follow:    req.Follow,
-		TailLines: req.TailLines,
-	})
-	if err != nil {
-		return status.Errorf(codes.Internal, "agent GetLogs: %v", err)
-	}
-
-	// Proxy logs from agent to CLI
-	for {
-		agentResp, err := agentStream.Recv()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return status.Errorf(codes.Internal, "receive from agent: %v", err)
-		}
-
-		// Forward to client
-		if err := stream.Send(&serverv1.GetMachineLogsResponse{Line: agentResp.Line}); err != nil {
-			return err
-		}
-	}
+	return nil
 }
 
 // ListImages implements ServerService.ListImages.

@@ -19,23 +19,32 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	AgentService_GetRunnerState_FullMethodName   = "/fireactions.agent.v1.AgentService/GetRunnerState"
-	AgentService_GetRunnerVersion_FullMethodName = "/fireactions.agent.v1.AgentService/GetRunnerVersion"
-	AgentService_GetLogs_FullMethodName          = "/fireactions.agent.v1.AgentService/GetLogs"
+	AgentService_Ready_FullMethodName   = "/fireactions.agent.v1.AgentService/Ready"
+	AgentService_CopyIn_FullMethodName  = "/fireactions.agent.v1.AgentService/CopyIn"
+	AgentService_CopyOut_FullMethodName = "/fireactions.agent.v1.AgentService/CopyOut"
+	AgentService_GetLogs_FullMethodName = "/fireactions.agent.v1.AgentService/GetLogs"
+	AgentService_Exec_FullMethodName    = "/fireactions.agent.v1.AgentService/Exec"
+	AgentService_Kill_FullMethodName    = "/fireactions.agent.v1.AgentService/Kill"
 )
 
 // AgentServiceClient is the client API for AgentService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// AgentService provides status reporting for the GitHub Actions agent running in a VM.
+// AgentService provides readiness and diagnostics for the generic guest agent.
 type AgentServiceClient interface {
-	// GetRunnerState retrieves the current state of the GitHub Actions runner.
-	GetRunnerState(ctx context.Context, in *GetRunnerStateRequest, opts ...grpc.CallOption) (*GetRunnerStateResponse, error)
-	// GetRunnerVersion retrieves the agent version.
-	GetRunnerVersion(ctx context.Context, in *GetRunnerVersionRequest, opts ...grpc.CallOption) (*GetRunnerVersionResponse, error)
+	// Ready validates the guest workspace and applies trusted transfer settings.
+	Ready(ctx context.Context, in *ReadyRequest, opts ...grpc.CallOption) (*ReadyResponse, error)
+	// CopyIn extracts a streaming tar archive under a workspace destination.
+	CopyIn(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[CopyInChunk, CopyInResponse], error)
+	// CopyOut streams a tar archive of a workspace path.
+	CopyOut(ctx context.Context, in *CopyOutRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[CopyOutChunk], error)
 	// GetLogs streams logs from the agent service (server-side streaming).
 	GetLogs(ctx context.Context, in *GetLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GetLogsResponse], error)
+	// Exec runs a process and streams output and a terminal result.
+	Exec(ctx context.Context, in *ExecRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExecOutput], error)
+	// Kill terminates one process scope or all tracked scopes when process_id is empty.
+	Kill(ctx context.Context, in *KillRequest, opts ...grpc.CallOption) (*KillResponse, error)
 }
 
 type agentServiceClient struct {
@@ -46,29 +55,51 @@ func NewAgentServiceClient(cc grpc.ClientConnInterface) AgentServiceClient {
 	return &agentServiceClient{cc}
 }
 
-func (c *agentServiceClient) GetRunnerState(ctx context.Context, in *GetRunnerStateRequest, opts ...grpc.CallOption) (*GetRunnerStateResponse, error) {
+func (c *agentServiceClient) Ready(ctx context.Context, in *ReadyRequest, opts ...grpc.CallOption) (*ReadyResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(GetRunnerStateResponse)
-	err := c.cc.Invoke(ctx, AgentService_GetRunnerState_FullMethodName, in, out, cOpts...)
+	out := new(ReadyResponse)
+	err := c.cc.Invoke(ctx, AgentService_Ready_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *agentServiceClient) GetRunnerVersion(ctx context.Context, in *GetRunnerVersionRequest, opts ...grpc.CallOption) (*GetRunnerVersionResponse, error) {
+func (c *agentServiceClient) CopyIn(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[CopyInChunk, CopyInResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(GetRunnerVersionResponse)
-	err := c.cc.Invoke(ctx, AgentService_GetRunnerVersion_FullMethodName, in, out, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &AgentService_ServiceDesc.Streams[0], AgentService_CopyIn_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	return out, nil
+	x := &grpc.GenericClientStream[CopyInChunk, CopyInResponse]{ClientStream: stream}
+	return x, nil
 }
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AgentService_CopyInClient = grpc.ClientStreamingClient[CopyInChunk, CopyInResponse]
+
+func (c *agentServiceClient) CopyOut(ctx context.Context, in *CopyOutRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[CopyOutChunk], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &AgentService_ServiceDesc.Streams[1], AgentService_CopyOut_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[CopyOutRequest, CopyOutChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AgentService_CopyOutClient = grpc.ServerStreamingClient[CopyOutChunk]
 
 func (c *agentServiceClient) GetLogs(ctx context.Context, in *GetLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GetLogsResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &AgentService_ServiceDesc.Streams[0], AgentService_GetLogs_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &AgentService_ServiceDesc.Streams[2], AgentService_GetLogs_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -85,18 +116,53 @@ func (c *agentServiceClient) GetLogs(ctx context.Context, in *GetLogsRequest, op
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type AgentService_GetLogsClient = grpc.ServerStreamingClient[GetLogsResponse]
 
+func (c *agentServiceClient) Exec(ctx context.Context, in *ExecRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExecOutput], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &AgentService_ServiceDesc.Streams[3], AgentService_Exec_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ExecRequest, ExecOutput]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AgentService_ExecClient = grpc.ServerStreamingClient[ExecOutput]
+
+func (c *agentServiceClient) Kill(ctx context.Context, in *KillRequest, opts ...grpc.CallOption) (*KillResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(KillResponse)
+	err := c.cc.Invoke(ctx, AgentService_Kill_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AgentServiceServer is the server API for AgentService service.
 // All implementations must embed UnimplementedAgentServiceServer
 // for forward compatibility.
 //
-// AgentService provides status reporting for the GitHub Actions agent running in a VM.
+// AgentService provides readiness and diagnostics for the generic guest agent.
 type AgentServiceServer interface {
-	// GetRunnerState retrieves the current state of the GitHub Actions runner.
-	GetRunnerState(context.Context, *GetRunnerStateRequest) (*GetRunnerStateResponse, error)
-	// GetRunnerVersion retrieves the agent version.
-	GetRunnerVersion(context.Context, *GetRunnerVersionRequest) (*GetRunnerVersionResponse, error)
+	// Ready validates the guest workspace and applies trusted transfer settings.
+	Ready(context.Context, *ReadyRequest) (*ReadyResponse, error)
+	// CopyIn extracts a streaming tar archive under a workspace destination.
+	CopyIn(grpc.ClientStreamingServer[CopyInChunk, CopyInResponse]) error
+	// CopyOut streams a tar archive of a workspace path.
+	CopyOut(*CopyOutRequest, grpc.ServerStreamingServer[CopyOutChunk]) error
 	// GetLogs streams logs from the agent service (server-side streaming).
 	GetLogs(*GetLogsRequest, grpc.ServerStreamingServer[GetLogsResponse]) error
+	// Exec runs a process and streams output and a terminal result.
+	Exec(*ExecRequest, grpc.ServerStreamingServer[ExecOutput]) error
+	// Kill terminates one process scope or all tracked scopes when process_id is empty.
+	Kill(context.Context, *KillRequest) (*KillResponse, error)
 	mustEmbedUnimplementedAgentServiceServer()
 }
 
@@ -107,14 +173,23 @@ type AgentServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedAgentServiceServer struct{}
 
-func (UnimplementedAgentServiceServer) GetRunnerState(context.Context, *GetRunnerStateRequest) (*GetRunnerStateResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method GetRunnerState not implemented")
+func (UnimplementedAgentServiceServer) Ready(context.Context, *ReadyRequest) (*ReadyResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Ready not implemented")
 }
-func (UnimplementedAgentServiceServer) GetRunnerVersion(context.Context, *GetRunnerVersionRequest) (*GetRunnerVersionResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method GetRunnerVersion not implemented")
+func (UnimplementedAgentServiceServer) CopyIn(grpc.ClientStreamingServer[CopyInChunk, CopyInResponse]) error {
+	return status.Errorf(codes.Unimplemented, "method CopyIn not implemented")
+}
+func (UnimplementedAgentServiceServer) CopyOut(*CopyOutRequest, grpc.ServerStreamingServer[CopyOutChunk]) error {
+	return status.Errorf(codes.Unimplemented, "method CopyOut not implemented")
 }
 func (UnimplementedAgentServiceServer) GetLogs(*GetLogsRequest, grpc.ServerStreamingServer[GetLogsResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method GetLogs not implemented")
+}
+func (UnimplementedAgentServiceServer) Exec(*ExecRequest, grpc.ServerStreamingServer[ExecOutput]) error {
+	return status.Errorf(codes.Unimplemented, "method Exec not implemented")
+}
+func (UnimplementedAgentServiceServer) Kill(context.Context, *KillRequest) (*KillResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Kill not implemented")
 }
 func (UnimplementedAgentServiceServer) mustEmbedUnimplementedAgentServiceServer() {}
 func (UnimplementedAgentServiceServer) testEmbeddedByValue()                      {}
@@ -137,41 +212,41 @@ func RegisterAgentServiceServer(s grpc.ServiceRegistrar, srv AgentServiceServer)
 	s.RegisterService(&AgentService_ServiceDesc, srv)
 }
 
-func _AgentService_GetRunnerState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(GetRunnerStateRequest)
+func _AgentService_Ready_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReadyRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(AgentServiceServer).GetRunnerState(ctx, in)
+		return srv.(AgentServiceServer).Ready(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: AgentService_GetRunnerState_FullMethodName,
+		FullMethod: AgentService_Ready_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(AgentServiceServer).GetRunnerState(ctx, req.(*GetRunnerStateRequest))
+		return srv.(AgentServiceServer).Ready(ctx, req.(*ReadyRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _AgentService_GetRunnerVersion_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(GetRunnerVersionRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(AgentServiceServer).GetRunnerVersion(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: AgentService_GetRunnerVersion_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(AgentServiceServer).GetRunnerVersion(ctx, req.(*GetRunnerVersionRequest))
-	}
-	return interceptor(ctx, in, info, handler)
+func _AgentService_CopyIn_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(AgentServiceServer).CopyIn(&grpc.GenericServerStream[CopyInChunk, CopyInResponse]{ServerStream: stream})
 }
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AgentService_CopyInServer = grpc.ClientStreamingServer[CopyInChunk, CopyInResponse]
+
+func _AgentService_CopyOut_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(CopyOutRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(AgentServiceServer).CopyOut(m, &grpc.GenericServerStream[CopyOutRequest, CopyOutChunk]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AgentService_CopyOutServer = grpc.ServerStreamingServer[CopyOutChunk]
 
 func _AgentService_GetLogs_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(GetLogsRequest)
@@ -184,6 +259,35 @@ func _AgentService_GetLogs_Handler(srv interface{}, stream grpc.ServerStream) er
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type AgentService_GetLogsServer = grpc.ServerStreamingServer[GetLogsResponse]
 
+func _AgentService_Exec_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(ExecRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(AgentServiceServer).Exec(m, &grpc.GenericServerStream[ExecRequest, ExecOutput]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AgentService_ExecServer = grpc.ServerStreamingServer[ExecOutput]
+
+func _AgentService_Kill_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(KillRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServiceServer).Kill(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AgentService_Kill_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServiceServer).Kill(ctx, req.(*KillRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // AgentService_ServiceDesc is the grpc.ServiceDesc for AgentService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -192,18 +296,33 @@ var AgentService_ServiceDesc = grpc.ServiceDesc{
 	HandlerType: (*AgentServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
-			MethodName: "GetRunnerState",
-			Handler:    _AgentService_GetRunnerState_Handler,
+			MethodName: "Ready",
+			Handler:    _AgentService_Ready_Handler,
 		},
 		{
-			MethodName: "GetRunnerVersion",
-			Handler:    _AgentService_GetRunnerVersion_Handler,
+			MethodName: "Kill",
+			Handler:    _AgentService_Kill_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
+			StreamName:    "CopyIn",
+			Handler:       _AgentService_CopyIn_Handler,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "CopyOut",
+			Handler:       _AgentService_CopyOut_Handler,
+			ServerStreams: true,
+		},
+		{
 			StreamName:    "GetLogs",
 			Handler:       _AgentService_GetLogs_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "Exec",
+			Handler:       _AgentService_Exec_Handler,
 			ServerStreams: true,
 		},
 	},

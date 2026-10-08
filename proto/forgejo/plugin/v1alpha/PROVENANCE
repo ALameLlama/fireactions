@@ -1,0 +1,6 @@
+Forgejo Runner v13.2.0
+Commit: df6b843fb929bb04b933b09c6bf208774d42480b
+Source: https://code.forgejo.org/forgejo/runner/raw/tag/v13.2.0/act/plugin/proto/v1alpha/plugin.proto
+Upstream SHA-256: 961fc5fc541c5c79f5502632d9f6dd3daa110ecfd55b9fbf697778b873367f79
+License: MIT (copyright and licensing notice retained in plugin.proto)
+Local change: go_package only. Generated code uses this repository's buf configuration.

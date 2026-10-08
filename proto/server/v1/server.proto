@@ -1,7 +1,7 @@
 syntax = "proto3";
 package fireactions.server.v1;
 
-option go_package = "github.com/hostinger/fireactions/proto/server/v1;serverv1";
+option go_package = "github.com/ALameLlama/fireactions/proto/server/v1;serverv1";
 
 import "google/protobuf/timestamp.proto";
 
@@ -28,12 +28,11 @@ enum PoolState {
 
 message Pool {
   string name = 1;
-  string organization = 2;
+  reserved 2, 6, 7;
+  reserved "organization", "group_id", "labels";
   int32 replicas = 3;
   int32 current_replicas = 4;
   int32 desired_replicas = 5;
-  int64 group_id = 6;
-  repeated string labels = 7;
   string image = 8;
   PoolState state = 9;
 }
@@ -82,8 +81,13 @@ message Machine {
   string pool = 2;
   string addr = 3;
   google.protobuf.Timestamp created_at = 4;
-  string runner_state = 5;
-  string runner_version = 6;
+  reserved 5, 6;
+  reserved "runner_state", "runner_version";
+  // Host-owned lifecycle: provisioning, idle, claimed, or removing.
+  string state = 7;
+  string agent_version = 8;
+  // Empty for idle machines.
+  string environment_id = 9;
 }
 
 message ListMachinesRequest {
