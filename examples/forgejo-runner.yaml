@@ -1,0 +1,24 @@
+runner:
+  capacity: 1
+  timeout: 30m
+  # Register this host Runner with Forgejo and replace the connection values below.
+  labels:
+    - "firecracker:firecracker://ubuntu-24.04"
+
+cache:
+  enabled: false
+
+container:
+  docker_host: "-"
+
+plugins:
+  firecracker:
+    address: "unix:///run/fireactions/plugin.sock"
+
+server:
+  connections:
+    forgejo:
+      url: "https://forgejo.example.org/"
+      uuid: "REPLACE_WITH_RUNNER_REGISTRATION_UUID"
+      # Create this file as the Runner OS user, mode 0600; never copy it into the plugin or guest.
+      token_url: "file:///home/runner/.config/forgejo-runner/token"

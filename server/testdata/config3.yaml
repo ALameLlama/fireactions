@@ -1,22 +1,14 @@
 ---
-bind_address: 0.0.0.0:8080
+socket_path: /run/fireactions/plugin.sock
+socket_group: fireactions
+state_dir: /var/lib/fireactions
 
-github:
-  app_private_key: |
-    -----BEGIN RSA PRIVATE KEY-----
-  app_id: 12345
 
 pools:
 - name: fireactions-2vcpu-2gb
   replicas: 1
-  runner:
-    name: fireactions-2vcpu-2gb
-    image: ghcr.io/hostinger/fireactions/runner:ubuntu-20.04-x64-2.310.2
-    image_pull_policy: IfNotPresent
-    group_id: 1
-    organization: hostinger
-    labels:
-    - self-hosted
+  image: localhost/fireactions-guest:ubuntu-24.04
+  image_pull_policy: IfNotPresent
   firecracker:
     binary_path: firecracker
     kernel_image_path: /var/lib/fireactions/vmlinux
@@ -29,4 +21,7 @@ pools:
         ops:
           size: 2000
 
+containerd:
+  address: /run/containerd/containerd.sock
+  namespace: fireactions
 log_level: debug

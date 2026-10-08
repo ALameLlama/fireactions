@@ -1,0 +1,15 @@
+[Unit]
+Description=Fireactions server
+After=containerd.service network-online.target
+Requires=containerd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fireactions server --config /etc/fireactions/config.yaml
+Restart=on-failure
+KillMode=control-group
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target

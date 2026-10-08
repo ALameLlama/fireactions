@@ -1,0 +1,14 @@
+name: Firecracker cancellation and timeout proof
+on:
+  workflow_dispatch:
+jobs:
+  cancel:
+    runs-on: firecracker
+    timeout-minutes: 2
+    steps:
+      - name: Spawn cancellable process tree
+        run: |
+          setsid sh -c 'sleep 600 & wait' &
+          child=$!
+          echo "child=$child"
+          sleep 600

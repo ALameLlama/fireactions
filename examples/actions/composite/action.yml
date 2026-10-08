@@ -1,0 +1,8 @@
+name: Fireactions composite transfer
+runs:
+  using: composite
+  steps:
+    - name: Round-trip an executable file
+      shell: bash
+      run: |
+        "$GITHUB_ACTION_PATH/verify.sh"

@@ -1,0 +1,7 @@
+name: Fireactions JavaScript lifecycle transfer
+runs:
+  using: node24
+  main: index.js
+  pre: pre.js
+  post: post.js
+  post-if: always()

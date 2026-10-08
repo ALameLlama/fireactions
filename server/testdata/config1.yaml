@@ -1,35 +1,21 @@
 ---
-bind_address: 0.0.0.0:8080
+socket_path: /run/fireactions/plugin.sock
+socket_group: fireactions
+state_dir: /var/lib/fireactions
+network:
+  resolver_path: /etc/resolv.conf
 
-basic_auth_enabled: true
-basic_auth_users:
-  user1: password1
-  user2: password2
-
-debug: false
 
 metrics:
   enabled: true
   address: 127.0.0.1:8081
 
-github:
-  app_private_key: |
-    -----BEGIN RSA PRIVATE KEY-----
-  app_id: 12345
 
 pools:
 - name: fireactions-2vcpu-2gb
   replicas: 1
-  runner:
-    name: fireactions-2vcpu-2gb
-    image: ghcr.io/hostinger/fireactions/runner:ubuntu-20.04-x64-2.310.2
-    image_pull_policy: IfNotPresent
-    group_id: 1
-    organization: hostinger
-    labels:
-    - self-hosted
-    - fireactions-2vcpu-2gb
-    - fireactions
+  image: localhost/fireactions-guest:ubuntu-24.04
+  image_pull_policy: IfNotPresent
   firecracker:
     binary_path: firecracker
     kernel_image_path: /var/lib/fireactions/vmlinux
@@ -58,20 +44,11 @@ pools:
         ops:
           size: 2000
           refill_time: 1000
-    metadata:
-      example1: value1
 - name: fireactions-2vcpu-4gb
+  default_user: ci
   replicas: 1
-  runner:
-    name: fireactions-2vcpu-4gb
-    image: ghcr.io/hostinger/fireactions/runner:ubuntu-20.04-x64-2.310.2
-    image_pull_policy: IfNotPresent
-    group_id: 1
-    organization: hostinger
-    labels:
-    - self-hosted
-    - fireactions-2vcpu-2gb
-    - fireactions
+  image: localhost/fireactions-guest:ubuntu-24.04
+  image_pull_policy: Never
   firecracker:
     binary_path: firecracker
     kernel_image_path: /var/lib/fireactions/vmlinux
@@ -79,7 +56,8 @@ pools:
     machine_config:
       mem_size_mib: 4096
       vcpu_count: 2
-    metadata:
-      example1: value1
 
+containerd:
+  address: /run/containerd/containerd.sock
+  namespace: fireactions
 log_level: debug
