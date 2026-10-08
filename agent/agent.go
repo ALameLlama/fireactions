@@ -2,19 +2,19 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"sync"
 	"time"
 
+	"github.com/ALameLlama/fireactions/internal/guestfs"
+	agentv1 "github.com/ALameLlama/fireactions/proto/agent/v1"
 	"github.com/firecracker-microvm/firecracker-go-sdk/vsock"
-	"github.com/hostinger/fireactions/agent/runner"
-	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
 	"github.com/rs/zerolog"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 )
 
@@ -22,24 +22,43 @@ const (
 	logFilePath = "/var/log/fireactions-agent.log"
 )
 
+type readySettings struct {
+	identity          Identity
+	directories       []string
+	maxTransferBytes  int64
+	maxArchiveEntries int
+	ready             bool
+}
+
 type Agent struct {
 	agentv1.UnimplementedAgentServiceServer
 	cfg           Config
+	fs            *guestfs.RootFS
+	processes     *execManager
+	readyMu       sync.RWMutex
+	readySettings readySettings
+	closeOnce     sync.Once
+	closeErr      error
 	logFile       string
 	logFileWriter *os.File
 	logger        *zerolog.Logger
-	runner        *runner.Runner
 }
 
 type Opt func(a *Agent)
 
 func New(cfg Config, opts ...Opt) (*Agent, error) {
+	cfg = cfg.withDefaults()
 	if cfgErr := cfg.Validate(); cfgErr != nil {
 		return nil, fmt.Errorf("validate config: %w", cfgErr)
 	}
 
+	root, err := guestfs.OpenRoot(cfg.WorkspaceRoot)
+	if err != nil {
+		return nil, fmt.Errorf("open workspace root: %w", err)
+	}
 	a := &Agent{
 		cfg:     cfg,
+		fs:      root,
 		logFile: logFilePath,
 	}
 
@@ -47,7 +66,10 @@ func New(cfg Config, opts ...Opt) (*Agent, error) {
 		opt(a)
 	}
 
+	a.processes = newExecManager(a)
+
 	if err := a.setupLogger(); err != nil {
+		_ = root.Close()
 		return nil, err
 	}
 
@@ -69,6 +91,8 @@ func (a *Agent) setupLogger() error {
 
 	logLevel, err := zerolog.ParseLevel(a.cfg.LogLevel)
 	if err != nil {
+		logFileWriter.Close()
+		a.logFileWriter = nil
 		return fmt.Errorf("parse log level: %w", err)
 	}
 
@@ -81,24 +105,29 @@ func (a *Agent) setupLogger() error {
 	return nil
 }
 
-// Close closes the agent resources, including the log file.
+// Close closes the agent resources, including the log file and workspace root.
 func (a *Agent) Close() error {
-	if a.logFileWriter != nil {
-		return a.logFileWriter.Close()
-	}
-
-	return nil
+	a.closeOnce.Do(func() {
+		if a.processes != nil {
+			if err := a.processes.shutdown(); err != nil {
+				a.closeErr = errors.Join(a.closeErr, err)
+			}
+		}
+		if a.logFileWriter != nil {
+			if err := a.logFileWriter.Close(); err != nil {
+				a.closeErr = errors.Join(a.closeErr, err)
+			}
+			a.logFileWriter = nil
+		}
+		if err := a.fs.Close(); err != nil {
+			a.closeErr = errors.Join(a.closeErr, err)
+		}
+	})
+	return a.closeErr
 }
 
 func (a *Agent) Run(ctx context.Context) error {
-	if err := a.setHostname(); err != nil {
-		return fmt.Errorf("setting hostname: %w", err)
-	}
-
-	// Run GitHub runner in background - it will trigger shutdown on success
-	go a.runGitHubRunner(ctx)
-
-	// Run gRPC server in main flow
+	defer a.Close()
 	return a.runGRPCServer(ctx)
 }
 
@@ -119,54 +148,30 @@ func (a *Agent) runGRPCServer(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	go func() {
 		a.logger.Info().Msgf("Agent GRPC server listening on VSOCK port %d", a.cfg.Port)
-		if err := grpcServer.Serve(listener); err != nil {
-			errCh <- fmt.Errorf("grpc serve: %w", err)
-		}
+		errCh <- grpcServer.Serve(hostOnlyListener{Listener: listener})
 	}()
 
 	select {
 	case <-ctx.Done():
-		grpcServer.GracefulStop()
+		stopped := make(chan struct{})
+		go func() {
+			grpcServer.GracefulStop()
+			close(stopped)
+		}()
+		timer := time.NewTimer(2 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-stopped:
+		case <-timer.C:
+			grpcServer.Stop()
+			<-stopped
+		}
 		return nil
 	case err := <-errCh:
-		return err
+		grpcServer.Stop()
+		if err != nil {
+			return fmt.Errorf("grpc serve: %w", err)
+		}
+		return nil
 	}
-}
-
-func (a *Agent) runGitHubRunner(ctx context.Context) {
-	a.runner = runner.New(
-		a.cfg.RunnerJITConfig,
-		runner.WithLogger(a.logger),
-	)
-
-	if err := a.runner.Run(ctx); err != nil {
-		a.logger.Error().Err(err).Msg("Runner encountered an error")
-	}
-
-	if !a.cfg.ShutdownOnExit {
-		a.logger.Info().Msg("Runner completed, but shutdown on exit is disabled - keeping VM running")
-		return
-	}
-
-	a.logger.Info().Msg("Runner completed, initiating VM shutdown")
-	a.shutdown()
-}
-
-func (a *Agent) shutdown() {
-	// We don't need to wait for it to complete since the VM will shut down anyway
-	cmd := exec.Command("systemctl", "reboot")
-	if err := cmd.Start(); err != nil {
-		a.logger.Error().Err(err).Msg("Failed to initiate VM shutdown")
-		return
-	}
-
-	a.logger.Info().Msg("Shutdown command executed")
-}
-
-func (a *Agent) setHostname() error {
-	if err := unix.Sethostname([]byte(a.cfg.Hostname)); err != nil {
-		return fmt.Errorf("sethostname: %w", err)
-	}
-
-	return nil
 }

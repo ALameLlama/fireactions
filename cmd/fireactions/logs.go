@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	serverv1 "github.com/hostinger/fireactions/proto/server/v1"
+	serverv1 "github.com/ALameLlama/fireactions/proto/server/v1"
 	"github.com/spf13/cobra"
 )
 
@@ -33,7 +33,7 @@ agent startup, status changes, and any errors from the agent.`,
 		"Follow log output (stream continuously like tail -f)")
 	cmd.Flags().IntVar(&tail, "tail", 0,
 		"Number of lines to show from end (0 = all buffered logs)")
-	cmd.Flags().StringP("endpoint", "e", "127.0.0.1:8080", "Sets the Fireactions server endpoint")
+	cmd.Flags().StringP("endpoint", "e", "unix:///run/fireactions/plugin.sock", "Sets the Fireactions server endpoint")
 
 	return cmd
 }

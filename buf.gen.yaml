@@ -2,7 +2,7 @@ version: v1
 managed:
   enabled: true
   go_package_prefix:
-    default: github.com/hostinger/fireactions
+    default: github.com/ALameLlama/fireactions
 plugins:
   - name: go
     out: .
