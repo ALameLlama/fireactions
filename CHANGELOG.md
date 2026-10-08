@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Added
+
+* Add an importable NixOS flake with Linux x86_64/ARM64 packages and containerd/devmapper and CNI host setup. Include an independent reaper, runtime guest archive import, and an optional Forgejo Runner using systemd credentials. Require an existing thin pool without automatic storage provisioning.
+* Add a NixOS host flake example and first-install instructions that preserve machine configuration and keep Runner credentials outside the Nix store.
+
 ### Fixed
 
 * Validate archive symlink chains against the final transfer tree and remove temporary names after same-inode hardlink replacement.

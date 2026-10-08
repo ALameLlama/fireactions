@@ -33,7 +33,11 @@ Fireactions does not provide SSH login, a default guest password, stdin or PTY a
 
 ## Installation
 
-Build or obtain the fork-built `fireactions` binary and prepare the host configuration. The default installer validates existing host prerequisites and does not replace containerd, LVM, or CNI configuration.
+On NixOS, import `github:ALameLlama/fireactions` through `nixosModules.default`. The module manages containerd/devmapper, CNI, the daemon, the independent reaper, and an optional Forgejo Runner. It requires an existing LVM thin pool and a prepared guest image. It never provisions or formats storage.
+
+See [Install on NixOS](docs/user-guide/installation.md#install-on-nixos) and the [host flake example](examples/nixos/flake.nix). Keep your existing machine configuration and hardware imports. Register Runner separately and keep its token outside the Nix store. The host uses NixOS while the supplied guest uses Ubuntu 24.04.
+
+On other Linux hosts, build or obtain the fork-built `fireactions` binary and prepare the host configuration. The default shell installer validates existing host prerequisites and does not replace containerd, LVM, or CNI configuration.
 
 ```bash
 sudo ./install.sh --binary ./fireactions --config examples/fireactions.yaml
