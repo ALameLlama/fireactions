@@ -29,7 +29,7 @@ Use `OWNER/REPO` for a repository-scoped Runner. The Forgejo command reads the e
 
 For the NixOS module, continue with [Install on NixOS](#install-on-nixos) after registration. The module generates the Runner configuration and manages its user. For a manually managed Runner, follow the remaining steps in this section.
 
-Configure Runner with the Forgejo server URL, the registration UUID from Forgejo, and the host socket `unix:///run/fireactions/plugin.sock`. Set the token file path in a `file://` `token_url` field. Use the Fireactions label format from [`examples/forgejo-runner.yaml`](../../examples/forgejo-runner.yaml), for example `firecracker:firecracker://ubuntu-24.04`. The example shows the Runner configuration shape:
+Configure Runner with the Forgejo server URL, the registration UUID from Forgejo, and the host socket `unix:///run/fireactions/plugin.sock`. Set the token file path in a `file://` `token_url` field. Use the Fireactions label format from [`examples/forgejo-runner.yaml`](https://github.com/ALameLlama/fireactions/blob/main/examples/forgejo-runner.yaml), for example `firecracker:firecracker://ubuntu-24.04`. The example shows the Runner configuration shape:
 
 ```yaml
 server:
@@ -79,7 +79,7 @@ Complete the first installation in this order:
 
 Start with an installed NixOS host and working `/dev/kvm`. Keep its `configuration.nix` and `hardware-configuration.nix`. Keep the hardware import, bootloader, filesystems, and `system.stateVersion` unchanged. Replacing an Ubuntu host with NixOS does not change the supplied Ubuntu 24.04 guest image.
 
-Copy [`examples/nixos/flake.nix`](../../examples/nixos/flake.nix) to `/etc/nixos/flake.nix`, beside your existing `configuration.nix`. If you already use a host flake, add the input and module to that flake instead. This example imports your existing machine configuration:
+Copy [`examples/nixos/flake.nix`](https://github.com/ALameLlama/fireactions/blob/main/examples/nixos/flake.nix) to `/etc/nixos/flake.nix`, beside your existing `configuration.nix`. If you already use a host flake, add the input and module to that flake instead. This example imports your existing machine configuration:
 
 ```nix
 {
@@ -257,7 +257,7 @@ The default resolver file is `/run/systemd/resolve/resolv.conf`. If you disable 
 
 ## Prepare the configuration and image for the shell installer
 
-Start from [`examples/fireactions.yaml`](../../examples/fireactions.yaml). Set the containerd socket, namespace, Firecracker path, kernel path, and host resolver path to values that exist on your host. Use an image name that you import into the same containerd namespace. The example namespace is `fireactions`.
+Start from [`examples/fireactions.yaml`](https://github.com/ALameLlama/fireactions/blob/main/examples/fireactions.yaml). Set the containerd socket, namespace, Firecracker path, kernel path, and host resolver path to values that exist on your host. Use an image name that you import into the same containerd namespace. The example namespace is `fireactions`.
 
 Build and export the guest image as a Docker image archive. Import that archive with the devmapper snapshotter into the configured namespace. The example commands use the `fireactions` namespace:
 
@@ -300,15 +300,18 @@ The installer enables the main service and independent reaper timer. Keep `firea
 
 ## Run the host daemon in a container
 
-The top-level `Dockerfile` builds the host daemon image, not a guest image. Build the Linux `fireactions` binary at the repository root first. The image creates `SOCKET_GROUP=fireactions` with numeric `SOCKET_GID=1000` by default.
+The top-level `Dockerfile` builds the host daemon image, not a guest image. Build the Linux `fireactions` binary for the host architecture at the repository root first. The host build context requires `linux/amd64/fireactions` or `linux/arm64/fireactions`. Keep the root `fireactions` binary for guest image builds. The image creates `SOCKET_GROUP=fireactions` with numeric `SOCKET_GID=1000` by default.
 
-The container and host must use the same numeric group ID for the shared socket directory. The group name in the image must match `socket_group` in your configuration. Read that name with the binary, then read its numeric ID from the host group database:
+The container and host must use the same numeric group ID for the shared socket directory. The group name in the image must match `socket_group` in your configuration. Read that name with the binary, then read its numeric ID from the host group database.
+
+The commands below use an amd64 binary. For an ARM64 host, use an arm64 binary and replace both `linux/amd64` values with `linux/arm64`:
 
 ```bash
 socket_group=$(./fireactions validate --print-socket-group examples/fireactions.yaml)
 socket_gid=$(getent group "$socket_group" | cut -d: -f3)
 test -n "$socket_gid" || { echo "Create the configured socket group on the host first" >&2; exit 1; }
-docker build --build-arg SOCKET_GROUP="$socket_group" \
+install -D -m0755 ./fireactions linux/amd64/fireactions
+docker build --platform linux/amd64 --build-arg SOCKET_GROUP="$socket_group" \
   --build-arg SOCKET_GID="$socket_gid" -t fireactions-host .
 docker run --rm --entrypoint getent fireactions-host group "$socket_group"
 ```

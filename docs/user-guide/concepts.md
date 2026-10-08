@@ -42,4 +42,4 @@ Archive exports keep directory descriptors bounded, including for deeply nested 
 
 ## Retained names
 
-Fireactions retains some historical names, including `fireactions`, its module path, and the `fireactions` host state and socket names. These names do not mean that GitHub is the runner backend. GitHub remains the source, CI, and release host.
+Fireactions retains the `fireactions` binary name and its host state and socket names. The Go module is `github.com/ALameLlama/fireactions`. GitHub hosts the source repository, CI, and releases. Forgejo is the runner backend.

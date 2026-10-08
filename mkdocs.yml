@@ -1,7 +1,7 @@
 site_name: "Fireactions"
-repo_name: "hostinger/fireactions"
-repo_url: https://github.com/hostinger/fireactions
-site_url: https://hostinger.github.io/fireactions/
+repo_name: "ALameLlama/fireactions"
+repo_url: https://github.com/ALameLlama/fireactions
+site_url: https://alamellama.github.io/fireactions/
 edit_uri: edit/main/docs/
 
 theme:
@@ -27,7 +27,7 @@ extra:
     provider: mike
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/hostinger/fireactions
+      link: https://github.com/ALameLlama/fireactions
 
 nav:
   - User Guide:

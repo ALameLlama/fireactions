@@ -1,4 +1,5 @@
 # Adopters
-<!-- Add yourself here if you are using Fireactions in production! -->
+There are no confirmed production adopters of this Forgejo fork.
+Upstream adoption does not establish adoption of this fork.
 
-- [Hostinger](https://www.hostinger.com/)
+If you use this fork in production, submit a pull request to add your organization.

@@ -6,7 +6,7 @@ A Fireactions guest image is a Linux root filesystem in a container image. Firea
 
 The guest image must include the Fireactions binary and a systemd unit for the guest agent. The supplied Ubuntu 24.04 image creates the `ci` user and `/workspace` directory. Its unit starts the agent as root so the agent can set up the job user and workspace. Job commands run as the configured default user, `ci`.
 
-The unit enables delegated cgroup v2 control for the guest agent and its CI processes. The guest kernel command line must enable the unified cgroup hierarchy. See the supplied [`fireactions-agent.service`](../../images/ubuntu-24.04/fireactions-agent.service) and [kernel guide](kernels.md).
+The unit enables delegated cgroup v2 control for the guest agent and its CI processes. The guest kernel command line must enable the unified cgroup hierarchy. See the supplied [`fireactions-agent.service`](https://github.com/ALameLlama/fireactions/blob/main/images/ubuntu-24.04/fireactions-agent.service) and [kernel guide](kernels.md).
 
 Fireactions does not support SSH login or a default guest password. Do not add either as a way to debug a guest. Fireactions does not provide stdin, PTY, or signal RPC access.
 

@@ -55,6 +55,7 @@
 * Package the canonical Unix-socket host service and independent 10-second reaper timer. Preserve existing containerd, LVM and CNI in the default installer.
 * Remove forced container privilege dropping and the obsolete TCP port. Document the host privileges, shared namespaces and mounts required for container execution.
 * Complete Forgejo registration, guest build/import, clean idle profiles and lifecycle documentation. Replace the obsolete GitHub runner architecture diagram.
+* Move the Go namespace, release ownership, and active documentation links to `ALameLlama/fireactions`. Keep the upstream `tc-redirect-tap` dependency, legal attribution, and historical changelog links.
 
 ## [2.0.8](https://github.com/hostinger/fireactions/compare/v2.0.7...v2.0.8) (2026-09-15)
 

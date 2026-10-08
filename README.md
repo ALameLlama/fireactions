@@ -1,4 +1,4 @@
-[![Go Report Card](https://goreportcard.com/badge/github.com/hostinger/fireactions)](https://goreportcard.com/report/github.com/hostinger/fireactions)
+[![Go Report Card](https://goreportcard.com/badge/github.com/ALameLlama/fireactions)](https://goreportcard.com/report/github.com/ALameLlama/fireactions)
 
 ![Banner](docs/img/banner_violet.png)
 
@@ -20,7 +20,7 @@ flowchart LR
 
 Fireactions supports Forgejo Runner protocol version 13.2 on Linux. The Forgejo Runner and its registration credentials stay on the host. Each job runs in a Linux guest from a configured profile. A guest is destroyed after its lease ends. Fireactions does not resume jobs after a host service restart.
 
-Fireactions retains its historical product, module, binary, and state names. Those names do not indicate an unfinished backend change.
+This fork uses the Go module `github.com/ALameLlama/fireactions`. It retains the Fireactions product name, binary names, and host state paths.
 
 ## Features
 
@@ -45,7 +45,7 @@ sudo ./install.sh --binary ./fireactions --config examples/fireactions.yaml
 
 Use the [installation guide](docs/user-guide/installation.md) for host requirements, guest image import, Forgejo Runner registration, and service setup. Host dependency setup is a separate opt-in operation. Storage formatting is destructive and is not part of the default installation.
 
-See the [user guide](https://fireactions.io/latest/) for configuration and operation details.
+See the [user guide](docs/user-guide/overview.md) for configuration and operation details.
 
 ## CLI
 
