@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
+	serverv1 "github.com/ALameLlama/fireactions/proto/server/v1"
 	"github.com/firecracker-microvm/firecracker-go-sdk"
-	serverv1 "github.com/hostinger/fireactions/proto/server/v1"
 )
 
 func TestConvertPoolUsesProfileImageAndCurrentTarget(t *testing.T) {

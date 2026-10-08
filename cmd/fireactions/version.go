@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/hostinger/fireactions"
+	"github.com/ALameLlama/fireactions"
 	"github.com/spf13/cobra"
 )
 

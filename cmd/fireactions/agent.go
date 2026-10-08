@@ -6,8 +6,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/hostinger/fireactions/agent"
-	"github.com/hostinger/fireactions/internal/executor"
+	"github.com/ALameLlama/fireactions/agent"
+	"github.com/ALameLlama/fireactions/internal/executor"
 	"github.com/spf13/cobra"
 )
 

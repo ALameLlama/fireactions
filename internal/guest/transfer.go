@@ -6,8 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/hostinger/fireactions/internal/executor"
-	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
+	"github.com/ALameLlama/fireactions/internal/executor"
+	agentv1 "github.com/ALameLlama/fireactions/proto/agent/v1"
 )
 
 const transferChunkSize = 32 << 10

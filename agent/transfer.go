@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hostinger/fireactions/internal/guestfs"
-	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
+	"github.com/ALameLlama/fireactions/internal/guestfs"
+	agentv1 "github.com/ALameLlama/fireactions/proto/agent/v1"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"

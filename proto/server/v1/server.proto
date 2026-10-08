@@ -1,7 +1,7 @@
 syntax = "proto3";
 package fireactions.server.v1;
 
-option go_package = "github.com/hostinger/fireactions/proto/server/v1;serverv1";
+option go_package = "github.com/ALameLlama/fireactions/proto/server/v1;serverv1";
 
 import "google/protobuf/timestamp.proto";
 

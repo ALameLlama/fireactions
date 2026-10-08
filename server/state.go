@@ -12,12 +12,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ALameLlama/fireactions/helper/stringid"
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/leases"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/errdefs"
 	"github.com/containernetworking/cni/libcni"
-	"github.com/hostinger/fireactions/helper/stringid"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )

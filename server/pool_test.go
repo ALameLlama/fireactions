@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ALameLlama/fireactions/internal/executor"
 	"github.com/firecracker-microvm/firecracker-go-sdk"
-	"github.com/hostinger/fireactions/internal/executor"
 	"github.com/rs/zerolog"
 	"golang.org/x/sys/unix"
 )

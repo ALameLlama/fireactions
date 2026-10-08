@@ -3,8 +3,8 @@ package main
 import (
 	"fmt"
 
-	"github.com/hostinger/fireactions/helper/printer"
-	serverv1 "github.com/hostinger/fireactions/proto/server/v1"
+	"github.com/ALameLlama/fireactions/helper/printer"
+	serverv1 "github.com/ALameLlama/fireactions/proto/server/v1"
 	"github.com/spf13/cobra"
 )
 

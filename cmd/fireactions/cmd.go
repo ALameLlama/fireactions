@@ -1,8 +1,8 @@
 package main
 
 import (
-	"github.com/hostinger/fireactions"
-	serverv1 "github.com/hostinger/fireactions/proto/server/v1"
+	"github.com/ALameLlama/fireactions"
+	serverv1 "github.com/ALameLlama/fireactions/proto/server/v1"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"

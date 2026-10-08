@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hostinger/fireactions/internal/executor"
-	"github.com/hostinger/fireactions/internal/guest"
-	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
+	"github.com/ALameLlama/fireactions/internal/executor"
+	"github.com/ALameLlama/fireactions/internal/guest"
+	agentv1 "github.com/ALameLlama/fireactions/proto/agent/v1"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"

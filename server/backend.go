@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/hostinger/fireactions/internal/executor"
+	"github.com/ALameLlama/fireactions/internal/executor"
 )
 
 var _ executor.Backend = (*Server)(nil)

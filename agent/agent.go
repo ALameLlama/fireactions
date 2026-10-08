@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ALameLlama/fireactions/internal/guestfs"
+	agentv1 "github.com/ALameLlama/fireactions/proto/agent/v1"
 	"github.com/firecracker-microvm/firecracker-go-sdk/vsock"
-	"github.com/hostinger/fireactions/internal/guestfs"
-	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
 	"github.com/rs/zerolog"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"

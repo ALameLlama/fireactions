@@ -5,7 +5,7 @@ import (
 	"errors"
 	"io"
 
-	pluginv1alpha "github.com/hostinger/fireactions/proto/forgejo/plugin/v1alpha"
+	pluginv1alpha "github.com/ALameLlama/fireactions/proto/forgejo/plugin/v1alpha"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )

@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ALameLlama/fireactions/internal/executor"
+	"github.com/ALameLlama/fireactions/internal/guest"
 	"github.com/containerd/containerd"
-	"github.com/hostinger/fireactions/internal/executor"
-	"github.com/hostinger/fireactions/internal/guest"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"

@@ -10,9 +10,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ALameLlama/fireactions/internal/executor"
 	"github.com/containerd/containerd"
 	"github.com/containerd/log"
-	"github.com/hostinger/fireactions/internal/executor"
 	"github.com/rs/zerolog"
 )
 

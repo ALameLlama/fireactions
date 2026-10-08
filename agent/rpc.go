@@ -6,9 +6,9 @@ import (
 	"io"
 	"os"
 
-	"github.com/hostinger/fireactions"
-	"github.com/hostinger/fireactions/agent/tail"
-	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
+	"github.com/ALameLlama/fireactions"
+	"github.com/ALameLlama/fireactions/agent/tail"
+	agentv1 "github.com/ALameLlama/fireactions/proto/agent/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )

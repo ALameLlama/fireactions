@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
+	agentv1 "github.com/ALameLlama/fireactions/proto/agent/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )

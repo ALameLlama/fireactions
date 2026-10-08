@@ -3,8 +3,8 @@ package main
 import (
 	"time"
 
+	serverv1 "github.com/ALameLlama/fireactions/proto/server/v1"
 	"github.com/docker/go-units"
-	serverv1 "github.com/hostinger/fireactions/proto/server/v1"
 )
 
 // printablePool wraps a proto Pool for printing

@@ -11,7 +11,7 @@ syntax = "proto3";
 
 package plugin.v1alpha;
 
-option go_package = "github.com/hostinger/fireactions/proto/forgejo/plugin/v1alpha;pluginv1alpha";
+option go_package = "github.com/ALameLlama/fireactions/proto/forgejo/plugin/v1alpha;pluginv1alpha";
 
 import "google/protobuf/duration.proto";
 

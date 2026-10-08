@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/hostinger/fireactions/internal/executor"
+	"github.com/ALameLlama/fireactions/internal/executor"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )

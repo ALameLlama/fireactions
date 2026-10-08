@@ -7,8 +7,8 @@ import (
 	"errors"
 	"io"
 
-	"github.com/hostinger/fireactions/internal/executor"
-	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
+	"github.com/ALameLlama/fireactions/internal/executor"
+	agentv1 "github.com/ALameLlama/fireactions/proto/agent/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )

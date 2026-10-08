@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/hostinger/fireactions/internal/executor"
-	pluginv1alpha "github.com/hostinger/fireactions/proto/forgejo/plugin/v1alpha"
+	"github.com/ALameLlama/fireactions/internal/executor"
+	pluginv1alpha "github.com/ALameLlama/fireactions/proto/forgejo/plugin/v1alpha"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"

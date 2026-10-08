@@ -1,4 +1,4 @@
-module github.com/hostinger/fireactions
+module github.com/ALameLlama/fireactions
 
 go 1.26.0
 

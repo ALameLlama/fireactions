@@ -1,7 +1,7 @@
 syntax = "proto3";
 package fireactions.agent.v1;
 
-option go_package = "github.com/hostinger/fireactions/proto/agent/v1;agentv1";
+option go_package = "github.com/ALameLlama/fireactions/proto/agent/v1;agentv1";
 
 // AgentService provides readiness and diagnostics for the generic guest agent.
 service AgentService {

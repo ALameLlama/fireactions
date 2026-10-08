@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	serverv1 "github.com/hostinger/fireactions/proto/server/v1"
+	serverv1 "github.com/ALameLlama/fireactions/proto/server/v1"
 	"github.com/spf13/cobra"
 )
 

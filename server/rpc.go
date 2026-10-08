@@ -4,7 +4,7 @@ import (
 	"context"
 	"sort"
 
-	serverv1 "github.com/hostinger/fireactions/proto/server/v1"
+	serverv1 "github.com/ALameLlama/fireactions/proto/server/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )

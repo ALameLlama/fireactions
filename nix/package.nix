@@ -21,8 +21,8 @@ buildGo126Module (finalAttrs: {
   ldflags = [
     "-s"
     "-w"
-    "-X github.com/hostinger/fireactions.Version=${finalAttrs.version}"
-    "-X github.com/hostinger/fireactions.Commit=${gitRevision}"
+    "-X github.com/ALameLlama/fireactions.Version=${finalAttrs.version}"
+    "-X github.com/ALameLlama/fireactions.Commit=${gitRevision}"
   ];
 
   meta = {
