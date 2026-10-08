@@ -1,54 +1,56 @@
-# Images
+# Guest images
 
-Fireactions images are OCI compliant Docker images that are used to run GitHub Actions runner in Firecracker microVM. The images are built using Docker and contain all the necessary tools and dependencies.
+A Fireactions guest image is a Linux root filesystem in a container image. Fireactions uses containerd to create a root filesystem for a configured Firecracker profile. The profile must name an image that is imported into the same containerd namespace configured for Fireactions.
 
-## Image Requirements
+## Guest image requirements
 
-Each image must contain the Fireactions binary and `/etc/systemd/system/fireactions-agent.service` file:
+The guest image must include the Fireactions binary and a systemd unit for the guest agent. The supplied Ubuntu 24.04 image creates the `ci` user and `/workspace` directory. Its unit starts the agent as root so the agent can set up the job user and workspace. Job commands run as the configured default user, `ci`.
 
-```systemd
-[Unit]
-Description=Fireactions Agent
-Documentation=https://github.com/hostinger/fireactions
-After=network.target
+The unit enables delegated cgroup v2 control for the guest agent and its CI processes. The guest kernel command line must enable the unified cgroup hierarchy. See the supplied [`fireactions-agent.service`](https://github.com/ALameLlama/fireactions/blob/main/images/ubuntu-24.04/fireactions-agent.service) and [kernel guide](kernels.md).
 
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/bin/fireactions agent --log-level=info
-Restart=on-failure
-RestartSec=5s
+Fireactions does not support SSH login or a default guest password. Do not add either as a way to debug a guest. Fireactions does not provide stdin, PTY, or signal RPC access.
 
-[Install]
-WantedBy=multi-user.target
+## Build and export the supplied image
+
+The guest image, kernel, and agent binary must match the host architecture. The examples below use amd64. For a native arm64 host and guest, use `GOARCH=arm64` and Docker's `--platform linux/arm64` instead.
+
+From the repository root, build the static Linux amd64 `fireactions` binary. The guest image build copies this fork-built binary into the guest:
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o fireactions ./cmd/fireactions
 ```
 
-## How It Works
+Build from the repository root. The Docker build uses the `fireactions` binary at the repository root.
 
-The Fireactions agent is started as a systemd service when the container is run. The Fireactions agent manages the lifecycle of GitHub runner inside the Firecracker microVM. Once the workflow job completes (or GitHub runner exits), the Fireactions agent will shut down the Firecracker microVM.
+```bash
+docker build --platform linux/amd64 -f images/ubuntu-24.04/Dockerfile \
+  -t localhost/fireactions-guest:ubuntu-24.04 .
+docker save -o fireactions-guest.tar \
+  localhost/fireactions-guest:ubuntu-24.04
+```
 
-> Optionally, the shutdown can be disabled in order to keep the microVM running for debugging purposes using the `shutdown_on_exit` option of a Pool.
+Import the archive with the devmapper snapshotter into the same containerd namespace that appears in `containerd.namespace` in the Fireactions configuration. The example uses `fireactions`:
 
-## Base Images
+```bash
+sudo ctr --namespace fireactions images import --local --snapshotter devmapper fireactions-guest.tar
+sudo ctr --namespace fireactions images list
+```
 
-The following official base images are available in the [fireactions-images repository](https://github.com/hostinger/fireactions-images):
+Use `--local` to unpack with devmapper through the client instead of the containerd transfer service.
 
-| Name | Description | OS |
-|------|-------------|----|
-| ubuntu20.04 | Full Ubuntu 20.04 image with Docker, Docker Compose, and other tools | Ubuntu 20.04 |
-| ubuntu22.04 | Full Ubuntu 22.04 image with Docker, Docker Compose, and other tools | Ubuntu 22.04 |
-| ubuntu24.04 | Full Ubuntu 24.04 image with Docker, Docker Compose, and other tools | Ubuntu 24.04 |
-
-## Using Images
-
-To use an image in your Fireactions configuration, specify it in the pool configuration:
+Set the configured profile image to the imported reference, for example:
 
 ```yaml
-pools:
-  - name: default
-    image: ghcr.io/hostinger/fireactions-images/ubuntu24.04:latest
+image: localhost/fireactions-guest:ubuntu-24.04
+image_pull_policy: Never
 ```
 
-## Custom Images
+The `Never` policy means containerd must already have that image in the configured namespace. Image names are namespace-scoped. Importing the image into a different namespace does not make it available to Fireactions.
 
-To build a custom image, see the [custom image tutorial](../tutorials/custom-image.md).
+## Configure bootable profiles
+
+A pool profile combines the image reference with a readable kernel, executable Firecracker binary, kernel arguments, and machine size. For example, the supplied configuration defines `ubuntu-24.04` with 2 CPUs and 4 GiB of memory, and `ubuntu-24.04-large` with 4 CPUs and 8 GiB.
+
+Forgejo Runner selects a configured profile by its label, for example `firecracker:firecracker://ubuntu-24.04`. The label does not allow a workflow to boot an arbitrary Docker image. Configure each bootable image and kernel in the host configuration before jobs request it.
+
+A used guest is disposable. Fireactions does not keep job changes for another run or return a claimed guest to idle capacity. To change an image, build and import the replacement and update the profile configuration.

@@ -1,41 +1,16 @@
-# Debugging workflows
+# Debug workflow failures
 
-Occasionally, it may be necessary to connect to a running Fireactions VM for debugging workflow steps or inspecting the filesystem.
+Fireactions does not provide SSH login, a default guest password, or a `tmate` session. It also does not provide stdin, PTY, or signal RPC support. Use the supported workflow logs and guest agent logs to find failures.
 
-[tmate](https://github.com/mxschmitt/action-tmate) action provides a way to SSH into a running runner VM and have full access.
+Use the Forgejo workflow run page to read each step's output and identify the first failing command. Add temporary diagnostic commands to print relevant non-secret state, such as the working directory, tool version, and selected input files. Remove diagnostic output that reveals secrets before sharing logs.
 
-Using it is easy - just decide which workflow step to intercept, comment out the subsequent steps, then insert the tmate action just before them:
+Use the host CLI to list VMs and read agent logs:
 
-```
-    - name: Setup tmate session
-      uses: mxschmitt/action-tmate@v3
-```
-
-!!! Warning
-      For security purposes, it's advised to add SSH keys to your github [profile](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/adding-a-new-ssh-key-to-your-github-account) and limit access to yourself:
-```
-    - name: Setup tmate session
-      uses: mxschmitt/action-tmate@v3
-      with:
-        limit-access-to-actor: true
+```sh
+fireactions ps
+fireactions logs VM_ID --follow
 ```
 
-Additionally, instead of having to add/remove, or uncomment the required config, you can make the tmate step to be conditional and use user input:
+The host CLI must be able to access the Fireactions Unix socket. The service account or your account must have access through the configured socket group. The `logs` command reports guest agent logs. It does not provide an interactive shell.
 
-```
-on:
-  workflow_dispatch:
-    inputs:
-      debug_enabled:
-        type: boolean
-        description: 'Run the build with tmate debugging enabled (https://github.com/marketplace/actions/debugging-with-tmate)'
-        required: false
-        default: false
-```
-
-```
-    steps:
-      - name: Setup tmate session
-        uses: mxschmitt/action-tmate@v3
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
-```
+For boot or provisioning failures, inspect the host Fireactions service journal and the containerd, CNI, and Firecracker logs for the configured profile. Use `fireactions validate --host /etc/fireactions/config.yaml` to check configured host prerequisites. Do not expose workflow secrets in logs or diagnostic output.

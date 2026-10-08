@@ -1,78 +1,40 @@
-# Setting up a Docker registry mirror
+# Configure a container image registry mirror
 
-Using DockerHub directly to pull images can be a pain due to rate limits. To avoid this, there's an option of setting up a custom registry mirror, or in other words a pull-through cache. 
+A registry mirror caches images from another registry. Use a mirror that serves your prepared Fireactions guest image. The examples below use `mirror.example.com/fireactions/guest:ubuntu-24.04`. Replace that reference with the exact image reference served by your mirror.
 
-This way, you can pull images from the mirror instead of DockerHub, which can be faster and more reliable.
+Fireactions creates its own registry resolver. It does not read the host containerd registry mirror configuration. Changing that configuration alone does not route Fireactions pulls through a mirror.
 
-To set up the Docker registry mirror, include the following Ansible role in the Ansible playbook that you've used to install Fireactions:
+Pull the mirror-qualified image into the configured containerd namespace with the devmapper snapshotter. The example namespace is `fireactions`. If your configuration uses a different namespace or containerd socket, change the `ctr` arguments to match:
+
+```sh
+sudo ctr --namespace fireactions images pull --snapshotter devmapper \
+  mirror.example.com/fireactions/guest:ubuntu-24.04
+sudo ctr --namespace fireactions images list
+```
+
+Alternatively, export the mirror-qualified image as an archive on a machine that can reach the mirror. Transfer the archive to the Fireactions host and import it into the same namespace:
+
+```sh
+docker pull mirror.example.com/fireactions/guest:ubuntu-24.04
+docker save -o fireactions-guest.tar mirror.example.com/fireactions/guest:ubuntu-24.04
+# On the Fireactions host:
+sudo ctr --namespace fireactions images import --local --snapshotter devmapper fireactions-guest.tar
+sudo ctr --namespace fireactions images list
+```
+
+Set each profile to the exact pulled or imported image reference and `image_pull_policy: Never`. For example, change these fields in an existing profile:
 
 ```yaml
-- role: hostinger.common.registry
-  vars:
-    registry_name: docker.io
-    registry_config: "{{ registry_config_docker_io }}"
-  tags:
-    - registry_docker_io
-    - registry
+containerd:
+  address: /run/containerd/containerd.sock
+  namespace: fireactions
+pools:
+  - name: ubuntu-24.04
+    image: mirror.example.com/fireactions/guest:ubuntu-24.04
+    image_pull_policy: Never
+    # Keep the profile's remaining fields, including firecracker.
 ```
 
-The `registry_config_docker_io` variable should be defined in the `group_vars/all.yaml` file. Here's an example of how it can look like:
+`Never` uses the image already stored in that namespace and does not contact a registry. A missing image fails provisioning. `Always`, or `IfNotPresent` with a missing image, invokes the Fireactions resolver instead. Make sure that the image list contains the exact configured reference before starting Fireactions.
 
-```yaml
-registry_config_docker_io:
-  version: 0.1
-  http:
-    addr: 192.168.128.1:5003 # fireactions-br0 network
-    relativeurls: false
-    draintimeout: 60s
-  storage:
-    filesystem:
-      rootdirectory: /var/lib/registry/docker.io
-  proxy:
-    remoteurl: https://registry-1.docker.io
-  log:
-    level: info
-    formatter: text
-    accesslog:
-      disabled: false
-```
-
-Then run the Ansible playbook to apply the changes:
-
-```bash
-ansible-playbook -i <inventory> <playbook>.yml --tags registry_docker_io
-```
-
-This configuration will set up a registry mirror for `docker.io` images. The mirror will be available at `http://192.168.128.1:5003`.
-
-After setting up the Docker registry mirror, configure the GitHub workflow to use the mirror:
-
-```yaml
-- name: Set up Docker Buildx
-  uses: docker/setup-buildx-action@v3
-  with:
-    install: true
-    driver: docker-container
-    buildkitd-flags: --config /etc/buildkit/buildkitd.toml
-    config-inline: |
-      [registry."docker.io"]
-        mirrors = ["192.168.128.1:5003"]
-        http = true
-        insecure = true
-
-- name: Pull image
-  run: |
-    docker pull alpine:latest
-```
-
-To check if it worked, run the following command:
-
-```bash
-curl --silent http://192.168.128.1:5003/v2/_catalog
-```
-
-If the output is similar to the following, congratulations, the Docker registry mirror is set up correctly!
-
-```json
-{"repositories":["library/alpine","moby/buildkit"]}
-```
+A host mirror does not provide Docker actions or service containers inside workflow VMs. Fireactions does not start arbitrary workflow container images. A Docker registry mirror configured inside a guest or workflow has a separate purpose and does not change Fireactions image selection.

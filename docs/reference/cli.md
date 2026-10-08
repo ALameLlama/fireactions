@@ -1,257 +1,98 @@
-# Interacting with Fireactions via CLI
+# Command-line reference
 
-Fireactions provides a CLI for interacting with the server.
+The `fireactions` command starts the host server, validates configuration, and manages configured profiles and guest VMs. Run `fireactions --help` or `fireactions COMMAND --help` for command help.
 
-```bash
-$ fireactions --help
-BYOM (Bring Your Own Metal) and run self-hosted GitHub runners in ephemeral, fast and secure Firecracker based virtual machines.
+## Server and agent
 
-Usage:
-  fireactions [command]
+`fireactions server` starts the host plugin server. It reads `/etc/fireactions/config.yaml` by default. Use `--config` or `-f` to select another file.
 
-Main application commands:
-  server      Starts the Fireactions server
-  agent       Starts the Fireactions agent
-  validate    Validates the server configuration file
-
-Pool management commands:
-  pools       Manage pools
-
-Machine management commands:
-  ps          List all running machines across all pools
-  login       SSH into a running VM as root user
-  logs        Stream logs from the fireactions-agent service inside a machine
-
-Image management commands:
-  image       Manage images
-
-Additional Commands:
-  version     Show version information
-  help        Help about any command
-  completion  Generate the autocompletion script for the specified shell
-
-Flags:
-  -h, --help      help for fireactions
-  -v, --version   version for fireactions
-
-Use "fireactions [command] --help" for more information about a command.
+```sh
+sudo fireactions server --config /etc/fireactions/config.yaml
 ```
 
-## Server Endpoint
+`fireactions agent` starts the guest agent. The guest image starts this command as a service. Its flags are `--log-level` or `-l`, `--port` (default `9001`), `--workspace-root` (default `/workspace`), `--default-user` (default `ci`), `--max-transfer-bytes`, and `--max-archive-entries`. The server and agent use the Fireactions guest protocol. The current Forgejo runner plugin protocol is pinned to Runner 13.2 alpha and supports Linux guests only.
 
-Most commands that interact with the Fireactions server accept an `--endpoint` (or `-e`) flag to specify the server address.
+## Validate configuration
 
-```bash
-fireactions --endpoint https://fireactions.example.com:8080 pools list
-# or using shorthand
-fireactions -e https://fireactions.example.com:8080 pools list
-```
+The positional form checks the configuration schema without checking host resources:
 
-The default endpoint is `127.0.0.1:8080`.
-
-## Commands
-
-### Main Application Commands
-
-#### `server`
-
-Starts the Fireactions server.
-
-```bash
-fireactions server
-```
-
-By default, the server looks for a configuration file at `/etc/fireactions/config.yaml`. You can specify a different path using the `--config` (or `-f`) flag:
-
-```bash
-fireactions server --config /path/to/config.yaml
-```
-
-#### `agent`
-
-Starts the Fireactions agent. This command should be run inside the virtual machine and is automatically executed by the VM image.
-
-```bash
-fireactions agent
-```
-
-The agent reads metadata from the Firecracker MMDS service to configure itself. You can optionally specify the log level:
-
-```bash
-fireactions agent --log-level debug
-```
-
-Available log levels: `debug`, `info`, `warn`, `error`, `fatal`, `panic`, `trace` (default: `info`)
-
-#### `validate`
-
-Validates a server configuration file without starting the server. This is useful for checking configuration syntax and validating settings before deployment.
-
-```bash
-fireactions validate /path/to/config.yaml
-```
-
-### Pool Management Commands
-
-All pool management commands accept an `--endpoint` (or `-e`) flag to specify the server address (default: `127.0.0.1:8080`).
-
-#### `pools list` (alias: `pools ls`)
-
-List all configured pools with their current status.
-
-```bash
-fireactions pools list
-```
-
-#### `pools pause <NAME>`
-
-Pause a pool, preventing it from scaling up. Running VMs continue to operate, but no new VMs will be started.
-
-```bash
-fireactions pools pause default
-```
-
-#### `pools resume <NAME>`
-
-Resume a paused pool, enabling it to scale up again.
-
-```bash
-fireactions pools resume default
-```
-
-#### `pools scale <NAME> --replicas <N>`
-
-Scale a pool to the specified number of replicas. The pool will scale up or down to match the desired number.
-
-```bash
-# Scale to 5 replicas
-fireactions pools scale default --replicas 5
-
-# Scale down to 0 (stop all VMs)
-fireactions pools scale default --replicas 0
-```
-
-**Note**: The `--replicas` flag is required and you can scale down to 0 to stop all VMs in a pool.
-
-### Machine Management Commands
-
-All machine management commands accept an `--endpoint` (or `-e`) flag to specify the server address (default: `127.0.0.1:8080`).
-
-#### `ps` (alias: `ls`)
-
-List all running machines across all pools.
-
-```bash
-fireactions ps
-```
-
-#### `login <VMID>`
-
-SSH into a running VM as the root user. This is useful for debugging or inspecting VM state.
-
-```bash
-fireactions login default-abc123
-```
-
-The command will automatically:
-- Look up the VM's IP address
-- Establish an SSH connection with appropriate options
-- Drop you into a root shell
-
-**Requirements**: SSH must be installed and accessible in your PATH.
-
-#### `logs <MACHINE_ID>`
-
-Stream logs from the fireactions-agent gRPC service running inside a machine. This shows the zerolog output from the agent service itself, including agent startup, status changes, and any errors from the agent.
-
-```bash
-# Show all buffered logs
-fireactions logs default-abc123
-
-# Follow logs in real-time (like tail -f)
-fireactions logs default-abc123 --follow
-
-# Show last 50 lines and follow
-fireactions logs default-abc123 --follow --tail 50
-```
-
-**Flags:**
-- `-f, --follow`: Follow log output (stream continuously like tail -f)
-- `--tail N`: Number of lines to show from end (0 = all buffered logs)
-
-### Image Management Commands
-
-All image management commands accept an `--endpoint` (or `-e`) flag to specify the server address (default: `127.0.0.1:8080`).
-
-#### `image list` (alias: `image ls`)
-
-List all container images managed by Fireactions.
-
-```bash
-fireactions image list
-```
-
-#### `image remove <NAME>` (alias: `image rm`)
-
-Remove a container image from the Fireactions server.
-
-```bash
-fireactions image remove ghcr.io/myorg/myimage:latest
-```
-
-### Additional Commands
-
-#### `version`
-
-Show version information for Fireactions.
-
-```bash
-fireactions version
-```
-
-## Examples
-
-### Basic Workflow
-
-```bash
-# Validate configuration before starting
+```sh
 fireactions validate /etc/fireactions/config.yaml
+```
 
-# Start the server
-fireactions server --config /etc/fireactions/config.yaml
+The host form also checks configured Firecracker and kernel paths, KVM, containerd, the devmapper snapshotter, CNI plugins, and host resolver prerequisites. It does not start the server or create VMs or host resources.
 
-# List all pools
+```sh
+sudo fireactions validate --host /etc/fireactions/config.yaml
+```
+
+To read the configured socket group, validate the file and print only the group name:
+
+```sh
+fireactions validate --print-socket-group /etc/fireactions/config.yaml
+```
+
+This form uses the YAML parser and validates the whole configuration. On success, standard output contains one group name and a newline. On failure, it returns a nonzero exit status without printing a group. It does not require the group to exist. If you also pass `--host`, host validation must succeed before it prints the group.
+
+## Reap expired or abandoned VMs
+
+`reap` is a standalone cleanup command. It does not require a running plugin. Use `--config` to select its configuration file. The default is `/etc/fireactions/config.yaml`.
+
+```sh
+sudo fireactions reap --config /etc/fireactions/config.yaml
+```
+
+The reaper preserves unexpired VMs owned by a live daemon. It uses saved process identities, CNI configuration, and containerd ownership labels. Journal records are under `state_dir/journal`. Corrupt records are quarantined with a `.json.corrupt-<id>` suffix. They are evidence for an operator to assess. Do not remove them without determining whether their resources still exist. Startup cleans old VMs instead of resuming jobs. The independent `fireactions-reaper.timer` must stay enabled when the main service stops or crashes.
+
+## Plugin endpoint
+
+Management commands use the local Unix socket `unix:///run/fireactions/plugin.sock` by default. They accept `--endpoint` or `-e` to select another endpoint. Fireactions does not expose a TCP gRPC endpoint.
+
+```sh
+fireactions -e unix:///run/fireactions/plugin.sock pools list
+```
+
+## Profile commands
+
+`pools list` (alias `pools ls`) lists configured profiles and their status. Its `current` count is the number of ready idle VMs, not active environments.
+
+```sh
 fireactions pools list
+```
 
-# Scale up a pool
-fireactions pools scale production --replicas 10
+`pools pause NAME` stops idle replenishment and cold acquisition. Existing idle VMs can still be claimed. `pools resume NAME` resumes replenishment and cold acquisition.
 
-# Check machine status
+```sh
+fireactions pools pause ubuntu-24.04
+fireactions pools resume ubuntu-24.04
+```
+
+`pools scale NAME --replicas N` changes the target number of clean idle VMs. The count can be zero. Scaling down removes idle VMs and cancels excess idle provisioning. It does not stop claimed environments.
+
+```sh
+fireactions pools scale ubuntu-24.04 --replicas 3
+```
+
+## VM and image commands
+
+`ps` (alias `ls`) lists machines across profiles. `logs MACHINE_ID` reads guest agent logs. Add `--follow` or `-f` to stream logs. Add `--tail N` to limit the initial output. A zero tail value returns all buffered lines.
+
+```sh
 fireactions ps
+fireactions logs VM_ID --follow --tail 50
+```
 
-# View logs from a specific machine
-fireactions logs production-abc123 --follow
+`image list` (alias `image ls`) lists container images managed through the server. `image remove NAME` (alias `image rm`) removes an image. Image removal can affect a configured profile. Do not remove an image that a running server needs.
 
-# SSH into a machine for debugging
-fireactions login production-abc123
-
-# Scale down when done
-fireactions pools scale production --replicas 0
-
-# List images
+```sh
 fireactions image list
-
-# Remove an unused image
-fireactions image remove ghcr.io/example/old-image:v1
+fireactions image remove localhost/fireactions-guest:ubuntu-24.04
 ```
 
-### Using Remote Server
+`version` prints the Fireactions version. `completion SHELL` generates completion code for a shell.
 
-```bash
-# Connect to a remote Fireactions server
-fireactions -e https://fireactions.example.com:8080 pools list
+## Runner and guest limits
 
-# All commands support the --endpoint flag
-fireactions -e https://fireactions.example.com:8080 ps
-fireactions -e https://fireactions.example.com:8080 logs machine-123 -f
-```
+The plugin accepts a configured profile name, not an arbitrary Docker image. It resolves profile selection in this order: request image, `label_arg`, then the `profile` backend option. If no value selects a configured profile, the request fails. There is no implicit default profile.
+
+The plugin rejects service containers and Docker-container actions. It does not provide stdin, PTY, or signal RPC support. Linux guests are supported. Capability adjustments are advisory and ignored. A claimed VM is disposable. Fireactions does not reuse it for another job or resume a job after restart. Fireactions does not add Firecracker jailer isolation.

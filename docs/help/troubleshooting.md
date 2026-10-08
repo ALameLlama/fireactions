@@ -1,116 +1,59 @@
 # Troubleshooting
 
-## How to access the virtual machine of GitHub runner?
+## Host validation fails
 
-To access the virtual machine, the ID of the virtual machine must be known. The ID can be found in GitHub Actions logs. Once the ID is known, the virtual machine can be accessed by issuing a `fireactions microvm login <vmid>` command:
+Run schema validation first, then host validation with the configuration used by the service:
 
-```bash
-root@localhost:~# fireactions microvm login default-f093dd909cea44b35ef2d99e
-
-VM ID: default-f093dd909cea44b35ef2d99e
-IP Address: 192.168.128.28
-Copy/paste to connect:
-
-ssh -l root 192.168.128.28
+```sh
+fireactions validate /etc/fireactions/config.yaml
+sudo fireactions validate --host /etc/fireactions/config.yaml
 ```
 
-The default password is `fireactions`. This can be changed by creating a custom image. Once logged in, the virtual machine can be managed as a regular Linux machine. Inside you will find `fireactions` service logs:
+The host check reports missing or unusable configured Firecracker and kernel paths, KVM access, containerd devmapper support, CNI plugins, or resolver settings. Install or configure the missing host prerequisite with your normal host-management procedure. The check does not change host resources.
 
-```bash
-root@localhost:~# systemctl status fireactions
-● fireactions.service - Fireactions
-     Loaded: loaded (/etc/systemd/system/fireactions.service; enabled; vendor preset: enabled)
-     Active: active (running) since Fri 2024-09-27 14:54:48 UTC; 2 weeks 5 days ago
-<...>
+## A profile cannot find its guest image
+
+Check that the image name in the profile matches the imported image name. Check that `containerd.namespace` names the same namespace used to import the image. Check that the image pull policy allows the image to be used locally. Fireactions boots prepared Linux root filesystem images. A general-purpose Docker image is not automatically a supported guest.
+
+## A VM does not start or reach the guest agent
+
+Read the Fireactions service journal and inspect the configured kernel and Firecracker executable paths. Check that KVM is available, the configured kernel is readable, the guest image follows the boot contract, and the guest agent service starts. Run host validation again after you correct a prerequisite.
+
+Use these commands to inspect the host service and the VM's agent log:
+
+```sh
+sudo journalctl -u fireactions.service
+fireactions ps
+fireactions logs VM_ID
 ```
 
-## containerd: creating snapshot: snapshotter not loaded: devmapper: invalid argument
+The agent log is not an interactive session. Fireactions does not support guest SSH login, a default password, stdin, or PTY.
 
-If the following error is found in the logs:
+## containerd cannot create a devmapper snapshot
 
-```text
-Nov 10 19:01:47 eu-lt-sng3-node3 fireactions[14729]: 2024-11-10 19:01:47 ERR pool.go:125 > Failed to scale pool error="containerd: creating snapshot: snapshotter not loaded: devmapper: invalid argument" pool=fireactions-2vcpu-2gb
+Check that the configured containerd daemon has the devmapper snapshotter loaded and that it can create snapshots. Use the configuration and maintenance procedure for the containerd installation on this host. Do not overwrite containerd configuration or stop its service as a generic repair. Do not remove namespaces, images, snapshots, or storage devices to clear an error. Those resources can belong to other workloads.
+
+## A VM remains after the service stops
+
+The independent `fireactions-reaper.timer` cleans expired VMs and VMs from a daemon that no longer owns them. Check the timer and service journal:
+
+```sh
+sudo systemctl status fireactions-reaper.timer
+sudo journalctl -u fireactions-reaper.service
 ```
 
-This error is caused by the `devmapper` snapshotter not being loaded. To fix this, the `devmapper` snapshotter must be loaded. This can be done by adding the following line to the `containerd` configuration file:
+You can run the cleanup command with the service configuration:
 
-```bash
-tee /etc/containerd/config.toml <<EOF
-[plugins]
-  [plugins."io.containerd.snapshotter.v1.devmapper"]
-    pool_name       = "containerd-thinpool"
-    root_path       = "/var/lib/containerd/devmapper"
-    base_image_size = "30GB"
-    discard_blocks  = true
-EOF
-
-systemctl restart containerd
+```sh
+sudo fireactions reap --config /etc/fireactions/config.yaml
 ```
 
-## containerd: creating snapshot: prepare: failed to create snapshot
+Do not remove quarantined journal records by hand. They identify resources that an operator must assess. The reaper uses saved process identities and resource ownership labels. It does not treat a matching process name as proof that a resource belongs to Fireactions.
 
-If the following error is found in the logs:
+## A shell probe reports a missing directory
 
-```text
-Nov 10 19:02:04 eu-lt-sng3-node3 fireactions[14729]: 2024-11-10 19:02:04 ERR pool.go:125 > Failed to scale pool error="containerd: creating snapshot: prepare: failed to create snapshot \"containerd-thinpool-snap-35\" (dev: 35) from \"containerd-thinpool-snap-23\" (dev: 23): no data available: unknown" pool=fireactions-2vcpu-2gb
-```
+Runner 13.2 can probe the repository directory before a workflow without checkout declares `FORGEJO_WORKSPACE`. That early probe reports `plugin exec: open workdir: no such file or directory`, and Runner selects its normal shell fallback. Fireactions prepares the declared workspace before the actual workflow script runs. An explicit missing working directory still causes a process launch failure.
 
-The error message is not clear. This could happen when tampering with the installation. We've only been able to fix this by completely wiping Containerd namespaces and restarting the service. This is not a good solution, but it works.
+## A workflow requests an unsupported feature
 
-To do this, run the following commands:
-
-```bash
-systemctl stop containerd
-
-ctr namespaces ls
-NAME                  LABELS
-fireactions-2vcpu-4gb
-
-ctr --namespace=fireactions-2vcpu-4gb snapshots --snapshotter=devmapper ls
-KEY                                                                     PARENT                                                                  KIND
-fireactions-2vcpu-4gb-943101bc9e5079d2886dc0ec                          sha256:7bcb2dfc39edf0d70dcee6285aa9cb9d5cab4d84933c454d69bfd811a6a477b5 Active
-
-ctr --namespace=fireactions-2vcpu-4gb snapshots --snapshotter=devmapper rm fireactions-2vcpu-4gb-943101bc9e5079d2886dc0ec
-
-ctr --namespace=fireactions-2vcpu-4gb i ls
-REF                                                     TYPE                                                      DIGEST                                                                  SIZE      PLATFORMS               LABELS
-ghcr.io/hostinger/fireactions-images/ubuntu22.04:v0.7.0 application/vnd.docker.distribution.manifest.list.v2+json sha256:c7dd9a4dd58300040a24a00c52a2035e1d428aeab95fbd81690a6bf37aeea87f 617.7 MiB linux/amd64,linux/arm64 -
-
-ctr --namespace=fireactions-2vcpu-4gb i rm ghcr.io/hostinger/fireactions-images/ubuntu22.04:v0.7.0
-
-ctr namespaces rm fireactions-2vcpu-4gb
-
-systemctl start containerd
-```
-
-## How to clean up orphaned GH Runners?
-
-If there is a need to clean up GH Runners that have errored and didn't remove themselves, there is a one-line shell
-command that can remove all runners that are currently offline.
-
-Requirements:
-
-- The tools `jq`, `xargs` and the GitHub CLI
-- The GitHub CLI is authenticated as Organization Administrator for the affected Fireactions Pool.
-
-⚠️ **Warning**: This command will permanently delete runners. Ensure your organization depends on fireactions and that
-you have tested this in a non-production environment first. To preview which runners will be deleted without actually
-deleting them please omit the `xargs` step in the shell commands.
-
-To execute this command with bash, execute the following:
-
-```bash
-export GH_PAGER=
-export ORG="<ORG>"
-gh api --paginate /orgs/$ORG/actions/runners | jq '.runners[] | select(.status=="offline") | .id' | xargs -I {} gh api --method DELETE /orgs/$ORG/actions/runners/{}
-```
-
-To do the same with fish shell, execute the following:
-
-```fish
-set -x GH_PAGER
-set -x ORG <ORG>
-gh api --paginate /orgs/$ORG/actions/runners | jq '.runners[] | select(.status=="offline") | .id' | xargs -I {} gh api --method DELETE /orgs/$ORG/actions/runners/{}
-```
-
-Please replace `<ORG>` with the name of your GitHub Account or Organization.
+The plugin is pinned to Runner 13.2 alpha and supports Linux guests only. It does not support service containers, Docker-container actions, stdin, PTY, or signal RPC. Capability adjustments are advisory and ignored. Use actions and workflow steps that run commands in the supported Linux guest.

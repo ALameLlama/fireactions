@@ -1,106 +1,74 @@
-# Upgrading
+# Upgrade Fireactions
 
-This guide covers the process of upgrading Fireactions to a newer version.
+Use a Fireactions binary built from the intended source revision. GitHub hosts the source repository and release files, but the host must run the fork-built Fireactions binary. Do not install an upstream runner product in its place.
 
-## Upgrade Steps
+A host service restart destroys old claimed and idle VMs before Fireactions accepts jobs. Jobs do not resume after a restart. Schedule an upgrade when interrupting active jobs is acceptable.
 
-### 1. Stop the Fireactions service
+Rebuild each guest image with the new binary from the same source revision. Replacing only the host binary leaves the old guest agent in each VM. See [Guest images](images.md) for the build and export commands.
 
-Stop the Fireactions service to prevent new runners from starting:
+## Replace the binary
 
-```bash
-sudo systemctl stop fireactions
-```
+Copy the new binary to the host. Make sure it is executable and keep a backup of the current binary outside the active install path.
 
-Verify the service is stopped:
+Stop the host service, reaper timer, and reaper service before replacing the binary:
 
 ```bash
-sudo systemctl status fireactions
+sudo systemctl stop fireactions-reaper.timer fireactions.service fireactions-reaper.service
 ```
 
-### 2. Download new Fireactions binary
-
-Download the new release from the [GitHub releases page](https://github.com/hostinger/fireactions/releases):
+Import the rebuilt guest archive into the configured containerd namespace before restarting Fireactions. The example uses the `fireactions` namespace:
 
 ```bash
-# Example for version X.Y.Z
-wget https://github.com/hostinger/fireactions/releases/download/vX.Y.Z/fireactions_X.Y.Z_linux_amd64.tar.gz
-tar -xzf fireactions_X.Y.Z_linux_amd64.tar.gz
+sudo ctr --namespace fireactions images import --local --snapshotter devmapper fireactions-guest.tar
 ```
 
-### 3. Replace the binary
+Keep each profile's `image` reference aligned with the imported image. If you use the NixOS module, replace its `imageArchive` and package together, then rebuild the host configuration.
 
-Replace the old binary with the new one:
+Install the new binary at the existing Fireactions binary path. The default installer uses `/usr/local/bin/fireactions`:
 
 ```bash
-sudo mv fireactions /usr/local/bin/fireactions
-sudo chmod +x /usr/local/bin/fireactions
+sudo install -m 0755 ./fireactions /usr/local/bin/fireactions
 ```
 
-### 4. Verify the binary
+Validate the current configuration, including existing host prerequisites:
 
-Confirm the new version is installed:
+```bash
+sudo /usr/local/bin/fireactions validate /etc/fireactions/config.yaml
+sudo /usr/local/bin/fireactions validate --host /etc/fireactions/config.yaml
+```
+
+Review release notes and update the configuration when the new version requires a schema change. Do not replace the host state directory or delete journal records as part of an upgrade.
+
+Journal locks now use one `.metadata.lock` file. Do not run old and new Fireactions binaries against the same state directory together.
+
+Stop every daemon and reaper that uses this state directory, including manually started processes. After they stop, you can remove old per-VM lock files:
+
+```bash
+sudo find /var/lib/fireactions/journal -maxdepth 1 -type f -name '*.lock' ! -name '.metadata.lock' -delete
+```
+
+If you use a custom `state_dir`, change the path in this command. Keep `.metadata.lock` and all JSON journal records.
+
+Start the service and confirm that the independent reaper timer remains enabled:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl start fireactions.service
+sudo systemctl enable --now fireactions-reaper.timer
+sudo systemctl status fireactions.service
+sudo systemctl status fireactions-reaper.timer
+```
+
+Keep the reaper timer enabled during normal operation, including main-service stops and crashes. Stop it temporarily when replacing the binary.
+
+## Verify the upgrade
+
+Check the installed binary version, pool state, and host service journal:
 
 ```bash
 fireactions version
+fireactions pools list
+sudo journalctl -u fireactions.service -n 100
 ```
 
-### 5. Validate configuration
-
-Check your configuration for compatibility with the new version:
-
-```bash
-fireactions validate /etc/fireactions/config.yaml
-```
-
-If validation fails, review the error messages and update your configuration according to the release notes. Breaking changes are typically documented in the release notes with migration instructions.
-
-### 6. Start the Fireactions service
-
-Start Fireactions with the new version:
-
-```bash
-sudo systemctl start fireactions
-```
-
-## Post-Upgrade Verification
-
-After starting the service, verify the upgrade was successful:
-
-### Check Service Status
-
-```bash
-sudo systemctl status fireactions
-```
-
-The service should be `active (running)`.
-
-### Review Logs
-
-Check the logs for any errors or warnings:
-
-```bash
-sudo journalctl -u fireactions -n 100 -f
-```
-
-Look for specific error messages or warnings that might indicate issues.
-
-### Verify Pool Status
-
-List the pools to ensure they are running correctly:
-
-```bash
-fireactions pools ls
-```
-
-### Monitor Metrics
-
-If metrics are enabled, check the metrics endpoint:
-
-```bash
-curl http://127.0.0.1:8081/metrics
-```
-
-### Test with a Workflow
-
-Trigger a test GitHub workflow to verify runners are being created and jobs execute successfully.
+Run a Forgejo workflow with a configured Fireactions profile label after the host service is ready. Fireactions supports Forgejo Runner protocol 13.2 on Linux. Keep the Runner and its registration token on the host.

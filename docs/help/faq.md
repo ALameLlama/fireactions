@@ -1,17 +1,29 @@
-# Frequently Asked Questions
+# Frequently asked questions
 
-## How does Fireactions compare to other solutions?
+## What does Fireactions run?
 
-Self hosted GitHub runners are a great way to run your CI/CD jobs on your own infrastructure. However, setting up and managing self-hosted runners can be a complex and time-consuming process. Fireactions aims to simplify this process by providing a lightweight and secure solution for orchestrating self-hosted GitHub runners.
+Fireactions runs Forgejo workflows in disposable Firecracker virtual machines. A configured profile names a prepared, bootable Linux guest image and its VM resources. Fireactions does not run arbitrary Docker images as guest profiles.
 
-Compared to [ARC(Actions Runner Controller)](https://github.com/actions/actions-runner-controller), ARC is a Kubernetes operator with primary use case of managing self-hosted GitHub runners in Kubernetes clusters, while Fireactions is a standalone application that can be run on any regular bare metal server or a VM that supports nested virtualization.
+## Which Runner and guest versions are supported?
 
-Kubernetes can be an overkill for most situations and managing a Kubernetes cluster can be complex and resource intensive task.
+The Forgejo runner plugin protocol is pinned to Runner 13.2 alpha. Linux guests are supported. The plugin does not support service containers or Docker-container actions. It also does not support stdin, PTY, or signal RPC. Capability adjustments are advisory and ignored.
 
-## Do I need to use a bare metal server or a VM to run Fireactions?
+## Can I connect to a guest with SSH or tmate?
 
-Fireactions can be run on any regular bare metal server or a VM that supports nested virtualization. Do note that running Fireactions on a VM might have performance implications, especially if you are running multiple concurrent jobs.
+No. Fireactions does not provide guest SSH login, a default password, or tmate access. Use the workflow output and `fireactions logs VM_ID` to inspect guest agent logs.
 
-## Is there GPU support in Fireactions?
+## Does Fireactions reuse virtual machines?
 
-Currently, Fireactions **does not support GPU workloads**. Fireactions uses [Firecracker](https://firecracker-microvm.github.io/) under the hood and it does not have GPU support, but it is in the [roadmap](https://github.com/firecracker-microvm/firecracker/discussions/4845). We are actively tracking this feature and will add support for GPU workloads as soon as it is available.
+No. A VM that belongs to a job is disposable and never returns to the idle pool. Fireactions does not resume a job after a restart. The independent reaper cleans expired or abandoned resources.
+
+## Does Fireactions add Firecracker jailer isolation?
+
+No. Fireactions does not add jailer isolation. Run the host service with the required KVM, containerd, CNI, network, and root-mount privileges. Treat the guest image and workflow code as untrusted input, and protect the host and its credentials.
+
+## Can I run Fireactions inside a virtual machine?
+
+The host must provide usable KVM access and the required containerd, devmapper, CNI, kernel, and resolver resources. A nested virtual machine can have performance limits. Run `fireactions validate --host CONFIG` to check the configured host prerequisites.
+
+## Does Fireactions support GPU workloads?
+
+No. The current Firecracker VM setup does not provide GPU support.

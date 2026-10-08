@@ -1,5 +1,72 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+* Add an importable NixOS flake with Linux x86_64/ARM64 packages and containerd/devmapper and CNI host setup. Include an independent reaper, runtime guest archive import, and an optional Forgejo Runner using systemd credentials. Require an existing thin pool without automatic storage provisioning.
+* Add a NixOS host flake example and first-install instructions that preserve machine configuration and keep Runner credentials outside the Nix store.
+
+### Fixed
+
+* Allow graceful Runner shutdown before systemd's stop limit so maintenance can finish active jobs instead of canceling them immediately.
+* Use the local containerd importer to unpack guest archives with devmapper instead of the transfer service.
+* Preserve caller deadlines through acquisition and guest operations, and classify private transport errors without exposing their messages.
+* Reject canceled guest commands before launch, return failed process-scope termination, and cancel log streams after output failures.
+* Give concurrent image pulls independent cancellation and keep replica fields consistent during scaling.
+* Reject replaceable state ancestors, filesystem-root state paths, trailing YAML documents, and FIFO kernel paths without blocking.
+* Honor cleanup-waiter cancellation and allow the daemon to run with `metrics: null`.
+* Check pinned host-download hashes before installation and refuse existing destinations before optional host or storage setup.
+* Order the host services after containerd, select the Go toolchain from `go.mod`, and correct release-tag version lookup.
+* Refresh the Nix vendor hash and document guest-agent rebuilds during host upgrades.
+* Validate archive symlink chains against the final transfer tree and remove temporary names after same-inode hardlink replacement.
+* Preserve process output during slow consumption and select PATH executables with the requested user's permissions.
+* Return guest upload rejection while Runner input is paused, close the upstream reader, and release the environment operation gate.
+* Keep replica targets during concurrent reconciliation and preserve active provisioning on repeated resume calls.
+* Preserve existing socket directory permissions and replacement sockets. Return listener failures without an extra shutdown timeout.
+* Use one journal metadata lock instead of retaining a lock file for every completed VM. Resolve Firecracker executables through PATH.
+* Restart Containerd after explicit storage initialization and use the registered Runner label name in the first-build workflow.
+* Give real-VM integration tests a dedicated socket directory that follows the server permission policy.
+* Reject untrusted Unix socket ancestors and give newly created directories access for the configured socket group.
+* Serialize resource reclamation across daemon and reaper processes without delaying VM isolation behind cleanup waits.
+* Restrict uploaded hard links to files from the same upload and preserve metadata on files outside the transfer destination.
+* Bound directory descriptors during deep archive exports and keep wide uploads within low descriptor limits.
+* Match the documented Docker guest image platform to the agent binary architecture.
+* Preserve external directory-deletion authority across interrupted cleanup and publish complete ownership markers atomically without replacing existing markers.
+* Validate state ancestors before owner-lock setup can change files or permissions.
+* Provision the configured installer socket group and make host-image socket group names and GIDs configurable.
+* Reject archive-entry limits outside the int32 wire range and non-regular kernel image paths.
+* Bind Unix sockets through trusted short aliases while retaining canonical ownership checks and cleanup.
+* Document explicit mirror-qualified image pulls/imports with `Never` and the guest kernel's `cgroup.kill` requirement.
+
+### Changed
+
+* Remove GitHub App/JIT registration, runner processes and MMDS bootstrap. Pools now select bootable OCI image profiles while retaining Firecracker, devmapper, CNI and rate limits.
+* Reject obsolete and unknown YAML settings; require unique safe profile names and positive VM resources.
+* Replace runner diagnostics with VM state and generic agent readiness/version. The guest agent starts directly with `--port` and `--log-level` flags.
+* Isolate disposable environment ownership from wire protocols, with opaque IDs, hard deadlines, per-environment serialization and cancellation-first removal.
+* Give writable snapshots, leases, CNI namespaces, VMM processes and control connections one retryable cleanup owner; verify process identity before force-stop.
+* Stream bounded tar transfers through the private guest channel, confining filesystem access to the rooted workspace and preserving safe links, ownership, executable modes and timestamps.
+* Execute direct guest argv with explicit identity/environment, bounded stdout/stderr streams and delegated cgroup-v2 process scopes. Require `cgroup.kill` readiness and clean descendants on cancellation or shutdown.
+* Add the Forgejo Runner v13.2 `plugin.v1alpha` backend with health checks, configured image profiles, and streamed file and process operations.
+* Replace the TCP listener with a permission-protected Unix socket and restrict guest control connections to the host CID.
+* Add the Ubuntu 24.04 guest image, Runner configuration, action fixtures, and real Firecracker integration coverage. Remove the root SSH login command.
+* Return permanent guest readiness errors immediately instead of waiting for the startup deadline.
+* Prepare Runner's declared `FORGEJO_WORKSPACE` through rooted guest setup. Other missing execution directories still produce launch failures.
+* Use same-revision remote JavaScript fixtures for pre/main/post hooks because Runner v13.2 skips pre hooks for local actions.
+* Accept Runner v13.2 active-stream keepalive pings so silent commands remain connected until their actual deadline or cancellation.
+* Count replicas as clean idle VMs. Claim each VM once and replenish idle capacity without scaling down active environments.
+* Allow paused pools to supply existing idle VMs but reject new provisioning. Destroy cancelled claims instead of returning them to idle.
+* Replace runner metrics with profile-specific VM lifecycle and operation metrics. Reject invalid replica counts and return nonzero CLI failure status.
+* Persist version-1 VM ownership before allocation and publication. Replay saved network configuration and verify process identities and resource labels during cleanup.
+* Add independent `reap --config`, startup reconciliation, and systemd reaper units. Destroy abandoned VMs without resuming jobs or deleting unrelated resources.
+* Stop VMs at their hard deadline without adding cleanup grace to execution. Bound cleanup attempts and retain unfinished ownership for retry.
+* Install the supplied fork binary on an existing host after nonmutating KVM, containerd/devmapper, CNI, resolver, VMM and kernel checks. Keep host preparation and destructive storage setup behind explicit options and approval.
+* Package the canonical Unix-socket host service and independent 10-second reaper timer. Preserve existing containerd, LVM and CNI in the default installer.
+* Remove forced container privilege dropping and the obsolete TCP port. Document the host privileges, shared namespaces and mounts required for container execution.
+* Complete Forgejo registration, guest build/import, clean idle profiles and lifecycle documentation. Replace the obsolete GitHub runner architecture diagram.
+* Move the Go namespace, release ownership, and active documentation links to `ALameLlama/fireactions`. Keep the upstream `tc-redirect-tap` dependency, legal attribution, and historical changelog links.
+
 ## [2.0.8](https://github.com/hostinger/fireactions/compare/v2.0.7...v2.0.8) (2026-09-15)
 
 
