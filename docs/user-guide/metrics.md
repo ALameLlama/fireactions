@@ -1,25 +1,36 @@
 # Metrics
 
-Fireactions provides Prometheus metrics for monitoring.
+Fireactions exposes Prometheus metrics for its disposable VM lifecycle. A profile is a configured bootable guest image and its VM settings. A clean idle VM is ready and has never belonged to a job. A claimed VM belongs to one environment and never returns to the idle pool.
 
-The metrics can be enabled by setting the `metrics.enabled` configuration option to `true`. The metrics are exposed on the `/metrics` endpoint on the address and port specified in the `metrics.address` and `metrics.port` configuration options.
+Enable the listener in the host configuration:
 
-## Metrics
+```yaml
+metrics:
+  enabled: true
+  address: 127.0.0.1:8081
+```
 
-The following metrics are available, excluding the default Prometheus metrics:
+The listener serves `/metrics` on a loopback address. Collect metrics with a local Prometheus server or a protected proxy. Do not expose this endpoint directly to an untrusted network.
 
-| Metric Name                                  | Type      | Description                                               | Labels                                           |
-|----------------------------------------------|-----------|-----------------------------------------------------------|--------------------------------------------------|
-| `fireactions_server_up`                      | Gauge     | Whether the server is up (1) or down (0)                  | None                                             |
-| `fireactions_pools_total`                    | Gauge     | Total number of pools                                     | None                                             |
-| `fireactions_pool_runners_current`           | Gauge     | Current number of running runners in a pool               | `pool`, `organization`                           |
-| `fireactions_pool_runners_desired`           | Gauge     | Desired number of runners in a pool (replicas)            | `pool`, `organization`                           |
-| `fireactions_pool_status`                    | Gauge     | Status of a pool (0 = paused, 1 = active)                 | `pool`                                           |
-| `fireactions_pool_scale_requests_total`      | Counter   | Number of scale API requests for a pool                   | `pool`                                           |
-| `fireactions_scale_operations_total`         | Counter   | Total number of individual scale operations               | `pool`, `organization`, `direction`, `status`    |
-| `fireactions_scale_duration_seconds`         | Histogram | Time taken to complete a scale operation                  | `pool`, `organization`, `direction`              |
+## Lifecycle metrics
 
+| Metric | Type | Meaning | Labels |
+| --- | --- | --- | --- |
+| `fireactions_clean_idle_vms` | Gauge | Ready VMs that no environment has claimed | `profile` |
+| `fireactions_claimed_vms` | Gauge | Published VMs claimed by environments | `profile` |
+| `fireactions_active_environments` | Gauge | Environment entries retained until cleanup succeeds | `profile` |
+| `fireactions_vm_acquisition_seconds` | Histogram | Time to claim an idle VM or provision a dedicated VM | `profile` |
+| `fireactions_vm_boot_seconds` | Histogram | Time spent starting Firecracker | `profile` |
+| `fireactions_guest_readiness_seconds` | Histogram | Time spent waiting for the guest agent | `profile` |
+| `fireactions_operations_total` | Counter | Environment operations by result | `profile`, `operation`, `outcome` |
+| `fireactions_cleanup_failures_total` | Counter | Environment cleanup attempts that failed | `profile` |
+| `fireactions_vm_ttl_expirations_total` | Counter | Owned VMs revoked after hard lifetime expiry | `profile` |
+| `fireactions_stale_vm_reconciliations_total` | Counter | Stale owned VMs moved into recovery cleanup | `profile` |
 
-Example Grafana dashboard for vizualisation of Fireactions metrics:
+Operation labels are `create`, `start`, `copy_in`, `exec`, `copy_out`, and `remove`. Outcome labels are `success`, `failure`, and `cancelled`. A nonzero command exit is a failure even when the Exec stream completes normally. Cancellation and deadline expiration use the `cancelled` outcome.
 
-![Grafana Dashboard](../img/grafana-dashboard.png)
+The clean idle gauge does not include VMs that are still provisioning. Provisioning contributes to pending idle capacity. When an active profile loses an idle VM to a claim, it starts replacement provisioning. A paused profile can supply an existing idle VM, but it does not create a replacement or a cold VM. Scaling down removes idle VMs and cancels excess idle provisioning.
+
+Lifetime expiration and stale-owner reconciliation counters count the first durable transition to cleanup, not each retry. The independent reaper writes service logs. The daemon observes removed records and clears its environment and VM gauges.
+
+Histograms and counters appear after their first event. Labels use configured profile names. They do not use environment IDs, job arguments, or secrets. A request without a resolved configured profile does not create an arbitrary profile label. Default Go and process metrics are also available.

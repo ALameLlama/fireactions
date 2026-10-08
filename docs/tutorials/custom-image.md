@@ -1,27 +1,26 @@
-# Creating custom image for Firecracker VMs
+# Create a custom guest image
 
-Fireactions allows you to use custom image for Firecracker virtual machines.
+Fireactions boots a Linux guest from a prepared root filesystem image. The guest image recipe is `images/ubuntu-24.04/Dockerfile`. It installs the guest services and copies in the Fireactions agent. Do not use the repository's top-level Dockerfile as a guest image recipe.
 
-Use cases:
+To add software, edit the guest image recipe. For example, add packages to its existing `apt-get install` list:
 
-- Pre-installing software that is often used in the organisation.
-- Using a custom OS
-- Pre-configuring the VM with a specific configuration
-
-Fireactions base images can be found in the [fireactions-images](https://github.com/hostinger/fireactions-images) GitHub repository. You can use them as a base for your custom image. Creating a custom image is as simple as creating a Dockerfile and building it:
-
-```Dockerfile
-# Use the base image
-FROM --platform=linux/amd64 ghcr.io/hostinger/fireactions-images/ubuntu22.04:v0.5.1
-
-# Install software, e.g. octopilot
-COPY --from=ghcr.io/dailymotion-oss/octopilot:v1.6.0 /usr/local/bin/octopilot /usr/local/bin/octopilot
+```dockerfile
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends systemd systemd-sysv bash coreutils git ca-certificates curl make \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 ```
 
-Build the image and push it to container registry:
+Build the guest image from the repository root. The recipe expects a Linux guest-agent binary named `fireactions` at the repository root. Build the agent for the guest architecture before you build the image.
 
-```bash
-docker build -t my-custom-image . && docker push my-custom-image
+```sh
+docker build --platform linux/amd64 \
+  --file images/ubuntu-24.04/Dockerfile \
+  --tag localhost/fireactions-guest:custom .
+docker save localhost/fireactions-guest:custom -o fireactions-guest.tar
+sudo ctr --namespace fireactions images import --local --snapshotter devmapper fireactions-guest.tar
 ```
 
-The last step is using the custom image in Fireactions by specifying it in the configuration file. The container registry must be accessible from the Fireactions server, so make sure to configure the credentials (optional).
+Import the archive into the namespace named by `containerd.namespace` in the host configuration. Set the profile's `image` to the imported image name and `image_pull_policy` to `Never` when the image is loaded locally. Keep the image name, namespace, architecture, guest kernel, and boot configuration aligned.
+
+The guest must include a compatible Linux system, an init system, a `ci` user (or the configured `default_user`), and the enabled Fireactions agent service. A profile selects a prepared image that Fireactions can boot. It does not enable arbitrary Docker images as workflow containers. The Forgejo runner plugin protocol is pinned to Runner 13.2 alpha and supports Linux guests only.

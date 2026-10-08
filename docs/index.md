@@ -1,39 +1,25 @@
 ![Banner](./img/banner_violet.png)
 
-Fireactions is an orchestrator for GitHub runners. BYOM (Bring Your Own Metal) and run self-hosted GitHub runners in ephemeral, fast and secure [Firecracker](https://firecracker-microvm.github.io/) based virtual machines.
+Fireactions runs Forgejo Actions jobs in disposable Firecracker virtual machines. It uses Linux KVM, a configured guest image and kernel, and a local Unix socket between the host service and Forgejo Runner.
 
-<!--
-https://excalidraw.com/#json=GrJMj6LLYt39mgC0me7Di,C65TV9FhicnxNKgPeRhi3A
-sequenceDiagram
-    autonumber
-    participant Fireactions
-    participant Configuration file (YAML)
-    participant Pool(s)
-    participant Firecracker VM with GitHub runner
-    participant GitHub
+```mermaid
+flowchart LR
+    Forgejo --> Runner["Forgejo Runner on the host"]
+    Runner -->|local Unix socket| Plugin["Fireactions host service"]
+    Plugin -->|maintains target| Idle["Clean, never-claimed idle VM"]
+    Idle -->|one-time claim| VM["Disposable Firecracker VM"]
+    VM --> Agent["Guest agent runs as root"]
+    Agent --> Job["Job processes run as ci"]
+    Job -->|lease ends, destroy VM| Cleanup["VM cleanup"]
+    Plugin --> Journal["Durable host state"]
+    Reaper["Independent systemd reaper"] --> Journal
+    Reaper --> Cleanup
+```
 
-    Fireactions->>Configuration file (YAML): Load pools
-    Fireactions->>Pool(s): Start pool(s)
-    loop Ensure min amount of GitHub runners every 1s
-        Pool(s)->>GitHub: Create JIT GitHub runner token
-        Pool(s)->>Firecracker VM with GitHub runner: Start Firecracker VM
-        Firecracker VM with GitHub runner->>GitHub: Run GitHub workflow job
-        Firecracker VM with GitHub runner->>Pool(s): Exit (on workflow job finish)
-    end
-    GitHub->>Fireactions: Scale pool on workflow_job event
--->
-![Architecture](./img/architecture.png)
+A pool profile defines a bootable guest image, kernel, CPU count, and memory size. A pool can keep clean idle VMs ready. Once Forgejo Runner claims a VM, Fireactions destroys it after the job lease. It does not reuse the VM or resume the job after a host service restart.
 
-Several key features:
+Fireactions supports Forgejo Runner protocol version 13.2 on Linux. The Runner and its registration credentials stay on the host. Fireactions does not provide SSH login, guest passwords, stdin or PTY access, signal forwarding, service containers, Docker-container actions, or Firecracker jailer isolation.
 
-- **Autoscaling**
+For host requirements and the safe default installer, start with the [installation guide](user-guide/installation.md). Then see [core concepts](user-guide/concepts.md), [images](user-guide/images.md), and the [configuration reference](reference/configuration.md).
 
-  Robust pool based scaling, cost-effective with fast GitHub runner startup time of 20s~.
-
-- **Ephemeral**
-
-  Each virtual machine is created from scratch and destroyed after the job is finished, no state is preserved between jobs, just like with GitHub hosted runners.
-
-- **Customizable**
-
-  Define job labels and customize virtual machine resources to fit Your needs. See [Configuration](./reference/configuration.md) for more information.
+GitHub hosts the Fireactions source repository, CI, and release files. The runner execution backend is Forgejo.

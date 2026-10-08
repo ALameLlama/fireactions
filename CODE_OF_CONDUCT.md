@@ -58,9 +58,9 @@ representative at an online or offline event.
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement at
-Hostinger.
+Report abusive, harassing, or otherwise unacceptable behavior to the maintainers
+of [ALameLlama/fireactions](https://github.com/ALameLlama/fireactions).
+Arrange private contact before sharing sensitive information.
 All complaints will be reviewed and investigated promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the
