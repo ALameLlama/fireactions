@@ -1,15 +1,15 @@
-module github.com/hostinger/fireactions
+module github.com/ALameLlama/fireactions
 
 go 1.26.0
 
 require (
 	github.com/containerd/errdefs v1.0.0
 	github.com/containerd/log v0.2.0
+	github.com/containernetworking/cni v1.3.0
 	github.com/distribution/reference v0.6.0
 	github.com/docker/go-units v0.5.0
 	github.com/fsnotify/fsnotify v1.10.1
-	github.com/google/go-github/v63 v63.0.0
-	github.com/hashicorp/go-retryablehttp v0.7.8
+	github.com/mdlayher/vsock v1.3.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/rs/zerolog v1.35.1
 	github.com/sirupsen/logrus v1.10.2
@@ -35,10 +35,8 @@ require (
 	github.com/containerd/platforms v1.0.0-rc.4 // indirect
 	github.com/containerd/ttrpc v1.2.8 // indirect
 	github.com/containerd/typeurl/v2 v2.3.0 // indirect
-	github.com/containernetworking/cni v1.3.0 // indirect
 	github.com/containernetworking/plugins v1.9.1 // indirect
 	github.com/cyphar/filepath-securejoin v0.6.1 // indirect
-	github.com/dgrijalva/jwt-go v3.2.0+incompatible // indirect
 	github.com/docker/cli v29.5.2+incompatible // indirect
 	github.com/docker/docker v28.5.2+incompatible // indirect
 	github.com/docker/docker-credential-helpers v0.9.7 // indirect
@@ -73,18 +71,15 @@ require (
 	github.com/goccy/go-json v0.10.6 // indirect
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
-	github.com/google/go-github/v29 v29.0.3 // indirect
-	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
-	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/klauspost/compress v1.19.1 // indirect
+	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.22 // indirect
 	github.com/mattn/go-runewidth v0.0.23 // indirect
 	github.com/mdlayher/socket v0.6.1 // indirect
-	github.com/mdlayher/vsock v1.3.0 // indirect
 	github.com/moby/locker v1.0.1 // indirect
 	github.com/moby/sys/mountinfo v0.7.2 // indirect
 	github.com/moby/sys/sequential v0.6.0 // indirect
@@ -119,7 +114,6 @@ require (
 )
 
 require (
-	github.com/bradleyfalzon/ghinstallation v1.1.1
 	github.com/containerd/containerd v1.7.35
 	github.com/containerd/nerdctl v1.7.7
 	github.com/firecracker-microvm/firecracker-go-sdk v1.0.0

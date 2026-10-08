@@ -1,8 +1,8 @@
 package main
 
 import (
-	"github.com/hostinger/fireactions"
-	serverv1 "github.com/hostinger/fireactions/proto/server/v1"
+	"github.com/ALameLlama/fireactions"
+	serverv1 "github.com/ALameLlama/fireactions/proto/server/v1"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -27,7 +27,7 @@ func newClient(endpoint string) (serverv1.ServerServiceClient, func(), error) {
 func NewRootCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:           "fireactions",
-		Short:         "BYOM (Bring Your Own Metal) and run self-hosted GitHub runners in ephemeral, fast and secure Firecracker based virtual machines.",
+		Short:         "Run disposable Firecracker execution environments for Forgejo.",
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		Version:       fireactions.Version,
@@ -36,13 +36,9 @@ func NewRootCommand() *cobra.Command {
 	cmd.SetVersionTemplate(fireactions.GetVersion())
 	cmd.PersistentFlags().SortFlags = false
 	cmd.Flags().SortFlags = false
-	cmd.SetFlagErrorFunc(func(cmd *cobra.Command, err error) error {
-		cmd.Println(err)
-		cmd.Println(cmd.UsageString())
-		return nil
-	})
 
 	cmd.AddGroup(&cobra.Group{ID: "main", Title: "Main application commands:"})
+	cmd.AddCommand(newReapCmd())
 	cmd.AddCommand(newServerCmd())
 	cmd.AddCommand(newAgentCmd())
 	cmd.AddCommand(newValidateCmd())
@@ -50,9 +46,8 @@ func NewRootCommand() *cobra.Command {
 	cmd.AddGroup(&cobra.Group{ID: "pool", Title: "Pool management commands:"})
 	cmd.AddCommand(newPoolsCmd())
 
-	cmd.AddGroup(&cobra.Group{ID: "machine", Title: "Machine management commands:"})
+	cmd.AddGroup(&cobra.Group{ID: "machine", Title: "VM diagnostics commands:"})
 	cmd.AddCommand(newPsCmd())
-	cmd.AddCommand(newLoginCmd())
 	cmd.AddCommand(newLogsCmd())
 
 	cmd.AddGroup(&cobra.Group{ID: "image", Title: "Image management commands:"})
