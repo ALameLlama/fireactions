@@ -1,31 +1,17 @@
-## Why Fireactions?
+## What Fireactions does
 
-Essentially, we needed a reliable and fast way to run self-hosted GitHub runners on our own infrastructure. We wanted to have the same level of control and security as with GitHub hosted runners, but without the limitations of the hosted runners (e.g. long startup times, limited resources, etc.).
+Fireactions runs Forgejo Actions jobs in disposable Firecracker virtual machines (VMs). A VM is a virtual computer. Firecracker uses Linux KVM to run the VM on a Linux host.
 
-Fireactions is designed to be a cost-effective, fast and secure solution for running self-hosted GitHub runners. It is built on top of [Firecracker](https://firecracker-microvm.github.io/) microVMs, which provide a lightweight and secure environment for running workloads.
+Fireactions provides a Forgejo-compatible plugin through a local Unix socket. Forgejo Runner connects to this socket from the host. Runner protocol support is pinned to version 13.2, and the supported guest operating system is Linux.
 
-## Why Firecracker?
+Each configured profile names a bootable guest image, a kernel, CPU count, and memory size. A pool can keep clean, never-claimed VMs ready. After a job claims a VM, Fireactions destroys it at the end of its hard lease. It never returns a used VM to the idle pool.
 
-Firecracker is a lightweight virtual machine monitor (VMM) that uses the Linux Kernel-based Virtual Machine (KVM) to create and manage microVMs. MicroVMs are lightweight, fast and secure virtual machines that are designed to run a single application or service.
+## Host requirements
 
-Compared to containers, microVMs provide a higher level of isolation and security, as each microVM runs in its own isolated environment. This makes them ideal for running untrusted workloads, such as CI/CD jobs.
+Use a Linux host with working KVM access, containerd with the devmapper snapshotter, the configured CNI network, Firecracker, and required CNI plugin executables. CNI provides network connectivity for guests. The host must have enough CPU, memory, and storage for the configured profiles.
 
-## Is it ready for production?
+The default install checks those existing resources. It does not overwrite containerd, LVM, or CNI configuration. The host service runs with privileges needed for KVM, containerd, CNI, networking, and guest root filesystems. This is a privileged host service, not a jailer-based isolation boundary.
 
-Fireactions is still in the early stages of development, we are waiting for feedback from the community to improve it further. However, we are already using it fully in production and it has been working well for us so far.
+The host resolver path must exist and contain usable nameservers. The guest networking setup must also reach the Forgejo server and any registries or services that jobs need. Host DNS settings alone do not prove that guests can reach those services.
 
-## Requirements
-
-There are a few requirements to run Fireactions:
-
-- Linux machine with KVM support. We recommend using a machine with at least 2 CPU cores and 4GB of RAM.
-- GitHub organisation account (currently only organisation accounts are supported)
-- GitHub App with permissions to manage self-hosted runners. See the [installation guide](installation.md) for setup details.
-- [Containerd v1.7.0 or newer](https://github.com/containerd/containerd)
-- [Firecracker v1.4.1 or newer](https://github.com/firecracker-microvm/firecracker)
-- [CNI Plugins v1.6.0 or newer](https://github.com/containernetworking/plugins) (with `firewall` and `bridge` plugins)
-- [tc-redirect-tap CNI plugin](https://github.com/awslabs/tc-redirect-tap)
-
-## Quickstart
-
-To install Fireactions, see the [installation guide](installation.md).
+See the [installation guide](installation.md) for setup, then read [core concepts](concepts.md) and [images](images.md).
