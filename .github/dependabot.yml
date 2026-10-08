@@ -7,8 +7,6 @@ updates:
   labels:
     - "dependencies"
     - "docker"
-  reviewers:
-    - "hostinger/cloudops-team"
   schedule:
     interval: "daily"
   commit-message:
