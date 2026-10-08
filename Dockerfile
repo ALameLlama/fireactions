@@ -1,9 +1,11 @@
 FROM --platform=$TARGETPLATFORM debian:stable-slim
 
+ARG TARGETPLATFORM
+
 ARG SOCKET_GROUP=fireactions
 ARG SOCKET_GID=1000
 
-COPY fireactions /usr/bin/fireactions
+COPY $TARGETPLATFORM/fireactions /usr/bin/fireactions
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates                                              \

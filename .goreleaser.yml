@@ -1,4 +1,5 @@
 ---
+version: 2
 project_name: fireactions
 
 builds:
@@ -13,50 +14,63 @@ builds:
   - amd64
   - arm64
   ldflags:
-  - -X github.com/hostinger/fireactions.Version={{ .Version }}
-  - -X github.com/hostinger/fireactions.Commit={{ .ShortCommit }}
-  - -X github.com/hostinger/fireactions.Date={{ .CommitDate }}
+  - -X github.com/ALameLlama/fireactions.Version={{ .Version }}
+  - -X github.com/ALameLlama/fireactions.Commit={{ .ShortCommit }}
+  - -X github.com/ALameLlama/fireactions.Date={{ .CommitDate }}
 
 archives:
 - id: fireactions
-  builds:
+  ids:
   - fireactions
   name_template: fireactions-v{{ .Version }}-{{ .Os }}-{{ .Arch }}
-  format: tar.gz
+  formats:
+  - tar.gz
 
-dockers:
+dockers_v2:
+- id: fireactions
+  ids:
+  - fireactions
+  dockerfile: Dockerfile
+  images:
+  - ghcr.io/alamellama/fireactions
+  tags:
+  - "{{ .Version }}"
+  - latest
+  platforms:
+  - linux/amd64
+  - linux/arm64
+  extra_files:
+  - entrypoint.sh
+  flags:
+  - "--pull=true"
 - id: fireactions-amd64
-  use: buildx
+  ids:
+  - fireactions
   dockerfile: Dockerfile
-  image_templates:
-  - ghcr.io/hostinger/fireactions:{{ .Version }}-amd64
+  images:
+  - ghcr.io/alamellama/fireactions
+  tags:
+  - "{{ .Version }}-amd64"
+  platforms:
+  - linux/amd64
   extra_files:
-    - "./"
-  build_flag_templates:
-  - "--pull"
-  - "--platform=linux/amd64"
-  goarch: amd64
+  - entrypoint.sh
+  flags:
+  - "--pull=true"
 - id: fireactions-arm64
-  use: buildx
+  ids:
+  - fireactions
   dockerfile: Dockerfile
-  image_templates:
-  - ghcr.io/hostinger/fireactions:{{ .Version }}-arm64
+  images:
+  - ghcr.io/alamellama/fireactions
+  tags:
+  - "{{ .Version }}-arm64"
+  platforms:
+  - linux/arm64
   extra_files:
-    - "./"
-  build_flag_templates:
-  - "--pull"
-  - "--platform=linux/arm64"
-  goarch: arm64
-
-docker_manifests:
-- name_template: ghcr.io/hostinger/fireactions:{{ .Version }}
-  image_templates:
-  - ghcr.io/hostinger/fireactions:{{ .Version }}-amd64
-  - ghcr.io/hostinger/fireactions:{{ .Version }}-arm64
-- name_template: ghcr.io/hostinger/fireactions:latest
-  image_templates:
-  - ghcr.io/hostinger/fireactions:{{ .Version }}-amd64
-  - ghcr.io/hostinger/fireactions:{{ .Version }}-arm64
+  - entrypoint.sh
+  flags:
+  - "--pull=true"
 
 # Changelog is managed by release-please
 changelog:
