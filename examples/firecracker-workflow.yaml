@@ -1,0 +1,50 @@
+name: Firecracker guest proof
+on: [push]
+jobs:
+  guest:
+    runs-on: firecracker
+    # To test profile override, set container.image: ubuntu-24.04-large.
+    steps:
+      - name: Checkout
+        uses: https://data.forgejo.org/actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Guest identity and workspace
+        id: guest
+        run: |
+          uname -a
+          id
+          pwd
+          printf 'transfer-proof\n' > /tmp/fireactions-transfer
+          cp /tmp/fireactions-transfer ./fireactions-transfer
+          cat ./fireactions-transfer
+          printf 'stdout-proof\n'
+          printf 'stderr-proof\n' >&2
+      - name: Outputs and environment reach next step
+        id: outputs
+        run: |
+          echo 'proof=output-value' >> "$FORGEJO_OUTPUT"
+          echo 'FIREACTIONS_ENV=environment-value' >> "$FORGEJO_ENV"
+      - name: Verify output and environment
+        env:
+          EXPECTED: ${{ steps.outputs.outputs.proof }}
+        run: |
+          test "$FIREACTIONS_ENV" = environment-value
+          test "$EXPECTED" = output-value
+      # The isolated Forgejo harness copies examples/actions/{composite,javascript} into
+      # .forgejo/actions/{composite,javascript} in its test repository.
+      - name: Local composite action
+        uses: ./.forgejo/actions/composite
+      # Runner v13.2 skips pre hooks for local actions; use the same-revision remote fixture.
+      - name: Remote JavaScript lifecycle
+        uses: ${{ forgejo.server_url }}/${{ forgejo.repository }}/.forgejo/actions/javascript@${{ forgejo.sha }}
+        env:
+          STATEFILE: /tmp/fireactions-javascript-state
+      - name: Verify JavaScript environment
+        run: test "$FIREACTIONS_JS" = main-ok
+      - name: Report a real nonzero exit without failing the whole proof
+        id: nonzero
+        continue-on-error: true
+        run: exit 42
+      - name: Verify nonzero step outcome
+        env:
+          NONZERO_OUTCOME: ${{ steps.nonzero.outcome }}
+        run: test "$NONZERO_OUTCOME" = failure

@@ -1,0 +1,8 @@
+[Unit]
+Description=Reap expired or abandoned Fireactions environments
+After=containerd.service
+Requires=containerd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/fireactions reap --config /etc/fireactions/config.yaml

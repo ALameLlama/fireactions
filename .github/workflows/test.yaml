@@ -14,8 +14,9 @@ jobs:
     - name: Setup Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.25.6'
+        go-version-file: go.mod
 
     - name: Run tests
       run: |
         go test -v ./...
+        bash packaging/install_test.sh
