@@ -19,6 +19,7 @@
 * Replace `services.fireactions.prewarmCount` with `services.fireactions.pools."ubuntu-24.04".prewarmCount`. Per-pool overrides preserve other profiles. Explicit `settings.pools` still replaces the complete pool list.
 * Remove the NixOS pool regression test and its flake check.
 * Move the default guest filesystem setup into a separate shell script while preserving its agent, user, and security configuration.
+* Document non-destructive recovery when a guest image import reports a missing parent snapshot.
 
 ### Fixed
 

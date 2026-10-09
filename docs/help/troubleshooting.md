@@ -33,6 +33,32 @@ The agent log is not an interactive session. Fireactions does not support guest 
 
 Check that the configured containerd daemon has the devmapper snapshotter loaded and that it can create snapshots. Use the configuration and maintenance procedure for the containerd installation on this host. Do not overwrite containerd configuration or stop its service as a generic repair. Do not remove namespaces, images, snapshots, or storage devices to clear an error. Those resources can belong to other workloads.
 
+### An image import reports a missing parent snapshot
+
+An error such as `parent snapshot ... does not exist: not found` means that containerd could not resolve a layer's parent during unpacking.
+It does not identify the cause or prove that the archive is invalid.
+The failed import can prevent both the backend and Runner from starting.
+
+Inspect the import and containerd journals before changing storage:
+
+```sh
+sudo journalctl -u fireactions-image-import.service -u containerd.service --since "10 minutes ago" --no-pager
+sudo systemctl status fireactions-image-import.service fireactions.service fireactions-runner.service --no-pager
+```
+
+If the import already succeeded and both services are active, do not restart them.
+If the import unit is still failed and containerd is healthy, retry the import once before starting the dependent services:
+
+```sh
+sudo systemctl start fireactions-image-import.service &&
+sudo systemctl start fireactions.service fireactions-runner.service
+```
+
+If the import fails again, stop and capture the full error, snapshotter state, and containerd logs.
+Do not delete the containerd namespace, snapshots, or thin-pool data as a generic repair.
+A later successful import does not establish why the original parent snapshot was missing.
+
+
 ## A VM remains after the service stops
 
 The independent `fireactions-reaper.timer` cleans expired VMs and VMs from a daemon that no longer owns them. Check the timer and service journal:
