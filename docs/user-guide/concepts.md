@@ -8,6 +8,58 @@ The Forgejo Runner label can be `firecracker:firecracker://ubuntu-24.04`. The ba
 
 The supplied configuration keeps one `ubuntu-24.04` VM idle and sets `ubuntu-24.04-large` to zero idle replicas. The first profile uses two virtual CPUs and 4 GiB of memory. The large profile uses four virtual CPUs and 8 GiB. Change replica counts to match host capacity.
 
+## Configure guest pools
+
+The backend uses the same YAML configuration on NixOS, Ubuntu, and other Linux hosts.
+Firecracker requires Linux with KVM.
+On Ubuntu and other non-NixOS hosts, edit `/etc/fireactions/config.yaml`.
+Start from the [complete YAML example](https://github.com/ALameLlama/fireactions/blob/main/examples/fireactions.yaml).
+Keep each profile's image, user, Firecracker executable, and kernel aligned with your host.
+
+| NixOS field under `services.fireactions.pools.<name>` | Backend YAML field in each `pools` entry |
+| --- | --- |
+| Attribute name | `name` |
+| `prewarmCount` | `replicas` |
+| `vcpuCount` | `firecracker.machine_config.vcpu_count` |
+| `memoryMiB` | `firecracker.machine_config.mem_size_mib` |
+| `image` | `image` |
+| `imagePullPolicy` | `image_pull_policy` |
+| `defaultUser` | `default_user` |
+| `firecrackerBinary` | `firecracker.binary_path` |
+| `kernelImage` | `firecracker.kernel_image_path` |
+| `kernelArgs` | `firecracker.kernel_args` |
+
+Set `replicas: 0` to keep a profile available without prewarming guests.
+Replica counts do not limit active jobs.
+CPU and memory values must be positive. Memory values use MiB.
+For eight standard idle guests and no large idle guests, set their `replicas` values to `8` and `0`.
+Keep the example's CPU and memory values if you want 2 CPUs/4096 MiB and 4 CPUs/8192 MiB.
+Budget memory for idle guests, active jobs, replacement guests, and the host.
+Guest RAM is allocated on demand, but real workloads can consume the full configured amount.
+
+Add a complete YAML profile to make another guest size available.
+Remove its entry to disable it, and remove any corresponding Runner label.
+On NixOS, add a named profile or set its `enable = false` instead.
+Use the [configuration reference](../reference/configuration.md#image-profiles) for additional fields such as rootfs and network rate limiters.
+On NixOS, set these fields under the profile's `settings`.
+These values override matching generated fields. Global `settings.pools` replaces the entire list.
+
+Before restarting the backend, stop Runner polling and let active jobs finish.
+A backend restart destroys all existing guests. Jobs cannot resume afterward.
+On a host installed with the shell installer, run:
+
+```bash
+sudo /usr/local/bin/fireactions validate /etc/fireactions/config.yaml
+sudo /usr/local/bin/fireactions validate --host /etc/fireactions/config.yaml
+sudo systemctl restart fireactions.service
+sudo /usr/local/bin/fireactions pools list
+```
+
+Restart Runner polling after the backend is ready.
+Keep `fireactions-reaper.timer` enabled.
+On NixOS, change the Nix options and run `sudo nixos-rebuild switch --flake .` from the host flake directory.
+Do not edit its generated `/etc/fireactions/config.yaml`.
+
 ## Disposable idle capacity
 
 An idle VM is clean and has never run a job. When a job claims it, Fireactions removes it from idle capacity and provisions a clean replacement to restore the configured idle target. A claimed VM is not reused, even if a job fails.

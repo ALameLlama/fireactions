@@ -63,7 +63,7 @@ A label selects a configured Fireactions profile. It does not select an arbitrar
 
 ## Install on NixOS
 
-Use the flake from `github:ALameLlama/fireactions` to import `nixosModules.default`, also exported as `nixosModules.fireactions`. This installs the fork-built daemon, guest kernel, Firecracker, containerd with devmapper, and CNI network plugins. CNI connects each guest to the host network.
+Use the flake from `github:ALameLlama/fireactions` to import `nixosModules.default`, also exported as `nixosModules.fireactions`. This installs the fork-built daemon, matching Ubuntu 24.04 guest archive, guest kernel, Firecracker, containerd with devmapper, and CNI network plugins. CNI connects each guest to the host network.
 
 The module manages the root daemon and an independent reaper timer that runs every 10 seconds. It generates `/etc/fireactions/config.yaml` and links the CNI executables under `/opt/cni/bin`. It also configures IP forwarding, firewall forwarding rules, and the host resolver through `systemd-resolved`. It does not enable Docker on the host.
 
@@ -72,8 +72,7 @@ Complete the first installation in this order:
 1. Keep the existing NixOS hardware and boot configuration.
 2. Prepare and activate the existing thin pool, or create one on a known empty spare device.
 3. Register Forgejo Runner separately and prepare its token file, if you enable the optional Runner.
-4. Build the guest image and place its archive on the host.
-5. Add the module configuration and run `nixos-rebuild switch`.
+4. Add the module configuration and run `nixos-rebuild switch`.
 
 ### Keep the machine configuration
 
@@ -101,7 +100,6 @@ Copy [`examples/nixos/flake.nix`](https://github.com/ALameLlama/fireactions/blob
           services.fireactions = {
             enable = true;
             devmapper.poolName = "containerd-thinpool";
-            imageArchive = "/var/lib/fireactions-images/ubuntu-24.04.tar";
             runner = {
               enable = true;
               url = "https://forgejo.example.org/";
@@ -189,57 +187,47 @@ The root systemd manager reads the file through `LoadCredential`. Runner reads `
 
 After replacing the source token, restart `fireactions-runner.service` to load the new credential. Do not put tokens in `services.fireactions.settings`, a guest image, or job environment variables.
 
-### Build and place the guest archive
+### Build the guest archive with Nix
 
-Build the image on a machine with Nix and Docker. Docker is required on that build machine only, not on the NixOS runtime host. Use the same architecture for the host, guest kernel, guest image, and static agent binary.
+The module builds its default Ubuntu 24.04 guest archive as part of the host configuration.
+The archive contains the exact `services.fireactions.package` binary that runs on the host.
+Nix fetches a pinned Ubuntu base image and adds the guest tools from the locked Nixpkgs input.
+The build does not require Docker, a separate image upload, or a maintenance script.
 
-From the Fireactions repository root on an x86_64 build machine, run:
+Add guest tools with `services.fireactions.guestImage.packages = [ pkgs.php ];`.
+Use `guestImage.extraCommands` and `guestImage.fakeRootCommands` to append image setup and ownership commands.
+The [guest image guide](images.md#extend-the-image-from-nixos) shows how to keep these commands in a separate shell file.
 
-```bash
-nix build path:/absolute/path/to/fireactions#fireactions --out-link result
-cp result/bin/fireactions ./fireactions
-docker build --platform linux/amd64 -f images/ubuntu-24.04/Dockerfile \
-  -t localhost/fireactions-guest:ubuntu-24.04 .
-docker save -o fireactions-guest.tar localhost/fireactions-guest:ubuntu-24.04
-```
-
-Replace `/absolute/path/to/fireactions` with this checkout's path. The package supplies the static binary that the Docker build copies into the guest. See [Images](images.md) for the guest contract. For a native ARM64 build machine, use Docker's `--platform linux/arm64` and an `aarch64-linux` host configuration.
-
-The flake exports Linux packages for `x86_64-linux` and `aarch64-linux`: `default`, `fireactions`, `tc-redirect-tap`, and `guest-kernel`. ARM64 host configurations were evaluated, but live ARM64 guest jobs were not tested. Privileged LVM activation and a live Forgejo job were not exercised by the package smoke checks.
-
-If you build elsewhere, upload the archive to the host over SSH:
+The flake also exports `guest-image` for native `x86_64-linux` and `aarch64-linux` builds:
 
 ```bash
-scp fireactions-guest.tar operator@nixos-host:fireactions-guest.tar
+nix build github:ALameLlama/fireactions#guest-image
 ```
 
-On the NixOS host, place the archive at the configured runtime path:
+The module imports the archive into the `fireactions` containerd namespace before the backend starts.
+Default profiles use `localhost/fireactions-guest:ubuntu-24.04` with `image_pull_policy: Never`.
+If you change the namespace or image reference, provide matching images there.
+See [Guest images](images.md) for custom images.
 
-```bash
-sudo install -d -o root -g root -m 0700 /var/lib/fireactions-images
-sudo install -o root -g root -m 0600 ./fireactions-guest.tar \
-  /var/lib/fireactions-images/ubuntu-24.04.tar
-```
+To use a custom Nix-built archive, set `imageArchive` to its derivation.
+To use an externally built archive, set it to an absolute runtime filename string.
+After replacing an external archive, restart `fireactions-image-import.service`.
+The module drains Runner, restarts the backend, and imports the archive before accepting new jobs.
+Runtime files have no automatic watcher.
+For additional images, set `pools.<name>.imageArchive` to a matching archive and set that pool's `image` reference.
+If `imageArchive = null`, the module manages only archives from enabled pools.
+Import any other configured images separately before starting the backend.
+The [external recipe example](images.md#keep-image-recipes-in-your-host-configuration) shows how to manage custom bases and packages in your own repository.
 
-Use an absolute quoted string for `imageArchive`, not a Nix path. The module imports that archive with devmapper before daemon startup and after containerd restarts. Replacing the archive triggers another import. The archive stays outside the Nix store.
-
-Default profiles reference `localhost/fireactions-guest:ubuntu-24.04` with `image_pull_policy: Never`, in the `fireactions` containerd namespace. `Never` requires a local image. If you change the namespace or image reference, import matching images there.
-
-If you set `imageArchive = null`, import images manually after containerd starts:
-
-```bash
-sudo ctr --namespace fireactions images import --local --snapshotter devmapper \
-  /var/lib/fireactions-images/ubuntu-24.04.tar
-sudo systemctl restart fireactions.service
-```
 
 ### Switch and inspect the services
 
-Before the first switch, make sure that the pool is active, the guest archive exists, and the optional Runner token is installed. Replace the registration placeholders in your host flake. Then apply it:
+Before the first switch, make sure that the thin pool is active and the optional Runner token is installed.
+Replace the registration placeholders in your host flake.
+From the directory that contains your host flake, apply configuration changes with:
 
 ```bash
-sudo nixos-rebuild switch --flake path:/etc/nixos#fireactions-host \
-  --option experimental-features 'nix-command flakes'
+sudo nixos-rebuild switch --flake .#fireactions-host
 sudo fireactions validate --host /etc/fireactions/config.yaml
 sudo systemctl status fireactions.service fireactions-reaper.timer
 sudo systemctl status fireactions-runner.service
@@ -247,9 +235,54 @@ sudo systemctl status fireactions-runner.service
 
 Omit the last command if Runner is disabled. The generated `/etc/fireactions/config.yaml` is a symlink to a file in the Nix store. Change `services.fireactions.settings` and rebuild instead of editing that file. After fixing a missing pool or image that prevented startup, run `sudo systemctl restart fireactions.service` to retry.
 
+To update the locked dependencies and rebuild the matching host and guest, run:
+
+```bash
+nix flake update
+sudo nixos-rebuild switch --flake .#fireactions-host
+```
+
+If the flake configuration name matches the host name, omit `#fireactions-host`.
+Keep `flake.lock` with the host configuration.
+NixOS rollback selects the previous system and its matching guest archive.
+
 The default `ubuntu-24.04` pool keeps one clean idle VM with 2 CPUs and 4 GiB of memory. The large profile uses 4 CPUs and 8 GiB, with zero idle replicas. Budget memory for the idle VM, active jobs, replacement idle capacity, and the host. Runner capacity defaults to one concurrent job.
 
-The module gives jobs a 30-minute timeout and allows 35 minutes for graceful Runner shutdown. The systemd stop limit is 36 minutes. Stopping Runner stops new polling and lets active jobs finish before the shutdown limit. For maintenance, wait for no claimed guests, stop Runner, and check again before stopping Fireactions.
+Configure each profile under `services.fireactions.pools`:
+
+```nix
+services.fireactions.pools = {
+  "ubuntu-24.04" = {
+    prewarmCount = 8;
+    vcpuCount = 2;
+    memoryMiB = 4096;
+  };
+  "ubuntu-24.04-large" = {
+    prewarmCount = 0;
+    vcpuCount = 4;
+    memoryMiB = 8192;
+  };
+};
+```
+
+Each pool also accepts `enable`, `image`, `imagePullPolicy`, `defaultUser`, `firecrackerBinary`, `kernelImage`, and `kernelArgs`.
+Set `prewarmCount = 0` to disable prewarming while keeping the profile available for jobs.
+Set `enable = false` to remove the profile from the generated configuration.
+New profiles default to zero idle replicas, two CPUs, and 4096 MiB.
+Per-pool overrides preserve the other profiles and their defaults.
+Align `runner.labels` with the names of enabled profiles.
+
+Use each pool's `settings` for additional backend fields, including rootfs and network rate limiters.
+These fields merge recursively with the generated profile and override matching typed options.
+The global `services.fireactions.settings` remains available for backend configuration.
+An explicit `settings.pools` list replaces all generated profiles.
+Do not put tokens or other secrets in these values because the configuration enters the Nix store.
+
+The old `services.fireactions.prewarmCount` option is removed.
+Move its value to `services.fireactions.pools."ubuntu-24.04".prewarmCount`.
+The [portable pool configuration](concepts.md#configure-guest-pools) uses the same backend fields on Ubuntu and other Linux hosts.
+
+The module gives jobs a 30-minute timeout and allows 35 minutes for graceful Runner shutdown. The systemd stop limit is 36 minutes. During a rebuild, systemd stops Runner before the backend. Runner stops polling and lets active jobs finish before the shutdown limit. Systemd imports the new archive before it starts the backend and Runner. A rebuild with no relevant changes does not restart them.
 
 Attribute overrides in `services.fireactions.settings` merge with the generated defaults. Setting `settings.pools` replaces the entire default pool list. Include each complete profile you need, with its image, pull policy, user, Firecracker path, kernel, and machine size. Keep `runner.labels` aligned with the profile names. `guestKernel` accepts a kernel-file derivation override, and `tcRedirectTapPackage` accepts a plugin package override.
 

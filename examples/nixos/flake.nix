@@ -22,10 +22,12 @@
         {
           services.fireactions = {
             enable = true;
+            pools = {
+              "ubuntu-24.04" = { prewarmCount = 1; vcpuCount = 2; memoryMiB = 4096; };
+              "ubuntu-24.04-large" = { prewarmCount = 0; vcpuCount = 4; memoryMiB = 8192; };
+            };
             # Existing, activated pool. This module does not create storage.
             devmapper.poolName = "containerd-thinpool";
-            # Runtime string, not a Nix path or a file in the Nix store.
-            imageArchive = "/var/lib/fireactions-images/ubuntu-24.04.tar";
             runner = {
               # Set false to manage Forgejo Runner separately.
               enable = true;

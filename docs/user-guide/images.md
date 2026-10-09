@@ -17,7 +17,10 @@ Fireactions does not support SSH login or a default guest password. Do not add e
 
 ## Nix-built guest image
 
-The Nix package builds the guest with the same Fireactions binary as the host package.
+On NixOS, the module builds and imports a matching Ubuntu 24.04 archive by default.
+Run `nixos-rebuild switch` to apply configuration changes.
+Run `nix flake update` before the rebuild to update the locked packages.
+Nix builds the host and guest from the same Fireactions package.
 The image uses a pinned Ubuntu base and Nixpkgs tools, including systemd, Bash, Git, Node.js, sudo, and CA certificates.
 Docker is not required.
 
@@ -29,6 +32,47 @@ nix build .#guest-image
 
 The archive is `result`. It uses the existing `localhost/fireactions-guest:ubuntu-24.04` image reference.
 Use the Docker procedure below for non-Nix hosts or custom Dockerfile images.
+
+### Extend the image from NixOS
+
+Configure the default guest image under `services.fireactions.guestImage`.
+The module keeps the standard tools, user, and matching agent.
+For example, add PHP and a file created by your own build script:
+
+```nix
+services.fireactions.guestImage = {
+  packages = [ pkgs.php ];
+  extraCommands = builtins.readFile ./guest-extra.sh;
+  fakeRootCommands = ''
+    chown -R 1000:1000 opt/ci
+  '';
+};
+```
+
+Use the `pkgs` argument in your host configuration module.
+Create `guest-extra.sh` beside that configuration file:
+
+```bash
+mkdir -p opt/ci
+printf '%s\n' 'configured-by-host' > opt/ci/image-label
+```
+
+`packages` adds executable tools to `/usr/bin` and includes their Nix store dependencies.
+`extraCommands` runs after the default root filesystem setup.
+`fakeRootCommands` runs after the default ownership and permissions are set.
+Use the latter hook to set image ownership without root access on the build host.
+
+Both hooks run in the build sandbox with the image root as their working directory.
+Use relative image paths such as `etc/ci` or `opt/ci`.
+These commands do not run inside a booted guest or a Docker container.
+Do not use `apt-get` here. Add Nix packages or use the Dockerfile procedure instead.
+Do not copy Runner credentials or other secrets into the image.
+
+NixOS merges package lists and command strings contributed by separate modules.
+Use `lib.mkBefore` or `lib.mkAfter` when one command depends on another module's command.
+Apply changes with `nixos-rebuild switch`.
+The existing lifecycle drains Runner, imports the archive, and starts fresh guests.
+These options affect the default archive only. An explicit `imageArchive` override takes precedence.
 
 ### Extend the image from a flake
 
@@ -44,24 +88,6 @@ fireactions.packages.${pkgs.stdenv.hostPlatform.system}.guest-image.override {
   '';
 }
 ```
-Create `guest-extra.sh` beside your flake file:
-
-```bash
-mkdir -p opt/ci
-printf '%s\n' 'configured-by-host' > opt/ci/image-label
-```
-
-`extraPackages` adds executable tools to `/usr/bin` and includes their Nix store dependencies.
-`extraCommands` runs after the default root filesystem setup.
-`fakeRootCommands` runs after the default ownership and permissions are set.
-Use the latter hook to set image ownership without root access on the build host.
-
-Both hooks run in the build sandbox with the image root as their working directory.
-Use relative image paths such as `etc/ci` or `opt/ci`.
-These commands do not run inside a booted guest or a Docker container.
-Do not use `apt-get` here. Add Nix packages or use the Dockerfile procedure instead.
-Do not copy Runner credentials or other secrets into the image.
-
 
 Use this expression for your flake's `packages.<system>.guest-image` output.
 Build that output with `nix build .#guest-image`.
@@ -107,6 +133,37 @@ guestImage.override {
 The existing `extraCommands` and `fakeRootCommands` hooks also work in this recipe.
 The shared builder still installs the agent, systemd, standard tools, the `ci` user, and passwordless sudo.
 
+Add this inline module to your host flake's `modules` list.
+The surrounding `outputs` function must include the Fireactions input as `fireactions`:
+
+```nix
+({ config, pkgs, ... }: {
+  services.fireactions.pools.project = {
+    image = "localhost/project-guest:ci";
+    imageArchive = import ./images/project-guest.nix {
+      inherit pkgs;
+      guestImage = fireactions.packages.${pkgs.stdenv.hostPlatform.system}.guest-image;
+      fireactions = config.services.fireactions.package;
+    };
+    prewarmCount = 0;
+  };
+
+  services.fireactions.runner.labels = [
+    "firecracker:firecracker://ubuntu-24.04"
+    "project:firecracker://project"
+  ];
+})
+```
+
+Keep any other labels from your existing configuration.
+Jobs with `runs-on: project` select this pool.
+The `fireactions` argument keeps its guest binary identical to the host package.
+Run `sudo nixos-rebuild switch` to build and import the archive through the existing graceful update lifecycle.
+Disabled pools do not add archives, and the importer imports each archive once.
+
+For an externally built archive, set the pool's `imageArchive` to an absolute filename instead.
+Rebuild that archive whenever the host binary changes.
+After replacing it, restart `fireactions-image-import.service` to drain Runner and import the new archive.
 
 ## Build and export the supplied image
 

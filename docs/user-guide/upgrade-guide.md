@@ -2,9 +2,36 @@
 
 Use a Fireactions binary built from the intended source revision. GitHub hosts the source repository and release files, but the host must run the fork-built Fireactions binary. Do not install an upstream runner product in its place.
 
-A host service restart destroys old claimed and idle VMs before Fireactions accepts jobs. Jobs do not resume after a restart. Schedule an upgrade when interrupting active jobs is acceptable.
+On NixOS, use the native commands below. On other Linux hosts, stop active workflows before restarting the backend. A backend restart destroys its guests, and jobs cannot resume afterward.
 
-Rebuild each guest image with the new binary from the same source revision. Replacing only the host binary leaves the old guest agent in each VM. See [Guest images](images.md) for the build and export commands.
+## Update on NixOS
+
+From the directory that contains the host flake, run:
+
+```bash
+nix flake update
+sudo nixos-rebuild switch --flake .
+```
+
+If the configuration name differs from the host name, append `#CONFIGURATION_NAME` to the flake argument.
+The default module builds the host binary and matching Ubuntu 24.04 guest archive together.
+Systemd drains Runner before stopping the backend and imports the new image before restarting them.
+No Docker build, archive upload, or separate maintenance script is required.
+To apply only configuration changes, omit `nix flake update`.
+NixOS rollback restores the previous system and its matching archive.
+
+The module cannot rebuild an external archive selected through a runtime filename.
+If you override `imageArchive` with that filename or `null`, keep its guest binary matched to the host yourself.
+The same rule applies to runtime filenames under `pools.<name>.imageArchive`.
+For additional derived archives, override their `fireactions` argument with `config.services.fireactions.package`.
+After replacing a runtime archive, restart `fireactions-image-import.service`.
+The module no longer watches external files for changes.
+
+## Update on other Linux hosts
+
+Rebuild each guest image with the new binary from the same source revision.
+Replacing only the host binary leaves the old guest agent in each VM.
+See [Guest images](images.md) for the build and export commands.
 
 ## Replace the binary
 
@@ -22,7 +49,7 @@ Import the rebuilt guest archive into the configured containerd namespace before
 sudo ctr --namespace fireactions images import --local --snapshotter devmapper fireactions-guest.tar
 ```
 
-Keep each profile's `image` reference aligned with the imported image. If you use the NixOS module, replace its `imageArchive` and package together, then rebuild the host configuration.
+Keep each profile's `image` reference aligned with the imported image.
 
 Install the new binary at the existing Fireactions binary path. The default installer uses `/usr/local/bin/fireactions`:
 

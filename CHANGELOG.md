@@ -6,13 +6,18 @@
 
 * Add an importable NixOS flake with Linux x86_64/ARM64 packages and containerd/devmapper and CNI host setup. Include an independent reaper, runtime guest archive import, and an optional Forgejo Runner using systemd credentials. Require an existing thin pool without automatic storage provisioning.
 * Add a NixOS host flake example and first-install instructions that preserve machine configuration and keep Runner credentials outside the Nix store.
-* Build the matching Ubuntu 24.04 guest archive with Nix.
-* Add guest image package and build hook overrides.
+* Build the matching Ubuntu 24.04 guest archive with Nix and drain Runner through native systemd dependencies during rebuilds.
+* Add per-profile NixOS options for idle replicas, CPUs, memory, images, users, and Firecracker configuration. Use the same backend YAML fields on Ubuntu and other Linux hosts.
+* Add guest image package and build hook options through NixOS and flake package overrides.
 * Add passwordless sudo for the `ci` user in both supplied Ubuntu guest images. Configure setuid binaries, PAM, and boot-time helpers in the Nix image.
 * Let callers supply their own base image, output name, and tag in external guest image recipes.
+* Import additional guest archives configured on enabled NixOS pools through the existing graceful update lifecycle.
 
 ### Changed
 
+* Replace automatic runtime archive watching with an explicit restart of `fireactions-image-import.service` after replacing an external archive.
+* Replace `services.fireactions.prewarmCount` with `services.fireactions.pools."ubuntu-24.04".prewarmCount`. Per-pool overrides preserve other profiles. Explicit `settings.pools` still replaces the complete pool list.
+* Remove the NixOS pool regression test and its flake check.
 * Move the default guest filesystem setup into a separate shell script while preserving its agent, user, and security configuration.
 
 ### Fixed

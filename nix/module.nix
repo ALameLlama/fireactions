@@ -1,36 +1,97 @@
-{ config, lib, pkgs, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 let
   cfg = config.services.fireactions;
-  inherit (lib) mkDefault mkEnableOption mkIf mkMerge mkOption types;
+  inherit (lib)
+    mkDefault
+    mkEnableOption
+    mkIf
+    mkMerge
+    mkOption
+    types
+    ;
   yaml = pkgs.formats.yaml { };
   configFile = yaml.generate "fireactions.yaml" cfg.settings;
   socketDirectory = builtins.dirOf cfg.settings.socket_path;
   runtimePath = types.strMatching "/.*";
-  hostPath = [ pkgs.containerd pkgs.lvm2 pkgs.iptables pkgs.iproute2 pkgs.util-linux ];
+  hostPath = [
+    pkgs.containerd
+    pkgs.lvm2
+    pkgs.iptables
+    pkgs.iproute2
+    pkgs.util-linux
+  ];
   binary = lib.getExe cfg.package;
-  hasArchive = cfg.imageArchive != null;
-  pool = name: replicas: vcpus: memory: {
-    inherit name replicas;
-    image = "localhost/fireactions-guest:ubuntu-24.04";
-    image_pull_policy = "Never";
-    default_user = "ci";
-    firecracker = {
-      binary_path = lib.getExe pkgs.firecracker;
-      kernel_image_path = toString cfg.guestKernel;
-      kernel_args = "console=ttyS0 reboot=k panic=1 pci=off nomodules rw init=/sbin/init systemd.unified_cgroup_hierarchy=1";
-      machine_config = { vcpu_count = vcpus; mem_size_mib = memory; };
+  imageArchives = lib.unique (
+    lib.filter (archive: archive != null) (
+      [ cfg.imageArchive ]
+      ++ lib.mapAttrsToList (_: profile: profile.imageArchive) (
+        lib.filterAttrs (_: profile: profile.enable) cfg.pools
+      )
+    )
+  );
+  hasArchive = imageArchives != [ ];
+  serviceRestartTriggers = [
+    configFile
+    cfg.package
+    cfg.guestKernel
+  ]
+  ++ imageArchives;
+  pool =
+    name: profile:
+    lib.recursiveUpdate {
+      inherit name;
+      replicas = profile.prewarmCount;
+      image = profile.image;
+      image_pull_policy = profile.imagePullPolicy;
+      default_user = profile.defaultUser;
+      firecracker = {
+        binary_path = profile.firecrackerBinary;
+        kernel_image_path = toString profile.kernelImage;
+        kernel_args = profile.kernelArgs;
+        machine_config = {
+          vcpu_count = profile.vcpuCount;
+          mem_size_mib = profile.memoryMiB;
+        };
+      };
+    } profile.settings;
+  defaultPools = {
+    "ubuntu-24.04" = {
+      prewarmCount = 1;
+      vcpuCount = 2;
+      memoryMiB = 4096;
+    };
+    "ubuntu-24.04-large" = {
+      prewarmCount = 0;
+      vcpuCount = 4;
+      memoryMiB = 8192;
     };
   };
   defaultSettings = {
-    containerd = { address = "/run/containerd/containerd.sock"; namespace = "fireactions"; };
+    containerd = {
+      address = "/run/containerd/containerd.sock";
+      namespace = "fireactions";
+    };
     log_level = "info";
     socket_path = "/run/fireactions/plugin.sock";
     socket_group = "fireactions";
     state_dir = "/var/lib/fireactions";
     network.resolver_path = "/run/systemd/resolve/resolv.conf";
-    guest = { startup_timeout = "2m"; max_transfer_bytes = 10737418240; max_archive_entries = 100000; };
-    leases = { max_lifetime = "3h2m"; cleanup_grace = "2m"; reap_interval = "10s"; };
-    pools = [ (pool "ubuntu-24.04" 1 2 4096) (pool "ubuntu-24.04-large" 0 4 8192) ];
+    guest = {
+      startup_timeout = "2m";
+      max_transfer_bytes = 10737418240;
+      max_archive_entries = 100000;
+    };
+    leases = {
+      max_lifetime = "3h2m";
+      cleanup_grace = "2m";
+      reap_interval = "10s";
+    };
+    pools = lib.mapAttrsToList pool (lib.filterAttrs (_: profile: profile.enable) cfg.pools);
   };
   runnerConfig = yaml.generate "fireactions-runner.yaml" {
     runner = {
@@ -89,6 +150,87 @@ in
       defaultText = lib.literalExpression "pkgs.callPackage ./tc-redirect-tap.nix { }";
       description = "tc-redirect-tap CNI plugin package.";
     };
+    pools = mkOption {
+      type = types.attrsOf (
+        types.submodule {
+          options = {
+            enable = mkOption {
+              type = types.bool;
+              default = true;
+              description = "Whether to make this guest profile available.";
+            };
+            prewarmCount = mkOption {
+              type = types.ints.between 0 2147483647;
+              default = 0;
+              description = "Number of clean idle VMs to keep ready for this profile.";
+            };
+            vcpuCount = mkOption {
+              type = types.ints.positive;
+              default = 2;
+              description = "Number of virtual CPUs in each guest.";
+            };
+            memoryMiB = mkOption {
+              type = types.ints.positive;
+              default = 4096;
+              description = "Addressable guest RAM in MiB. The host allocates memory on demand.";
+            };
+            image = mkOption {
+              type = types.nonEmptyStr;
+              default = "localhost/fireactions-guest:ubuntu-24.04";
+              description = "Bootable guest image reference in containerd.";
+            };
+            imageArchive = mkOption {
+              type = types.nullOr (types.either types.package runtimePath);
+              default = null;
+              description = ''
+                Additional guest archive to import for this enabled pool.
+                Use a derivation built with the host package or an absolute runtime filename.
+                Archive changes use the same graceful import lifecycle as the default image.
+                Null does not add an archive; the pool image must already be imported.
+              '';
+            };
+            imagePullPolicy = mkOption {
+              type = types.enum [
+                "Always"
+                "Never"
+                "IfNotPresent"
+              ];
+              default = "Never";
+              description = "When to pull the guest image.";
+            };
+            defaultUser = mkOption {
+              type = types.strMatching "[a-z_][a-z0-9_-]{0,31}";
+              default = "ci";
+              description = "Guest user that runs workflow commands.";
+            };
+            firecrackerBinary = mkOption {
+              type = runtimePath;
+              default = lib.getExe pkgs.firecracker;
+              defaultText = lib.literalExpression "lib.getExe pkgs.firecracker";
+              description = "Absolute filename of the Firecracker executable.";
+            };
+            kernelImage = mkOption {
+              type = types.either types.package runtimePath;
+              default = cfg.guestKernel;
+              defaultText = lib.literalExpression "config.services.fireactions.guestKernel";
+              description = "Guest kernel file derivation or absolute runtime filename.";
+            };
+            kernelArgs = mkOption {
+              type = types.str;
+              default = "console=ttyS0 reboot=k panic=1 pci=off nomodules rw init=/sbin/init systemd.unified_cgroup_hierarchy=1";
+              description = "Guest kernel command line.";
+            };
+            settings = mkOption {
+              type = types.attrsOf yaml.type;
+              default = { };
+              description = "Additional backend YAML fields for this pool. These values override generated fields and enter the Nix store.";
+            };
+          };
+        }
+      );
+      default = { };
+      description = "Named guest profiles. Standard and large Ubuntu defaults merge with per-pool overrides. Explicit settings.pools replaces the generated pool list.";
+    };
     settings = mkOption {
       type = yaml.type;
       default = { };
@@ -126,16 +268,43 @@ in
         description = "Dedicated CNI bridge interface name.";
       };
     };
+    guestImage = {
+      packages = mkOption {
+        type = types.listOf types.package;
+        default = [ ];
+        example = lib.literalExpression "[ pkgs.php ]";
+        description = "Additional packages in the default guest image. Their binaries are available in /usr/bin.";
+      };
+      extraCommands = mkOption {
+        type = types.lines;
+        default = "";
+        description = "Shell commands appended after the default guest setup. The working directory is the image root, not a running guest.";
+      };
+      fakeRootCommands = mkOption {
+        type = types.lines;
+        default = "";
+        description = "Shell commands appended after default guest ownership and permissions are set under fakeroot.";
+      };
+    };
     imageArchive = mkOption {
-      type = types.nullOr runtimePath;
-      default = null;
+      type = types.nullOr (types.either types.package runtimePath);
+      default = pkgs.callPackage ./guest-image.nix {
+        fireactions = cfg.package;
+        extraPackages = cfg.guestImage.packages;
+        extraCommands = cfg.guestImage.extraCommands;
+        fakeRootCommands = cfg.guestImage.fakeRootCommands;
+      };
+      defaultText = lib.literalMD "The matching Ubuntu 24.04 archive configured by `services.fireactions.guestImage`.";
       example = "/var/lib/fireactions-images/ubuntu-24.04.tar";
       description = ''
-        Absolute runtime filename of a native-architecture OCI/Docker image archive.
-        When set, import it into the configured namespace with devmapper before
-        each daemon start and after containerd restarts. Replacing the archive
-        also triggers an import. The archive is not copied into the Nix store.
-        When null, the operator must import the configured images separately.
+        A native-architecture OCI/Docker image archive derivation or an absolute runtime filename.
+        The default Ubuntu 24.04 archive contains the same Fireactions package as the host.
+        Import the archive with devmapper before the backend starts and after containerd restarts.
+        Changes to the archive derivation drain the runner and restart the import and backend.
+        Runtime strings remain outside the Nix store and have no file watcher.
+        After replacing a runtime archive, restart fireactions-image-import.service to drain the runner and import it.
+        When null, only archives from enabled pools are managed.
+        Import any other configured images separately.
       '';
     };
     runner = {
@@ -193,15 +362,24 @@ in
         }
       ];
       services.fireactions.settings = lib.mapAttrsRecursive (_: value: mkDefault value) defaultSettings;
+      services.fireactions.pools = lib.mapAttrsRecursive (_: value: mkDefault value) defaultPools;
       services.resolved.enable = mkDefault true;
       services.lvm.enable = true;
       services.lvm.boot.thin.enable = true;
-      environment.systemPackages = [ cfg.package pkgs.firecracker pkgs.containerd pkgs.lvm2 ];
+      environment.systemPackages = [
+        cfg.package
+        pkgs.firecracker
+        pkgs.containerd
+        pkgs.lvm2
+      ];
       users.groups.${cfg.settings.socket_group} = { };
       # ARM64 KVM is built into the NixOS kernel; x86 loads the common module
       # here and the CPU-specific kvm_intel/kvm_amd driver through modaliases.
-      boot.kernelModules = [ "dm_thin_pool" "tun" ]
-        ++ lib.optional pkgs.stdenv.hostPlatform.isx86_64 "kvm";
+      boot.kernelModules = [
+        "dm_thin_pool"
+        "tun"
+      ]
+      ++ lib.optional pkgs.stdenv.hostPlatform.isx86_64 "kvm";
       boot.kernel.sysctl = {
         "net.ipv4.ip_forward" = 1;
         "net.ipv4.conf.all.forwarding" = 1;
@@ -216,7 +394,13 @@ in
       systemd.tmpfiles.rules = [
         "d /opt/cni/bin 0755 root root - -"
         "L+ /opt/cni/bin/tc-redirect-tap - - - - ${cfg.tcRedirectTapPackage}/bin/tc-redirect-tap"
-      ] ++ map (plugin: "L+ /opt/cni/bin/${plugin} - - - - ${pkgs.cni-plugins}/bin/${plugin}") [ "bridge" "firewall" "host-local" "loopback" ];
+      ]
+      ++ map (plugin: "L+ /opt/cni/bin/${plugin} - - - - ${pkgs.cni-plugins}/bin/${plugin}") [
+        "bridge"
+        "firewall"
+        "host-local"
+        "loopback"
+      ];
 
       # The pinned containerd includes devmapper by default: its Linux builtin
       # is guarded by !no_devmapper, and nixpkgs does not set that build tag.
@@ -230,20 +414,32 @@ in
         };
       };
       systemd.services.containerd = {
-        path = [ pkgs.lvm2 pkgs.util-linux pkgs.e2fsprogs ];
+        path = [
+          pkgs.lvm2
+          pkgs.util-linux
+          pkgs.e2fsprogs
+        ];
         wants = lib.optional hasArchive "fireactions-image-import.service";
       };
       systemd.services.fireactions = {
         description = "Fireactions Firecracker execution backend";
         wantedBy = [ "multi-user.target" ];
         wants = [ "network-online.target" ];
-        requires = [ "containerd.service" "network-online.target" ] ++ lib.optional hasArchive "fireactions-image-import.service";
-        after = [ "containerd.service" "network-online.target" "systemd-tmpfiles-setup.service" ]
-          ++ lib.optional config.services.resolved.enable "systemd-resolved.service"
-          ++ lib.optional hasArchive "fireactions-image-import.service";
-        partOf = [ "containerd.service" ];
+        requires = [
+          "containerd.service"
+          "network-online.target"
+        ]
+        ++ lib.optional hasArchive "fireactions-image-import.service";
+        after = [
+          "containerd.service"
+          "network-online.target"
+          "systemd-tmpfiles-setup.service"
+        ]
+        ++ lib.optional config.services.resolved.enable "systemd-resolved.service"
+        ++ lib.optional hasArchive "fireactions-image-import.service";
+        partOf = [ "containerd.service" ] ++ lib.optional hasArchive "fireactions-image-import.service";
         path = hostPath;
-        restartTriggers = [ configFile ];
+        restartTriggers = serviceRestartTriggers;
         preStart = "${binary} validate --host ${configFile}";
         serviceConfig = {
           User = "root";
@@ -259,7 +455,10 @@ in
       systemd.services.fireactions-reaper = {
         description = "Reap expired or abandoned Fireactions environments";
         requires = [ "containerd.service" ];
-        after = [ "containerd.service" "systemd-tmpfiles-setup.service" ];
+        after = [
+          "containerd.service"
+          "systemd-tmpfiles-setup.service"
+        ];
         path = hostPath;
         restartTriggers = [ configFile ];
         serviceConfig = {
@@ -299,47 +498,46 @@ in
     })
     (mkIf hasArchive {
       systemd.services.fireactions-image-import = {
-        description = "Import the Fireactions guest archive into containerd devmapper";
+        description = "Import the Fireactions guest archives into containerd devmapper";
         requires = [ "containerd.service" ];
         after = [ "containerd.service" ];
         before = [ "fireactions.service" ];
         partOf = [ "containerd.service" ];
         path = hostPath;
-        restartTriggers = [ configFile ];
-        # No RemainAfterExit: every daemon/containerd start must recheck the
-        # runtime archive, rather than retain stale success across restarts.
-        serviceConfig = { Type = "oneshot"; User = "root"; UMask = "0077"; };
-        script = ''
+        restartTriggers = serviceRestartTriggers;
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          User = "root";
+          UMask = "0077";
+        };
+        script = lib.concatMapStringsSep "\n" (archive: ''
           ${pkgs.containerd}/bin/ctr --address ${lib.escapeShellArg cfg.settings.containerd.address} \
             --namespace ${lib.escapeShellArg cfg.settings.containerd.namespace} \
-            images import --local --snapshotter devmapper ${lib.escapeShellArg cfg.imageArchive}
-        '';
-      };
-      systemd.paths.fireactions-image-import = {
-        description = "Import changed Fireactions guest archives";
-        wantedBy = [ "multi-user.target" ];
-        pathConfig = {
-          PathChanged = cfg.imageArchive;
-          Unit = "fireactions-image-import.service";
-        };
+            images import --local --snapshotter devmapper ${lib.escapeShellArg (toString archive)}
+        '') imageArchives;
       };
     })
     (mkIf cfg.runner.enable {
       assertions = [
         {
           assertion = lib.versionAtLeast (cfg.runner.package.version or "0") "13.2";
-          message = "services.fireactions.runner requires Forgejo Runner >= 13.2 with execution plugin support; the selected package reports ${cfg.runner.package.version or "no version"}.";
+          message = "services.fireactions.runner requires Forgejo Runner >= 13.2 with execution plugin support; the selected package reports ${
+            cfg.runner.package.version or "no version"
+          }.";
         }
         {
           assertion = cfg.runner.url != "" && cfg.runner.uuid != "";
           message = "services.fireactions.runner.url and uuid must identify an already registered Forgejo runner; automatic registration is disabled.";
         }
         {
-          assertion = cfg.runner.tokenFile != null && !(lib.hasPrefix "${builtins.storeDir}/" cfg.runner.tokenFile);
+          assertion =
+            cfg.runner.tokenFile != null && !(lib.hasPrefix "${builtins.storeDir}/" cfg.runner.tokenFile);
           message = "services.fireactions.runner.tokenFile must be an absolute runtime string outside the Nix store, containing the registered runner token.";
         }
         {
-          assertion = cfg.settings.state_dir != "/var/lib/fireactions-runner"
+          assertion =
+            cfg.settings.state_dir != "/var/lib/fireactions-runner"
             && !(lib.hasPrefix "${cfg.settings.state_dir}/" "/var/lib/fireactions-runner")
             && !(lib.hasPrefix "/var/lib/fireactions-runner/" cfg.settings.state_dir)
             && !(lib.hasPrefix "${cfg.settings.state_dir}/" socketDirectory)
@@ -357,9 +555,14 @@ in
       systemd.services.fireactions-runner = {
         description = "Forgejo Runner using the Fireactions execution plugin";
         wantedBy = [ "multi-user.target" ];
-        wants = [ "network-online.target" "fireactions.service" ];
-        after = [ "network-online.target" "fireactions.service" ];
-        restartTriggers = [ runnerConfig ];
+        wants = [ "network-online.target" ];
+        requires = [ "fireactions.service" ];
+        after = [
+          "network-online.target"
+          "fireactions.service"
+        ];
+        partOf = [ "fireactions.service" ];
+        restartTriggers = serviceRestartTriggers ++ [ runnerConfig ];
         serviceConfig = {
           User = "fireactions-runner";
           Group = "fireactions-runner";
