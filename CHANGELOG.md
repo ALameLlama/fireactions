@@ -30,6 +30,7 @@
 
 ### Fixed
 
+* Install guest kernel images from the separate Nix build directory instead of the kernel source directory.
 * Allow graceful Runner shutdown before systemd's stop limit so maintenance can finish active jobs instead of canceling them immediately.
 * Use the local containerd importer to unpack guest archives with devmapper instead of the transfer service.
 * Preserve caller deadlines through acquisition and guest operations, and classify private transport errors without exposing their messages.

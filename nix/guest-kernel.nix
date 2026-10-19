@@ -163,7 +163,7 @@ in
     '';
     preInstall = "";
     installPhase = ''
-      cp ${image} "$out"
+      cp "$buildRoot/${image}" "$out"
     '';
     dontFixup = true;
     meta = {
