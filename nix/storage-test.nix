@@ -1,12 +1,38 @@
-{ pkgs }:
+{ pkgs, module, imageTools }:
+let
+  root = pkgs.buildEnv {
+    name = "fireactions-import-test-root";
+    paths = [
+      pkgs.pkgsStatic.busybox
+      (pkgs.writeTextDir "etc/fireactions-proof" "imported-rootfs\n")
+    ];
+    pathsToLink = [ "/bin" "/etc" ];
+  };
+  managedImage = imageTools.nix2container.buildImage {
+    name = "localhost/fireactions-import-test";
+    tag = "managed";
+    copyToRoot = root;
+  };
+  externalArchive = pkgs.dockerTools.buildLayeredImage {
+    name = "localhost/fireactions-import-test";
+    tag = "archive";
+    contents = [ root ];
+    compressor = "none";
+  };
+in
 pkgs.testers.runNixOSTest {
   name = "fireactions-storage";
   nodes.machine = { lib, ... }: {
-    imports = [ ./module.nix ];
+    imports = [ module ];
     virtualisation.emptyDiskImages = [ 8192 8192 8192 ];
     services.fireactions = {
       enable = true;
-      imageArchive = null;
+      imageArchive = managedImage;
+      pools.external = {
+        image = "localhost/fireactions-import-test:archive";
+        imageArchive = externalArchive;
+        prewarmCount = 0;
+      };
       guestKernel = pkgs.emptyFile;
       devmapper.provision = {
         enable = true;
@@ -14,6 +40,10 @@ pkgs.testers.runNixOSTest {
         metadataSize = "32M";
       };
     };
+    services.dockerRegistry.package = pkgs.writeShellScriptBin "registry" ''
+      sleep 2
+      exec ${pkgs.distribution}/bin/registry "$@"
+    '';
     # This test exercises storage, not guest boot or runner registration.
     systemd.services.fireactions.enable = lib.mkForce false;
     systemd.services.fireactions-reaper.enable = lib.mkForce false;
@@ -21,8 +51,21 @@ pkgs.testers.runNixOSTest {
     environment.systemPackages = [ pkgs.e2fsprogs ];
   };
   testScript = ''
+    import json
+
     machine.start(allow_reboot=True)
     machine.wait_for_unit("containerd.service")
+    machine.wait_for_unit("fireactions-image-import.service")
+    repositories = json.loads(machine.succeed("${pkgs.curl}/bin/curl --fail --silent http://127.0.0.1:5000/v2/_catalog"))["repositories"]
+    layers = json.loads(machine.succeed("cat ${managedImage}"))["layers"]
+    for layer in layers:
+        machine.succeed(f"${pkgs.curl}/bin/curl --fail --silent --head http://127.0.0.1:5000/v2/{repositories[0]}/blobs/{layer['digest']}")
+    for tag in ["managed", "archive"]:
+        command = f"ctr --namespace fireactions run --rm --snapshotter devmapper localhost/fireactions-import-test:{tag} smoke-{tag} /bin/busybox cat /etc/fireactions-proof"
+        assert machine.succeed(command).strip() == "imported-rootfs"
+    machine.succeed("systemctl stop docker-registry.service")
+    machine.succeed("systemctl start fireactions-image-import.service")
+    assert machine.succeed("ctr --namespace fireactions run --rm --snapshotter devmapper localhost/fireactions-import-test:managed smoke-repeat /bin/busybox cat /etc/fireactions-proof").strip() == "imported-rootfs"
     machine.succeed("dmsetup table containerd-thinpool | grep -w thin-pool")
     assert machine.succeed("lvs --noheadings -o seg_monitor containerd/thinpool").strip() == "monitored"
     machine.succeed("ctr --namespace fireactions snapshots --snapshotter devmapper prepare retained")

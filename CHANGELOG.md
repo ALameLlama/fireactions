@@ -6,7 +6,7 @@
 
 * Add an importable NixOS flake with Linux x86_64/ARM64 packages and containerd/devmapper and CNI host setup. Include an independent reaper, runtime guest archive import, and an optional Forgejo Runner using systemd credentials.
 * Add a NixOS host flake example and first-install instructions that preserve machine configuration and keep Runner credentials outside the Nix store.
-* Build the matching Ubuntu 24.04 guest archive with Nix and drain Runner through native systemd dependencies during rebuilds.
+* Build the matching Ubuntu 24.04 guest image with Nix and drain Runner through native systemd dependencies during rebuilds.
 * Add per-profile NixOS options for idle replicas, CPUs, memory, images, users, and Firecracker configuration. Use the same backend YAML fields on Ubuntu and other Linux hosts.
 * Add guest image package and build hook options through NixOS and flake package overrides.
 * Add passwordless sudo for the `ci` user in both supplied Ubuntu guest images. Configure setuid binaries, PAM, and boot-time helpers in the Nix image.
@@ -27,6 +27,7 @@
 * Use pinned full upstream Ubuntu guest images with native Docker, Buildx, Compose, systemd, PAM, and sudo. Replace the upstream agent with this fork's binary.
 * Build the guest kernel from resolved Kconfig and reject missing built-in guest drivers, loadable modules, or Rust.
 * Consolidate NixOS installation, customization, and upgrade instructions in a separate guide.
+* Build managed guest images with nix2container and reuse native, runtime, and agent layers through a loopback registry. External Docker archives remain supported.
 
 ### Fixed
 

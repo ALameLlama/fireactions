@@ -2,6 +2,7 @@
   config,
   lib,
   pkgs,
+  imageTools,
   utils,
   ...
 }:
@@ -43,12 +44,12 @@ let
       name = mkOption {
         type = types.nonEmptyStr;
         default = "localhost/fireactions-guest";
-        description = "Container image name for the generated guest archive.";
+        description = "Container image name for the generated guest image.";
       };
       tag = mkOption {
         type = types.nonEmptyStr;
         default = "ubuntu-${config.ubuntuVersion}";
-        description = "Container image tag for the generated guest archive.";
+        description = "Container image tag for the generated guest image.";
       };
       docker = {
         enable = mkOption {
@@ -85,6 +86,7 @@ let
     pkgs.callPackage ./guest-image.nix (
       {
         fireactions = cfg.package;
+        inherit imageTools;
         inherit (image) ubuntuVersion name tag;
         dockerEnabled = image.docker.enable;
         dockerSettings = image.docker.settings;
@@ -112,6 +114,12 @@ let
     )
   );
   hasArchive = imageArchives != [ ];
+  isManagedImage =
+    image:
+    lib.isDerivation image && image ? copyTo && image ? imageName && image ? imageTag;
+  hasManagedImage = lib.any isManagedImage imageArchives;
+  registryAddress = "127.0.0.1:${toString config.services.dockerRegistry.port}";
+  ctr = "${pkgs.containerd}/bin/ctr --address ${lib.escapeShellArg cfg.settings.containerd.address} --namespace ${lib.escapeShellArg cfg.settings.containerd.namespace}";
   serviceRestartTriggers = [
     configFile
     cfg.package
@@ -284,10 +292,10 @@ in
                 type = types.nullOr (types.either types.package runtimePath);
                 default = if config.guestImage == null then null else buildGuestImage config.guestImage;
                 description = ''
-                  Additional guest archive to import for this enabled pool.
-                  Use a derivation built with the host package or an absolute runtime filename.
-                  Archive changes use the same graceful import lifecycle as the default image.
-                  Null does not add an archive; the pool image must already be imported.
+                  Additional nix2container image or OCI/Docker archive to import for this enabled pool.
+                  Use an image derivation or an absolute runtime archive filename.
+                  Image changes use the same graceful import lifecycle as the default image.
+                  Null does not add an image. The pool image must already be imported.
                 '';
               };
               guestImage = mkOption {
@@ -298,7 +306,7 @@ in
                   ]
                 );
                 default = null;
-                description = "Build a matching guest archive for this pool. Null shares the default image or an explicitly selected archive.";
+                description = "Build a matching guest image for this pool. Null shares the default image or an explicitly selected archive.";
               };
               imagePullPolicy = mkOption {
                 type = types.enum [
@@ -418,16 +426,18 @@ in
     imageArchive = mkOption {
       type = types.nullOr (types.either types.package runtimePath);
       default = buildGuestImage cfg.guestImage;
-      defaultText = lib.literalMD "The matching archive configured by `services.fireactions.guestImage`.";
+      defaultText = lib.literalMD "The matching image configured by `services.fireactions.guestImage`.";
       example = "/var/lib/fireactions-images/ubuntu-24.04.tar";
       description = ''
-        A native-architecture OCI/Docker image archive derivation or an absolute runtime filename.
-        The default archive contains the same Fireactions package as the host.
-        Import the archive with devmapper before the backend starts and after containerd restarts.
-        Changes to the archive derivation drain the runner and restart the import and backend.
+        A native-architecture nix2container image, OCI/Docker archive derivation, or absolute runtime archive filename.
+        The default image contains the same Fireactions package as the host.
+        Import the image with devmapper before the backend starts and after containerd restarts.
+        Changes to the image derivation drain the runner and restart the import and backend.
+        Managed nix2container images use a loopback registry, which stores another copy of their layers.
+        The registry uses services.dockerRegistry storage and garbage collection options.
         Runtime strings remain outside the Nix store and have no file watcher.
         After replacing a runtime archive, restart fireactions-image-import.service to drain the runner and import it.
-        When null, only archives from enabled pools are managed.
+        When null, only images from enabled pools are managed.
         Import any other configured images separately.
       '';
     };
@@ -678,13 +688,28 @@ in
         oifname "${cfg.networking.bridge}" ip daddr ${cfg.networking.subnet} ct state established,related accept
       '';
     })
+    (mkIf hasManagedImage {
+      assertions = [
+        {
+          assertion = config.services.dockerRegistry.listenAddress == "127.0.0.1";
+          message = "Managed Fireactions images require services.dockerRegistry.listenAddress to remain 127.0.0.1.";
+        }
+      ];
+      services.dockerRegistry = {
+        enable = true;
+        listenAddress = mkDefault "127.0.0.1";
+        port = mkDefault 5000;
+      };
+      # The environment also overrides a custom registry configuration file.
+      systemd.services.docker-registry.environment.REGISTRY_HTTP_ADDR = lib.mkForce registryAddress;
+    })
     (mkIf hasArchive {
       systemd.services.fireactions-image-import = {
-        description = "Import the Fireactions guest archives into containerd devmapper";
-        requires = [ "containerd.service" ];
-        after = [ "containerd.service" ];
+        description = "Import the Fireactions guest images into containerd devmapper";
+        requires = [ "containerd.service" ] ++ lib.optional hasManagedImage "docker-registry.service";
+        after = [ "containerd.service" ] ++ lib.optional hasManagedImage "docker-registry.service";
         before = [ "fireactions.service" ];
-        partOf = [ "containerd.service" ];
+        partOf = [ "containerd.service" ] ++ lib.optional hasManagedImage "docker-registry.service";
         path = hostPath;
         restartTriggers = serviceRestartTriggers;
         serviceConfig = {
@@ -692,12 +717,37 @@ in
           RemainAfterExit = true;
           User = "root";
           UMask = "0077";
+        }
+        // lib.optionalAttrs hasManagedImage {
+          RuntimeDirectory = "fireactions-image-import";
+          RuntimeDirectoryMode = "0700";
         };
-        script = lib.concatMapStringsSep "\n" (archive: ''
-          ${pkgs.containerd}/bin/ctr --address ${lib.escapeShellArg cfg.settings.containerd.address} \
-            --namespace ${lib.escapeShellArg cfg.settings.containerd.namespace} \
-            images import --local --snapshotter devmapper ${lib.escapeShellArg (toString archive)}
-        '') imageArchives;
+        script = lib.concatMapStringsSep "\n" (
+          image:
+          if isManagedImage image then
+            let
+              repository = "${registryAddress}/fireactions/${builtins.hashString "sha256" image.imageName}";
+            in
+            ''
+              digestFile="$RUNTIME_DIRECTORY/digest"
+              rm -f "$digestFile"
+              ${lib.getExe image.copyTo} docker://${repository}:${lib.escapeShellArg image.imageTag} \
+                --dest-tls-verify=false --preserve-digests --retry-times 3 --digestfile "$digestFile"
+              digest="$(< "$digestFile")"
+              if [[ ! "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                echo "The local registry did not return a valid image manifest digest." >&2
+                exit 1
+              fi
+              ${ctr} images pull --plain-http --local --snapshotter devmapper "${repository}@$digest"
+              ${ctr} images tag --force "${repository}@$digest" \
+                ${lib.escapeShellArg "${image.imageName}:${image.imageTag}"}
+              ${ctr} images rm "${repository}@$digest"
+            ''
+          else
+            ''
+              ${ctr} images import --local --snapshotter devmapper ${lib.escapeShellArg (toString image)}
+            ''
+        ) imageArchives;
       };
     })
     (mkIf cfg.runner.enable {

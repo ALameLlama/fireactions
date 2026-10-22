@@ -2,6 +2,7 @@
   lib,
   stdenv,
   dockerTools,
+  imageTools,
   buildEnv,
   runCommand,
   writeText,
@@ -111,33 +112,81 @@ let
     fi
   '';
   path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+  baseDirectory = runCommand "fireactions-guest-base" {
+    nativeBuildInputs = [ imageTools.skopeo-nix2container ];
+    baseArchive = fromImage;
+  } ''
+    skopeo --insecure-policy copy "docker-archive:$baseArchive" "dir:$out"
+  '';
+  baseImage = runCommand "fireactions-guest-base.json" { } ''
+    ${imageTools.nix2container-bin}/bin/nix2container image-from-dir "$out" ${baseDirectory}
+  '';
+  runtimeLayer = imageTools.nix2container.buildLayer {
+    deps = [ runtime ];
+  };
+  agentLayer = imageTools.nix2container.buildLayer {
+    deps = [ fireactions ];
+    layers = [ runtimeLayer ];
+  };
+  customization = dockerTools.streamLayeredImage {
+    inherit name tag;
+    fromImage = null;
+    includeStorePaths = false;
+    extraCommands = ''
+      fireactions=${fireactions}
+      runtime=${runtime}
+      guestAccounts=${accounts}
+      dockerEnabled=${lib.boolToString dockerEnabled}
+      agentUnit=${../images/ubuntu-24.04/fireactions-agent.service}
+      visudo=${sudo}/bin/visudo
+      guestPath=${path}
+      source ${./guest-image-setup.sh}
+      ${lib.optionalString (dockerSettings != { }) ''
+        mkdir -p etc/docker
+        cp ${writeText "fireactions-docker-daemon.json" (builtins.toJSON dockerSettings)} etc/docker/daemon.json
+      ''}
+      ${extraCommands}
+    '';
+    fakeRootCommands = ''
+      chown -R 0:0 .
+      chown -R 1000:1000 home/ci workspace
+      chmod 1777 tmp var/tmp
+      chmod 0700 root
+      ${fakeRootCommands}
+    '';
+  };
+  copiedOverlay = runCommand "fireactions-guest-overlay" {
+    nativeBuildInputs = [ jq ];
+  } ''
+    customization=$(jq -er '.customisation_layer' ${customization.conf})
+    mkdir -p "$out"
+    cp "$customization/layer.tar" "$out/layer.tar"
+    digest=$(sha256sum "$out/layer.tar")
+    digest="sha256:''${digest%% *}"
+    size=$(stat -c %s "$out/layer.tar")
+    jq -n --arg digest "$digest" --argjson size "$size" --arg layerPath "$out/layer.tar" \
+      '[{
+        digest: $digest,
+        size: $size,
+        diff_ids: $digest,
+        mediatype: "application/vnd.oci.image.layer.v1.tar",
+        "layer-path": $layerPath
+      }]' > "$out/layers.json"
+  '';
+  extraDependencyLayer = imageTools.nix2container.buildLayer {
+    deps = [ copiedOverlay ];
+    ignore = [ copiedOverlay ];
+    layers = [ runtimeLayer agentLayer ];
+  };
 in
-
-dockerTools.buildLayeredImage {
-  inherit name tag fromImage;
-  compressor = "none";
-  extraCommands = ''
-    fireactions=${fireactions}
-    runtime=${runtime}
-    guestAccounts=${accounts}
-    dockerEnabled=${lib.boolToString dockerEnabled}
-    agentUnit=${../images/ubuntu-24.04/fireactions-agent.service}
-    visudo=${sudo}/bin/visudo
-    guestPath=${path}
-    source ${./guest-image-setup.sh}
-    ${lib.optionalString (dockerSettings != { }) ''
-      mkdir -p etc/docker
-      cp ${writeText "fireactions-docker-daemon.json" (builtins.toJSON dockerSettings)} etc/docker/daemon.json
-    ''}
-    ${extraCommands}
-  '';
-  fakeRootCommands = ''
-    chown -R 0:0 .
-    chown -R 1000:1000 home/ci workspace
-    chmod 1777 tmp var/tmp
-    chmod 0700 root
-    ${fakeRootCommands}
-  '';
+imageTools.nix2container.buildImage {
+  inherit name tag;
+  fromImage = baseImage;
+  fromImageEnv = true;
+  layers = [
+    extraDependencyLayer
+    (copiedOverlay // { nestedLayers = [ ]; })
+  ];
   config = {
     Cmd = [ "/sbin/init" ];
     StopSignal = "SIGRTMIN+3";

@@ -171,11 +171,12 @@ Its labels must select enabled pool names, such as `firecracker:firecracker://ub
 
 ## Select guest images and Docker configuration
 
-The default archive uses the pinned full Ubuntu 24.04 image from the upstream image repository.
+The default image uses the pinned full Ubuntu 24.04 base from the upstream image repository.
 Docker, Buildx, Compose, systemd, PAM, and sudo remain Ubuntu packages.
-The image layer adds the same Fireactions binary as the host, Node.js 24, and the `ci` user with passwordless sudo.
+nix2container keeps the native base, Nix runtime, and Fireactions binary in separate layers.
+The final filesystem layer adds the `ci` user with passwordless sudo.
 It replaces the upstream agent, removes the GitHub runner, locks passwords, and disables SSH and login services.
-No Docker daemon is needed to build the archive on the host.
+No Docker daemon is needed to build the image on the host.
 
 Docker starts before the guest agent accepts commands.
 The `ci` user belongs to the guest's native `docker` group.
@@ -224,10 +225,25 @@ nix build '.#"guest-image-ubuntu24.04"'
 ```
 
 `guest-image` selects Ubuntu 24.04.
-The uncompressed archive is `result` and uses `localhost/fireactions-guest:ubuntu-24.04` by default.
-The module imports each managed archive once into the configured containerd namespace with devmapper before starting the backend.
+The `result` file contains nix2container image metadata, not a Docker archive.
+The default reference remains `localhost/fireactions-guest:ubuntu-24.04`.
+Before starting the backend, the module copies managed images through a registry on `127.0.0.1:5000`.
+containerd pulls their exact manifest digests with devmapper and applies the configured image names.
+Unchanged layers stay cached across agent updates instead of entering a new complete archive.
+The registry adds another local copy of image layers.
+Its storage and garbage collection follow `services.dockerRegistry` configuration.
+Do not expose this registry outside the host.
+The module requires its listener to remain on `127.0.0.1`.
+External Docker archives still use the local containerd importer.
 Default profiles use `image_pull_policy: Never`.
-Disabled pools do not add archives.
+Disabled pools do not add images.
+
+If another tool requires a Docker archive, export it explicitly:
+
+```bash
+nix run .#guest-image.copyTo -- \
+  docker-archive:/tmp/fireactions-guest.tar:localhost/fireactions-guest:ubuntu-24.04
+```
 
 ## Extend images without changing Fireactions
 
@@ -307,7 +323,7 @@ The exported image packages accept `fromImage`, `name`, `tag`, `dockerEnabled`, 
 Use `.override`, not `.overrideAttrs`, to change inputs before the layers are built.
 The standard layer setup lives in `nix/guest-image-setup.sh`.
 
-Add the archive to an enabled pool in your host flake:
+Add the image to an enabled pool in your host flake:
 
 ```nix
 ({ config, pkgs, ... }: {
@@ -336,6 +352,11 @@ For a local base archive, use `pkgs.requireFile` with its hash.
 Build and export that base first, then import it with `nix-store --add-fixed sha256`.
 Keep a garbage collection root for the stored archive.
 Changing its Dockerfile does not rebuild a `requireFile` archive.
+
+Keep native package installs in separate Dockerfile `RUN` layers to reuse unchanged components.
+For PHP images, separate each PHP version from Composer installation.
+Pulling a newer base invalidates the layers that depend on it.
+Use an explicit cache bypass when you need current packages or tools without changing the recipe.
 
 For a complete externally built guest archive, set `imageArchive` to an absolute runtime filename string.
 Rebuild it whenever the host binary changes.

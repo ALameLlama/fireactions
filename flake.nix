@@ -1,10 +1,16 @@
 {
   description = "Fireactions packages and NixOS host module";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nix2container = {
+      url = "github:nlewo/nix2container";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
   outputs =
-    { self, nixpkgs, ... }:
+    { self, nixpkgs, nix2container, ... }:
     {
       packages = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (
         system:
@@ -13,7 +19,8 @@
           fireactions = pkgs.callPackage ./nix/package.nix {
             gitRevision = self.rev or self.dirtyRev or "unknown";
           };
-          guest-image = pkgs.callPackage ./nix/guest-image.nix { inherit fireactions; };
+          imageTools = import nix2container { inherit pkgs; };
+          guest-image = pkgs.callPackage ./nix/guest-image.nix { inherit fireactions imageTools; };
         in
         {
           inherit fireactions guest-image;
@@ -29,14 +36,21 @@
         system:
         let
           pkgs = import nixpkgs { inherit system; };
+          imageTools = import nix2container { inherit pkgs; };
         in
         {
-          storage = import ./nix/storage-test.nix { inherit pkgs; };
+          storage = import ./nix/storage-test.nix {
+            inherit pkgs imageTools;
+            module = self.nixosModules.fireactions;
+          };
         }
       );
 
       nixosModules = {
-        fireactions = import ./nix/module.nix;
+        fireactions = { pkgs, ... }: {
+          imports = [ ./nix/module.nix ];
+          _module.args.imageTools = import nix2container { inherit pkgs; };
+        };
         default = self.nixosModules.fireactions;
       };
     };
